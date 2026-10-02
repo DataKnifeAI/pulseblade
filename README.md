@@ -2,9 +2,12 @@
 
 **Pulseblade** — a pulse that reveals what is moving across your infrastructure.
 
-Pulseblade is a self-hosted infrastructure monitor built for **AI agents as the primary consumer**. A lightweight host agent collects metrics and state, keeps a change journal, and exposes everything through the [Model Context Protocol](https://modelcontextprotocol.io) (MCP). Agents ask "what changed since checkpoint X?" instead of drowning in alert storms; dashboards are a later, degraded view of the same data.
+Pulseblade is a self-hosted infrastructure monitor built for **AI agents as the primary consumer**. A lightweight per-host **node** collects metrics and state, keeps a change journal, and exposes everything through the [Model Context Protocol](https://modelcontextprotocol.io) (MCP). Agents ask "what changed since checkpoint X?" instead of drowning in alert storms; dashboards are a later, degraded view of the same data.
 
-> The name nods to Titanfall's Pulse Blade — a sonar ping that reveals what is moving — in keeping with DataKnifeAI's Data Knife wink.
+It scales in two shapes with the same MCP contract:
+
+- **Single box** — one node, with an optional **pilot** (a local-LLM reasoning loop) watching the OS and user session.
+- **Fleet** — many nodes feeding a **hub** (control node); pilots and other agents talk to the hub, nodes enforce their own action policy.
 
 ## Why
 
@@ -20,30 +23,30 @@ Existing tools are either human-first monitoring stacks with an agent bolted on,
 
 ## Status
 
-Milestone **M1** (single-host agent) — see [docs/PLAN.md](docs/PLAN.md).
+Milestone **M1** (single-host node) — see [docs/PLAN.md](docs/PLAN.md).
 
 | Works today | Planned |
 |-------------|---------|
-| Host, CPU, memory, disk, network, systemd service collectors | Findings and anomaly detection (M2) |
-| Change journal, checkpoints, `changes_since` | Notes / memory (M2) |
-| Metrics with query-time downsampling | Gated remediation and audit chain (M3) |
-| MCP over stdio and streamable HTTP | Docker, Proxmox (M4), hub mode (M5), Kubernetes (M6) |
+| Host, CPU, memory, disk, network, systemd service collectors | Logs, processes, user units; findings and memory (M2) |
+| Change journal, checkpoints, `changes_since` | Gated remediation and audit chain (M3) |
+| Metrics with query-time downsampling | Pilot: local-LLM reasoning loop (M4) |
+| MCP over stdio and streamable HTTP | Docker, Proxmox (M5), hub (M6), Kubernetes (M7) |
 
 ## Quick start
 
 ```bash
 make install            # cargo install --path crates/pulseblade
 
-# Run the host agent: collectors + MCP over HTTP at http://127.0.0.1:7171/mcp
-pulseblade agent
+# Run this host's node: collectors + MCP over HTTP at http://127.0.0.1:7171/mcp
+pulseblade node
 
-# Or serve MCP over stdio (collects in-process unless an agent already owns the database)
+# Or serve MCP over stdio (collects in-process unless a node already owns the database)
 pulseblade mcp
 ```
 
 ### Connect an MCP client
 
-Cursor (`~/.cursor/mcp.json`), HTTP against a running agent:
+Cursor (`~/.cursor/mcp.json`), HTTP against a running node:
 
 ```json
 {
@@ -108,6 +111,7 @@ State lives in `~/.local/state/pulseblade/pulseblade.db` by default (`--db` to o
 ## Integrates with
 
 - Any MCP client: Cursor, Claude, local agents on Ollama, HolmesGPT, custom scripts
+- Ollama or any OpenAI-compatible endpoint, as the pilot's model (planned)
 - systemd (today); Docker, Proxmox VE, Kubernetes, Prometheus (planned)
 
 ## Development
