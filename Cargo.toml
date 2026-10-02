@@ -1,0 +1,52 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/pulseblade-core",
+    "crates/pulseblade-store",
+    "crates/pulseblade-collect",
+    "crates/pulseblade-detect",
+    "crates/pulseblade-act",
+    "crates/pulseblade-mcp",
+    "crates/pulseblade",
+]
+default-members = [
+    "crates/pulseblade-core",
+    "crates/pulseblade-store",
+    "crates/pulseblade-collect",
+    "crates/pulseblade-detect",
+    "crates/pulseblade-act",
+    "crates/pulseblade-mcp",
+    "crates/pulseblade",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/DataKnifeAI/pulseblade"
+authors = ["DataKnifeAI"]
+
+[workspace.dependencies]
+pulseblade-core = { path = "crates/pulseblade-core" }
+pulseblade-store = { path = "crates/pulseblade-store" }
+pulseblade-collect = { path = "crates/pulseblade-collect" }
+pulseblade-detect = { path = "crates/pulseblade-detect" }
+pulseblade-act = { path = "crates/pulseblade-act" }
+pulseblade-mcp = { path = "crates/pulseblade-mcp" }
+anyhow = "1"
+axum = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+rmcp = { version = "3.5", features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sysinfo = "0.39"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "process"] }
+tokio-util = "0.7"
+toml = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

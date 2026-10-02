@@ -1,0 +1,16 @@
+[package]
+name = "pulseblade-collect"
+description = "Pulseblade collectors: host and systemd today; docker, proxmox, k8s behind features"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+pulseblade-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sysinfo.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
