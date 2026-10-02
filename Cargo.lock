@@ -938,6 +938,7 @@ dependencies = [
  "chrono",
  "pulseblade-core",
  "rusqlite",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror",
