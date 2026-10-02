@@ -117,9 +117,20 @@ The node serves a read-only, LLM-free view of the same data on its HTTP port, ne
 
 Errors are JSON `{"error": "..."}` with 400 for invalid input and 404 for unknown resources, metrics, checkpoints, or endpoints.
 
-![Pulseblade dashboard: collector status, host CPU and memory, counts by kind, unhealthy resources, a filterable resource table, resource details with a CPU sparkline, and recent changes](docs/assets/dashboard.png)
+![Pulseblade dashboard showing synthetic demo data for a fictional host demo-01: collector status, host CPU and memory, counts by kind, a failed backup service, a degraded disk and service, a filterable resource table, host details with a CPU sparkline, and recent changes](docs/assets/dashboard.png)
+
+*Synthetic demo data, not a real machine.*
 
 The dashboard shows collector status, host key metrics, counts by kind, unhealthy resources first, a filterable resource table, recent changes over a selectable window, and per-resource details with a sparkline of any metric. It refreshes every 15 seconds (pausable). Deep links work: `/?kind=service&q=ssh&select=unit:web1:sshd.service&metric=...`.
+
+To reproduce the screenshot, seed two hours of deterministic demo data (written through the normal store API, ending now) and serve it within a minute, before the collectors read as stale:
+
+```bash
+cargo run -p pulseblade --example seed_demo -- /tmp/pb-demo/pb.db
+cargo run -p pulseblade -- --db /tmp/pb-demo/pb.db node --no-collect --listen 127.0.0.1:7188
+chromium --headless --hide-scrollbars --virtual-time-budget=5000 --window-size=1440,1250 \
+  --screenshot=docs/assets/dashboard.png 'http://127.0.0.1:7188/?select=host:demo-01&metric=cpu.used_pct'
+```
 
 ### Remote access
 
