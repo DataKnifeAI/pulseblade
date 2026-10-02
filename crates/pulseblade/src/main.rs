@@ -1,5 +1,6 @@
 mod config;
 mod node;
+mod status;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -56,6 +57,12 @@ enum Command {
 
 #[derive(Subcommand)]
 enum Ctl {
+    /// Human-readable summary: self-health, counts, unhealthy resources, recent changes.
+    Status {
+        /// How many recent changes to show.
+        #[arg(long, default_value_t = 10)]
+        changes: usize,
+    },
     /// Current state as JSON, unhealthy first.
     Snapshot {
         /// summary, brief, or full [default: summary without filters, brief with]
@@ -224,6 +231,10 @@ async fn main() -> anyhow::Result<()> {
 
 fn run_ctl(store: &Store, db: &Path, config: &Config, command: Ctl) -> anyhow::Result<()> {
     match command {
+        Ctl::Status { changes } => {
+            print!("{}", status::render(store, changes)?);
+            Ok(())
+        }
         Ctl::Snapshot {
             detail,
             kind,
