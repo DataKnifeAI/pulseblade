@@ -66,13 +66,13 @@ pub struct ResourceBrief {
     pub kind: ResourceKind,
     pub name: String,
     pub health: Health,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
     /// Latest metric values, rounded to two decimals.
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metrics: BTreeMap<String, f64>,
     /// Attributes, present when `verbose` or when the resource is unhealthy.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attrs: Option<BTreeMap<String, Value>>,
 }
 
@@ -202,7 +202,7 @@ pub struct Explanation {
     pub resource: StoredResource,
     /// Latest value of every metric; query history with `metrics_query`.
     pub metrics: BTreeMap<String, MetricValue>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<ResourceBrief>,
     pub children: ChildrenSummary,
     /// Recent changes on this resource and its parent, newest first: causal context.
@@ -325,7 +325,7 @@ pub struct Series {
     pub from: DateTime<Utc>,
     pub to: DateTime<Utc>,
     pub step_secs: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stats: Option<SeriesStats>,
     pub points: Vec<Point>,
 }

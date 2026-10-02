@@ -139,3 +139,139 @@ impl ServerHandler for PulsebladeServer {
             .with_instructions(INSTRUCTIONS)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{Duration, Utc};
+    use pulseblade_core::{Health, Observation, Resource, ResourceKind, Sample};
+    use serde::Serialize;
+    use serde_json::Value;
+
+    fn seeded() -> Arc<Store> {
+        let store = Store::open_in_memory().unwrap();
+        let t = Utc::now() - Duration::minutes(1);
+        store
+            .apply(
+                "host",
+                t,
+                &Observation {
+                    resources: vec![Resource::new("host:h", ResourceKind::Host, "h")
+                        .health(Health::Ok)
+                        .attr("os", "linux")],
+                    samples: vec![Sample::new("host:h", "cpu.used_pct", 5.0)],
+                },
+            )
+            .unwrap();
+        store
+            .apply(
+                "systemd",
+                t,
+                &Observation {
+                    resources: vec![
+                        Resource::new("unit:h:a.service", ResourceKind::Service, "a.service")
+                            .parent("host:h")
+                            .health(Health::Failed)
+                            .attr("active", "failed"),
+                        Resource::new("unit:h:b.service", ResourceKind::Service, "b.service")
+                            .parent("host:h"),
+                    ],
+                    samples: vec![],
+                },
+            )
+            .unwrap();
+        store
+            .apply(
+                "systemd",
+                Utc::now(),
+                &Observation {
+                    resources: vec![Resource::new(
+                        "unit:h:a.service",
+                        ResourceKind::Service,
+                        "a.service",
+                    )
+                    .parent("host:h")
+                    .health(Health::Ok)
+                    .attr("active", "active")],
+                    samples: vec![],
+                },
+            )
+            .unwrap();
+        Arc::new(store)
+    }
+
+    /// Clients such as Cursor reject structured content that violates the advertised schema.
+    fn assert_matches_output_schema<T: Serialize>(server: &PulsebladeServer, tool: &str, out: T) {
+        let tools = server.tool_router.list_all();
+        let schema = tools
+            .iter()
+            .find(|t| t.name == tool)
+            .and_then(|t| t.output_schema.clone())
+            .unwrap_or_else(|| panic!("{tool} has no output schema"));
+        let schema = Value::Object((*schema).clone());
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        let value = serde_json::to_value(out).unwrap();
+        let errors: Vec<String> = validator
+            .iter_errors(&value)
+            .map(|e| format!("{} at {}", e, e.instance_path()))
+            .collect();
+        assert!(errors.is_empty(), "{tool}: {errors:#?}\n{value:#}");
+    }
+
+    #[test]
+    fn structured_outputs_match_advertised_schemas() {
+        let store = seeded();
+        let server = PulsebladeServer::new(store.clone());
+
+        for verbose in [false, true] {
+            let snap = query::snapshot(
+                &store,
+                SnapshotParams {
+                    verbose: Some(verbose),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_matches_output_schema(&server, "state_snapshot", snap);
+        }
+        for id in ["host:h", "unit:h:a.service", "unit:h:b.service"] {
+            let e = query::explain(
+                &store,
+                ExplainParams {
+                    id: id.into(),
+                    changes_limit: None,
+                },
+            )
+            .unwrap();
+            assert_matches_output_schema(&server, "resource_explain", e);
+        }
+        for range in ["1h", "1s"] {
+            let s = query::metrics(
+                &store,
+                MetricsParams {
+                    id: "host:h".into(),
+                    metric: "cpu.used_pct".into(),
+                    range: Some(range.into()),
+                    step: None,
+                    agg: None,
+                },
+            )
+            .unwrap();
+            assert_matches_output_schema(&server, "metrics_query", s);
+        }
+        let cp = query::checkpoint(&store, CheckpointParams { name: "cp".into() }).unwrap();
+        assert_matches_output_schema(&server, "checkpoint_create", cp);
+        let cs = query::changes(
+            &store,
+            ChangesParams {
+                since: "seq:0".into(),
+                kind: None,
+                resource_prefix: None,
+                limit: None,
+            },
+        )
+        .unwrap();
+        assert!(cs.changes.iter().any(|c| c.field.is_some()));
+        assert_matches_output_schema(&server, "changes_since", cs);
+    }
+}
