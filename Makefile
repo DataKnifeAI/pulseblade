@@ -40,8 +40,8 @@ vet: fmt-check lint ## Static checks (fmt + clippy)
 ci: vet test ## Local quality gate (matches CI jobs)
 
 .PHONY: run
-run: ## Run the host agent (collectors + HTTP MCP on 127.0.0.1:7171)
-	$(CARGO) run -p pulseblade -- agent
+run: ## Run this host's node (collectors + HTTP MCP on 127.0.0.1:7171)
+	$(CARGO) run -p pulseblade -- node
 
 .PHONY: install
 install: ## Install the pulseblade binary into ~/.cargo/bin

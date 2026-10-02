@@ -13,7 +13,7 @@ pub struct Config {
     pub retention_hours: u64,
     /// How long change journal entries are kept.
     pub change_retention_days: u64,
-    /// Address for the agent's HTTP MCP endpoint.
+    /// Address for the node's HTTP MCP endpoint.
     pub listen: String,
     /// Extra `Host` header values accepted by the HTTP endpoint (loopback is always allowed).
     pub allowed_hosts: Vec<String>,

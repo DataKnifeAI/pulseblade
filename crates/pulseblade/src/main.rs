@@ -1,5 +1,5 @@
-mod agent;
 mod config;
+mod node;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -14,8 +14,8 @@ use pulseblade_store::Store;
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::{collect_once, spawn_collector, CollectorLock};
 use crate::config::{default_db_path, Config};
+use crate::node::{collect_once, spawn_collector, CollectorLock};
 
 /// Agent-first infrastructure monitor: MCP-native telemetry, change checkpoints,
 /// and gated remediation.
@@ -36,15 +36,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run collectors and serve MCP over streamable HTTP.
-    Agent {
+    /// Run this host's node: collectors plus MCP over streamable HTTP.
+    #[command(alias = "agent")]
+    Node {
         /// Listen address [default: from config, 127.0.0.1:7171]
         #[arg(long)]
         listen: Option<SocketAddr>,
     },
-    /// Serve MCP over stdio; collects in-process unless an agent owns the database.
+    /// Serve MCP over stdio; collects in-process unless a node owns the database.
     Mcp,
-    /// Aggregate many agents into fleet state (M5).
+    /// Control node: aggregate many nodes into fleet state (M6).
     Hub,
     /// Query and manage the local store from the shell.
     Ctl {
@@ -103,7 +104,7 @@ enum Ctl {
         #[arg(long)]
         max_lines: Option<usize>,
     },
-    /// Run one collection pass now (fails if an agent is already collecting).
+    /// Run one collection pass now (fails if a node is already collecting).
     Collect,
 }
 
@@ -145,7 +146,7 @@ async fn main() -> anyhow::Result<()> {
     let db = cli.db.clone().unwrap_or_else(default_db_path);
 
     match cli.command {
-        Command::Agent { listen } => {
+        Command::Node { listen } => {
             let store = open_store(&db)?;
             let lock = CollectorLock::try_acquire(&db)?.with_context(|| {
                 format!(
@@ -188,7 +189,7 @@ async fn main() -> anyhow::Result<()> {
                 )),
                 None => {
                     tracing::info!(
-                        "agent already collecting; serving its database without collecting"
+                        "node already collecting; serving its database without collecting"
                     );
                     None
                 }
@@ -202,7 +203,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Hub => {
             anyhow::bail!(
-                "hub mode is planned for M5: https://github.com/DataKnifeAI/pulseblade/issues/4"
+                "hub mode is planned for M6: https://github.com/DataKnifeAI/pulseblade/issues/4"
             )
         }
         Command::Ctl { command } => {
@@ -291,7 +292,7 @@ fn run_ctl(store: &Store, db: &Path, config: &Config, command: Ctl) -> anyhow::R
         }
         Ctl::Collect => {
             let _lock = CollectorLock::try_acquire(db)?
-                .context("an agent is already collecting into this database")?;
+                .context("a node is already collecting into this database")?;
             let mut collectors = default_collectors();
             let n = collect_once(store, &mut collectors, &config.labels);
             print_json(&serde_json::json!({
