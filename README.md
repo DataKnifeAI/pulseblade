@@ -47,6 +47,9 @@ pulseblade node
 
 # Or serve MCP over stdio (collects in-process unless a node already owns the database)
 pulseblade mcp
+
+# Serve an existing database without collecting (offline inspection, copied databases, demos)
+pulseblade --db ./copy.db node --no-collect
 ```
 
 ### Connect an MCP client

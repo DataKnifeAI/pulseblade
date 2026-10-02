@@ -43,6 +43,10 @@ enum Command {
         /// Listen address [default: from config, 127.0.0.1:7171]
         #[arg(long)]
         listen: Option<SocketAddr>,
+        /// Serve an existing database without collecting: HTTP, MCP, and dashboard,
+        /// no collectors, and no collector lock (offline inspection, demo data).
+        #[arg(long)]
+        no_collect: bool,
     },
     /// Serve MCP over stdio; collects in-process unless a node owns the database.
     Mcp,
@@ -162,14 +166,22 @@ async fn main() -> anyhow::Result<()> {
     let db = cli.db.clone().unwrap_or_else(default_db_path);
 
     match cli.command {
-        Command::Node { listen } => {
+        Command::Node { listen, no_collect } => {
+            if no_collect {
+                anyhow::ensure!(db.exists(), "database {} does not exist", db.display());
+            }
             let store = open_store(&db)?;
-            let lock = CollectorLock::try_acquire(&db)?.with_context(|| {
-                format!(
-                    "another pulseblade process is already collecting into {}",
-                    db.display()
-                )
-            })?;
+            let lock = if no_collect {
+                tracing::info!(db = %db.display(), "serving without collecting");
+                None
+            } else {
+                Some(CollectorLock::try_acquire(&db)?.with_context(|| {
+                    format!(
+                        "another pulseblade process is already collecting into {}",
+                        db.display()
+                    )
+                })?)
+            };
             let addr = match listen {
                 Some(a) => a,
                 None => config
@@ -178,7 +190,8 @@ async fn main() -> anyhow::Result<()> {
                     .with_context(|| format!("invalid listen address `{}`", config.listen))?,
             };
             let shutdown = CancellationToken::new();
-            let collector = spawn_collector(store.clone(), &config, lock, shutdown.clone());
+            let collector =
+                lock.map(|lock| spawn_collector(store.clone(), &config, lock, shutdown.clone()));
             let ctrl_c = shutdown.clone();
             tokio::spawn(async move {
                 let _ = tokio::signal::ctrl_c().await;
@@ -190,7 +203,9 @@ async fn main() -> anyhow::Result<()> {
             allowed.extend(config.allowed_hosts.iter().cloned());
             let served = pulseblade_mcp::serve_http(store, addr, allowed, shutdown.clone()).await;
             shutdown.cancel();
-            let _ = tokio::task::spawn_blocking(move || collector.join()).await;
+            if let Some(c) = collector {
+                let _ = tokio::task::spawn_blocking(move || c.join()).await;
+            }
             served
         }
         Command::Mcp => {

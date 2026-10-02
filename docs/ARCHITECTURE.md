@@ -82,7 +82,7 @@ Collectors report the full set of resources they own on each pass. The store dif
 
 ## Concurrency
 
-Only one process collects per database. Collection takes an exclusive lock on `<db>.lock`; `pulseblade mcp` collects only if the lock is free, otherwise it serves the database a running node maintains. SQLite runs in WAL mode so readers never block the collector.
+Only one process collects per database. Collection takes an exclusive lock on `<db>.lock`; `pulseblade mcp` collects only if the lock is free, otherwise it serves the database a running node maintains. `pulseblade node --no-collect` never takes the lock and only serves an existing database (offline inspection, demo data). SQLite runs in WAL mode so readers never block the collector.
 
 ## Self-observability
 
