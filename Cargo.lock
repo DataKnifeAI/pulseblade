@@ -891,6 +891,7 @@ dependencies = [
 name = "pulseblade-collect"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "pulseblade-core",
  "serde",
  "serde_json",
