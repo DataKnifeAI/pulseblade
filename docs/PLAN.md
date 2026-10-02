@@ -16,6 +16,13 @@ Cargo workspace, CI (`make vet`, `make test`), Makefile, license, README, archit
 - Semantic labels from config.
 - Verified end-to-end with Cursor as the MCP client.
 
+### M1.1 — Dashboard and HTTP API (done)
+
+- LLM-free basic view on the node's HTTP port: JSON API under `/api/v1` (status, snapshot, resources, metrics, changes, checkpoints) built on the shared query layer, Prometheus exposition at `/metrics`, and an embedded single-page dashboard at `/`.
+- Self-observability: collector runs persisted in the store; collector health in `state_snapshot`, `/api/v1/status`, Prometheus, and `pulseblade ctl status` (plain-text summary).
+- Token-efficient MCP: `state_snapshot` `detail` (`summary` default, `brief`, `full`) and `if_changed_since`, compact `metrics_query` series, compact `changes_since`, measured in a token-budget test (see [ARCHITECTURE.md](ARCHITECTURE.md#token-efficiency)).
+- Docs for reverse-proxy access, Prometheus/Grafana, and Homepage.
+
 ### M2 — OS and user signals, detection, memory ([#1](https://github.com/DataKnifeAI/pulseblade/issues/1))
 
 - Collectors: journald (per-unit error rate, recent error lines), top processes by CPU and memory, user systemd units (`systemctl --user`) and session.
@@ -34,7 +41,7 @@ Cargo workspace, CI (`make vet`, `make test`), Makefile, license, README, archit
 
 ### M4 — Pilot ([#6](https://github.com/DataKnifeAI/pulseblade/issues/6))
 
-- `pulseblade-pilot` crate and `pulseblade pilot` command: an MCP client driven by Ollama or any OpenAI-compatible endpoint.
+- `pulseblade-pilot` crate and `pulseblade pilot` command: an MCP client driven by any OpenAI-compatible endpoint, local (e.g. Ollama, vLLM) or remote (e.g. OpenRouter), with tiered routing and fallback ([design](ARCHITECTURE.md#pilot-planned-m4)).
 - Event-driven: wakes on new findings and a slow heartbeat, never per collection pass.
 - Investigates with the read tools, writes conclusions as notes, proposes actions through `action_plan`; `auto`-tier actions only if the operator enables it.
 - Budgets: max tool calls, tokens, and wall time per investigation; every run recorded.
@@ -55,10 +62,9 @@ Cargo workspace, CI (`make vet`, `make test`), Makefile, license, README, archit
 
 - Collector and actions (rollout restart, scale) behind a `k8s` feature (`kube`).
 - DaemonSet / Helm chart.
-- Prometheus interop: scrape `/metrics` targets and expose `/metrics`.
+- Prometheus interop: scrape `/metrics` targets (exposing `/metrics` shipped in M1.1).
 
 ### Later
 
 - Cloud collectors (AWS, Azure, GCP).
 - Hub-of-hubs (a hub presenting itself as a node upstream).
-- Minimal read-only web view.
