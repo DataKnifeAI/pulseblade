@@ -56,16 +56,17 @@ enum Command {
 
 #[derive(Subcommand)]
 enum Ctl {
-    /// Current state, unhealthy first.
+    /// Current state as JSON, unhealthy first.
     Snapshot {
+        /// summary, brief, or full [default: summary without filters, brief with]
+        #[arg(long, value_parser = parse_detail)]
+        detail: Option<query::Detail>,
         #[arg(long)]
         kind: Option<ResourceKind>,
         #[arg(long)]
         query: Option<String>,
         #[arg(long)]
         unhealthy: bool,
-        #[arg(long)]
-        verbose: bool,
         #[arg(long)]
         limit: Option<usize>,
     },
@@ -94,6 +95,9 @@ enum Ctl {
         prefix: Option<String>,
         #[arg(long)]
         limit: Option<usize>,
+        /// Include a timestamp on every change.
+        #[arg(long)]
+        timestamps: bool,
     },
     /// JSONL dump of resources (and changes with --since).
     Export {
@@ -111,6 +115,11 @@ enum Ctl {
 fn parse_agg(s: &str) -> Result<Aggregation, String> {
     serde_json::from_value(serde_json::Value::String(s.to_string()))
         .map_err(|_| "expected avg, min, max, or last".to_string())
+}
+
+fn parse_detail(s: &str) -> Result<query::Detail, String> {
+    serde_json::from_value(serde_json::Value::String(s.to_string()))
+        .map_err(|_| "expected summary, brief, or full".to_string())
 }
 
 fn open_store(path: &Path) -> anyhow::Result<Arc<Store>> {
@@ -216,19 +225,20 @@ async fn main() -> anyhow::Result<()> {
 fn run_ctl(store: &Store, db: &Path, config: &Config, command: Ctl) -> anyhow::Result<()> {
     match command {
         Ctl::Snapshot {
+            detail,
             kind,
             query: q,
             unhealthy,
-            verbose,
             limit,
         } => print_json(&query::snapshot(
             store,
             query::SnapshotParams {
+                detail,
+                if_changed_since: None,
                 kind,
                 query: q,
                 labels: None,
-                unhealthy_only: Some(unhealthy),
-                verbose: Some(verbose),
+                unhealthy_only: unhealthy.then_some(true),
                 limit,
             },
         )?),
@@ -263,6 +273,7 @@ fn run_ctl(store: &Store, db: &Path, config: &Config, command: Ctl) -> anyhow::R
             kind,
             prefix,
             limit,
+            timestamps,
         } => print_json(&query::changes(
             store,
             query::ChangesParams {
@@ -270,6 +281,7 @@ fn run_ctl(store: &Store, db: &Path, config: &Config, command: Ctl) -> anyhow::R
                 kind,
                 resource_prefix: prefix,
                 limit,
+                compact: Some(!timestamps),
             },
         )?),
         Ctl::Export {

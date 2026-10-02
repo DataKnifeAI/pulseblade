@@ -14,14 +14,19 @@ use crate::query::{
 };
 
 const INSTRUCTIONS: &str = "\
-Pulseblade is an infrastructure monitor built for agents. Typical loop:
-1. state_snapshot: what exists and what is unhealthy right now (unhealthy sorts first).
-2. Remember `as_of_seq`, or name the moment with checkpoint_create (e.g. before a deploy).
-3. Later, changes_since with that checkpoint or `seq:<n>` to see only what changed.
-4. resource_explain for one resource: attributes, children, latest metrics, and the recent changes \
-on it and its parent (causal context).
-5. metrics_query for bounded, downsampled history of one metric.
-export_bulk returns JSONL when you need everything at once.
+Pulseblade is an infrastructure monitor built for agents. Responses are small by default; \
+ask for detail only where something changed. Cheap loop:
+1. state_snapshot with no arguments: a summary (counts, collector health, host key metrics, \
+unhealthy resources only). Remember `as_of_seq`, or name the moment with checkpoint_create.
+2. To poll, call changes_since with `seq:<as_of_seq>` (or a checkpoint), or state_snapshot with \
+`if_changed_since: <as_of_seq>`, which returns just `{as_of_seq, unchanged: true}` when nothing \
+changed. Continue from `next_cursor`.
+3. Drill down only on what changed or is unhealthy: resource_explain for one resource \
+(attributes, children, latest metrics, recent changes on it and its parent), metrics_query for \
+one metric's history (compact `values` array).
+Use state_snapshot filters (kind, query, labels) or detail=brief|full only when you need lists; \
+export_bulk returns everything as JSONL and is large.
+Collectors with `ok: false` or `stale: true` mean data is failing or going stale.
 Resource ids: host:<host>, disk:<host>:<mount>, net:<host>:<iface>, unit:<host>:<unit>.";
 
 /// MCP handler exposing Pulseblade's read tools.
@@ -53,7 +58,7 @@ impl PulsebladeServer {
     }
 
     #[tool(
-        description = "Current infrastructure state: resource counts by kind, then resources with health, labels, and latest metrics. Unhealthy resources sort first. Returns `as_of_seq` for use with changes_since.",
+        description = "Current infrastructure state. Default `summary`: counts by kind, collector health, host key metrics, and unhealthy resources with attributes. `brief` (default when filtering) lists every matching resource with health and latest metrics; `full` adds all labels and attributes. Pass `if_changed_since: <as_of_seq>` to get only `{as_of_seq, unchanged: true}` when nothing changed. Returns `as_of_seq` for changes_since.",
         annotations(title = "State snapshot", read_only_hint = true)
     )]
     async fn state_snapshot(
@@ -79,7 +84,7 @@ impl PulsebladeServer {
     }
 
     #[tool(
-        description = "Downsampled time series for one metric of one resource, capped at 300 points, with min/max/avg/last stats.",
+        description = "Downsampled time series for one metric of one resource: `values[i]` covers the bucket at `start + i * step_secs` (null where empty), about 120 points by default and at most 300, with min/max/avg/last stats.",
         annotations(title = "Query metrics", read_only_hint = true)
     )]
     async fn metrics_query(
@@ -110,7 +115,7 @@ impl PulsebladeServer {
     }
 
     #[tool(
-        description = "Changes (appeared, changed with before/after, disappeared) since a checkpoint name, `seq:<n>`, RFC 3339 time, or relative duration like `15m`. Oldest first; follow `next_cursor` to page or to poll for future changes.",
+        description = "Changes (appeared, changed with before/after, disappeared) since a checkpoint name, `seq:<n>`, RFC 3339 time, or relative duration like `15m`. Oldest first; follow `next_cursor` to page or to poll for future changes. Compact by default: `first_ts`/`last_ts` bound the set; pass `compact: false` for per-change `ts`.",
         annotations(title = "Changes since", read_only_hint = true)
     )]
     async fn changes_since(
@@ -144,7 +149,7 @@ impl ServerHandler for PulsebladeServer {
 mod tests {
     use super::*;
     use chrono::{Duration, Utc};
-    use pulseblade_core::{Health, Observation, Resource, ResourceKind, Sample};
+    use pulseblade_core::{CollectorRun, Health, Observation, Resource, ResourceKind, Sample};
     use serde::Serialize;
     use serde_json::Value;
 
@@ -163,6 +168,21 @@ mod tests {
                 },
             )
             .unwrap();
+        // Two older samples with a gap, so compact series contain nulls.
+        for ago in [5, 3] {
+            store
+                .apply(
+                    "host",
+                    Utc::now() - Duration::minutes(ago),
+                    &Observation {
+                        resources: vec![Resource::new("host:h", ResourceKind::Host, "h")
+                            .health(Health::Ok)
+                            .attr("os", "linux")],
+                        samples: vec![Sample::new("host:h", "cpu.used_pct", ago as f64)],
+                    },
+                )
+                .unwrap();
+        }
         store
             .apply(
                 "systemd",
@@ -222,18 +242,53 @@ mod tests {
     fn structured_outputs_match_advertised_schemas() {
         let store = seeded();
         let server = PulsebladeServer::new(store.clone());
-
-        for verbose in [false, true] {
-            let snap = query::snapshot(
-                &store,
-                SnapshotParams {
-                    verbose: Some(verbose),
-                    ..Default::default()
-                },
-            )
+        store
+            .record_run(&CollectorRun {
+                source: "systemd".into(),
+                ts: Utc::now(),
+                duration_ms: 4,
+                ok: false,
+                error: Some("systemctl: boom".into()),
+                resource_count: 0,
+                sample_count: 0,
+                change_count: 0,
+                interval_secs: Some(15),
+            })
             .unwrap();
-            assert_matches_output_schema(&server, "state_snapshot", snap);
+        let seq = store.current_seq().unwrap();
+
+        let detail_modes = [
+            None,
+            Some(query::Detail::Summary),
+            Some(query::Detail::Brief),
+            Some(query::Detail::Full),
+        ];
+        for detail in detail_modes {
+            for if_changed_since in [None, Some(seq), Some(seq - 1)] {
+                let snap = query::snapshot(
+                    &store,
+                    SnapshotParams {
+                        detail,
+                        if_changed_since,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(snap.unchanged, if_changed_since == Some(seq));
+                assert_matches_output_schema(&server, "state_snapshot", snap);
+            }
         }
+        let filtered = query::snapshot(
+            &store,
+            SnapshotParams {
+                query: Some(":h".into()),
+                limit: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(filtered.truncated);
+        assert_matches_output_schema(&server, "state_snapshot", filtered);
         for id in ["host:h", "unit:h:a.service", "unit:h:b.service"] {
             let e = query::explain(
                 &store,
@@ -245,33 +300,63 @@ mod tests {
             .unwrap();
             assert_matches_output_schema(&server, "resource_explain", e);
         }
-        for range in ["1h", "1s"] {
+        for (range, step) in [("1h", None), ("1s", None), ("10m", Some("1m"))] {
             let s = query::metrics(
                 &store,
                 MetricsParams {
                     id: "host:h".into(),
                     metric: "cpu.used_pct".into(),
                     range: Some(range.into()),
-                    step: None,
+                    step: step.map(Into::into),
                     agg: None,
                 },
             )
             .unwrap();
             assert_matches_output_schema(&server, "metrics_query", s);
         }
-        let cp = query::checkpoint(&store, CheckpointParams { name: "cp".into() }).unwrap();
-        assert_matches_output_schema(&server, "checkpoint_create", cp);
-        let cs = query::changes(
+        let gappy = query::metrics(
             &store,
-            ChangesParams {
-                since: "seq:0".into(),
-                kind: None,
-                resource_prefix: None,
-                limit: None,
+            MetricsParams {
+                id: "host:h".into(),
+                metric: "cpu.used_pct".into(),
+                range: Some("10m".into()),
+                step: Some("1m".into()),
+                agg: None,
             },
         )
         .unwrap();
-        assert!(cs.changes.iter().any(|c| c.field.is_some()));
-        assert_matches_output_schema(&server, "changes_since", cs);
+        assert!(gappy.values.contains(&None), "{:?}", gappy.values);
+        assert_matches_output_schema(&server, "metrics_query", gappy);
+
+        let cp = query::checkpoint(&store, CheckpointParams { name: "cp".into() }).unwrap();
+        assert_matches_output_schema(&server, "checkpoint_create", cp);
+        for compact in [None, Some(false)] {
+            let cs = query::changes(
+                &store,
+                ChangesParams {
+                    since: "seq:0".into(),
+                    kind: None,
+                    resource_prefix: None,
+                    limit: None,
+                    compact,
+                },
+            )
+            .unwrap();
+            assert!(cs.changes.iter().any(|c| c.field.is_some()));
+            assert_matches_output_schema(&server, "changes_since", cs);
+        }
+        let empty = query::changes(
+            &store,
+            ChangesParams {
+                since: format!("seq:{seq}"),
+                kind: None,
+                resource_prefix: None,
+                limit: None,
+                compact: None,
+            },
+        )
+        .unwrap();
+        assert!(empty.changes.is_empty());
+        assert_matches_output_schema(&server, "changes_since", empty);
     }
 }
