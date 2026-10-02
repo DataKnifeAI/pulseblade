@@ -5,13 +5,13 @@
 //! diffs them against what it already knows to produce [`Change`]s.
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 use chrono::{DateTime, TimeZone, Utc};
 use pulseblade_core::{
-    Aggregation, Change, ChangeKind, Checkpoint, Health, Observation, Point, Resource,
-    ResourceKind, Since, StoredResource,
+    Aggregation, Change, ChangeKind, Checkpoint, CollectorRun, Health, Observation, Point,
+    Resource, ResourceKind, Since, StoredResource,
 };
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde_json::{json, Value};
@@ -80,7 +80,24 @@ CREATE TABLE IF NOT EXISTS latest (
     value       REAL NOT NULL,
     PRIMARY KEY (resource_id, metric)
 );
+
+CREATE TABLE IF NOT EXISTS collector_runs (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    source         TEXT NOT NULL,
+    ts             INTEGER NOT NULL,
+    duration_ms    INTEGER NOT NULL,
+    ok             INTEGER NOT NULL,
+    error          TEXT,
+    resource_count INTEGER NOT NULL,
+    sample_count   INTEGER NOT NULL,
+    change_count   INTEGER NOT NULL,
+    interval_secs  INTEGER
+);
+CREATE INDEX IF NOT EXISTS collector_runs_source ON collector_runs(source, id);
 "#;
+
+/// Collector runs kept per source; older rows are pruned on insert.
+const RUNS_KEPT_PER_SOURCE: i64 = 240;
 
 /// Filter for [`Store::resources`]. Empty fields match everything.
 #[derive(Debug, Clone, Default)]
@@ -133,27 +150,140 @@ pub struct Latest {
     pub value: f64,
 }
 
+/// The most recent run of one collector, with failure context.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CollectorSummary {
+    pub last: CollectorRun,
+    /// Most recent successful run among the retained rows.
+    pub last_success: Option<DateTime<Utc>>,
+    /// Failed runs since the last success.
+    pub consecutive_failures: usize,
+}
+
+/// Row counts for self-observability.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StoreStats {
+    pub samples: u64,
+    pub changes: u64,
+    pub checkpoints: u64,
+}
+
 pub struct Store {
     conn: Mutex<Connection>,
+    path: Option<PathBuf>,
 }
 
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        Self::init(Connection::open(path)?)
+        let path = path.as_ref();
+        Self::init(Connection::open(path)?, Some(path.to_path_buf()))
     }
 
     pub fn open_in_memory() -> Result<Self> {
-        Self::init(Connection::open_in_memory()?)
+        Self::init(Connection::open_in_memory()?, None)
     }
 
-    fn init(conn: Connection) -> Result<Self> {
+    fn init(conn: Connection, path: Option<PathBuf>) -> Result<Self> {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(SCHEMA)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            path,
         })
+    }
+
+    /// Database file, or `None` for in-memory stores.
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    /// Bytes on disk for the database and its WAL, when file-backed.
+    pub fn size_bytes(&self) -> Option<u64> {
+        let path = self.path.as_ref()?;
+        let main = std::fs::metadata(path).ok()?.len();
+        let mut wal = path.clone().into_os_string();
+        wal.push("-wal");
+        Some(main + std::fs::metadata(wal).map(|m| m.len()).unwrap_or(0))
+    }
+
+    pub fn stats(&self) -> Result<StoreStats> {
+        let conn = self.conn();
+        let count = |table: &str| -> Result<u64> {
+            Ok(
+                conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| {
+                    r.get::<_, i64>(0)
+                })? as u64,
+            )
+        };
+        Ok(StoreStats {
+            samples: count("samples")?,
+            changes: count("changes")?,
+            checkpoints: count("checkpoints")?,
+        })
+    }
+
+    /// Persist one collector pass and prune old runs of the same source.
+    pub fn record_run(&self, run: &CollectorRun) -> Result<()> {
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO collector_runs
+                (source, ts, duration_ms, ok, error, resource_count, sample_count, change_count, interval_secs)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                run.source,
+                run.ts.timestamp_millis(),
+                run.duration_ms as i64,
+                run.ok,
+                run.error,
+                run.resource_count as i64,
+                run.sample_count as i64,
+                run.change_count as i64,
+                run.interval_secs.map(|s| s as i64),
+            ],
+        )?;
+        conn.execute(
+            "DELETE FROM collector_runs WHERE source = ?1 AND id <= (
+                SELECT id FROM collector_runs WHERE source = ?1
+                ORDER BY id DESC LIMIT 1 OFFSET ?2)",
+            params![run.source, RUNS_KEPT_PER_SOURCE],
+        )?;
+        Ok(())
+    }
+
+    /// Latest run of every collector that has ever recorded one, by source.
+    pub fn collector_summaries(&self) -> Result<Vec<CollectorSummary>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT r.source, r.ts, r.duration_ms, r.ok, r.error, r.resource_count,
+                    r.sample_count, r.change_count, r.interval_secs,
+                    (SELECT MAX(ts) FROM collector_runs s WHERE s.source = r.source AND s.ok = 1),
+                    (SELECT COUNT(*) FROM collector_runs f WHERE f.source = r.source AND f.ok = 0
+                        AND f.id > COALESCE((SELECT MAX(id) FROM collector_runs g
+                                             WHERE g.source = r.source AND g.ok = 1), 0))
+             FROM collector_runs r
+             WHERE r.id IN (SELECT MAX(id) FROM collector_runs GROUP BY source)
+             ORDER BY r.source",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(CollectorSummary {
+                last: CollectorRun {
+                    source: r.get(0)?,
+                    ts: from_ms(r.get(1)?),
+                    duration_ms: r.get::<_, i64>(2)? as u64,
+                    ok: r.get(3)?,
+                    error: r.get(4)?,
+                    resource_count: r.get::<_, i64>(5)? as usize,
+                    sample_count: r.get::<_, i64>(6)? as usize,
+                    change_count: r.get::<_, i64>(7)? as usize,
+                    interval_secs: r.get::<_, Option<i64>>(8)?.map(|s| s as u64),
+                },
+                last_success: r.get::<_, Option<i64>>(9)?.map(from_ms),
+                consecutive_failures: r.get::<_, i64>(10)? as usize,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     fn conn(&self) -> MutexGuard<'_, Connection> {
@@ -782,6 +912,48 @@ mod tests {
             store.resolve_since(&Since::Checkpoint("nope".into())),
             Err(StoreError::UnknownCheckpoint(_))
         ));
+    }
+
+    #[test]
+    fn collector_runs_summarize_and_prune() {
+        let store = Store::open_in_memory().unwrap();
+        let t0 = Utc::now() - Duration::minutes(10);
+        let run = |source: &str, i: i64, ok: bool| CollectorRun {
+            source: source.into(),
+            ts: t0 + Duration::seconds(i),
+            duration_ms: 5,
+            ok,
+            error: (!ok).then(|| "boom".to_string()),
+            resource_count: 3,
+            sample_count: 7,
+            change_count: 0,
+            interval_secs: Some(15),
+        };
+        for i in 0..RUNS_KEPT_PER_SOURCE + 10 {
+            store.record_run(&run("host", i, true)).unwrap();
+        }
+        store.record_run(&run("systemd", 0, true)).unwrap();
+        store.record_run(&run("systemd", 1, false)).unwrap();
+        store.record_run(&run("systemd", 2, false)).unwrap();
+
+        let kept: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM collector_runs WHERE source = 'host'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, RUNS_KEPT_PER_SOURCE);
+
+        let s = store.collector_summaries().unwrap();
+        assert_eq!(s.len(), 2);
+        assert_eq!(s[0].last.source, "host");
+        assert!(s[0].last.ok);
+        assert_eq!(s[0].consecutive_failures, 0);
+        assert_eq!(s[1].last.error.as_deref(), Some("boom"));
+        assert_eq!(s[1].consecutive_failures, 2);
+        assert_eq!(s[1].last_success, Some(from_ms(t0.timestamp_millis())));
     }
 
     #[test]

@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use chrono::Utc;
 use pulseblade_collect::{default_collectors, Collector};
-use pulseblade_core::{ChangeKind, LabelRule};
+use pulseblade_core::{ChangeKind, CollectorRun, LabelRule};
 use pulseblade_store::Store;
 use tokio_util::sync::CancellationToken;
 
@@ -33,28 +33,53 @@ impl CollectorLock {
     }
 }
 
-/// Run one pass of every collector and record the results.
+/// Run one pass of every collector and record the results, including a
+/// [`CollectorRun`] per collector. `interval_secs` is `None` for one-off passes.
 pub fn collect_once(
     store: &Store,
     collectors: &mut [Box<dyn Collector>],
     labels: &[LabelRule],
+    interval_secs: Option<u64>,
 ) -> usize {
     let mut total = 0;
     for c in collectors.iter_mut() {
-        let mut obs = match c.collect() {
-            Ok(obs) => obs,
-            Err(e) => {
-                tracing::warn!(collector = c.name(), error = %e, "collection failed");
-                continue;
-            }
+        let started = Instant::now();
+        let ts = Utc::now();
+        let mut run = CollectorRun {
+            source: c.name().to_string(),
+            ts,
+            duration_ms: 0,
+            ok: false,
+            error: None,
+            resource_count: 0,
+            sample_count: 0,
+            change_count: 0,
+            interval_secs,
         };
-        for r in &mut obs.resources {
-            for rule in labels {
-                rule.apply(r);
-            }
-        }
-        match store.apply(c.name(), Utc::now(), &obs) {
+        let applied = c
+            .collect()
+            .map_err(|e| {
+                tracing::warn!(collector = c.name(), error = %e, "collection failed");
+                format!("collect: {e}")
+            })
+            .and_then(|mut obs| {
+                for r in &mut obs.resources {
+                    for rule in labels {
+                        rule.apply(r);
+                    }
+                }
+                run.resource_count = obs.resources.len();
+                run.sample_count = obs.samples.len();
+                store.apply(c.name(), ts, &obs).map_err(|e| {
+                    tracing::error!(collector = c.name(), error = %e, "store write failed");
+                    format!("store: {e}")
+                })
+            });
+        run.duration_ms = started.elapsed().as_millis() as u64;
+        match applied {
             Ok(changes) => {
+                run.ok = true;
+                run.change_count = changes.len();
                 total += changes.len();
                 for ch in changes.iter().filter(|ch| {
                     ch.kind == ChangeKind::Disappeared || ch.field.as_deref() == Some("health")
@@ -69,7 +94,10 @@ pub fn collect_once(
                     );
                 }
             }
-            Err(e) => tracing::error!(collector = c.name(), error = %e, "store write failed"),
+            Err(e) => run.error = Some(e),
+        }
+        if let Err(e) = store.record_run(&run) {
+            tracing::warn!(collector = c.name(), error = %e, "recording collector run failed");
         }
     }
     total
@@ -97,7 +125,7 @@ pub fn spawn_collector(
         let mut last_prune = Instant::now();
         while !shutdown.is_cancelled() {
             let started = Instant::now();
-            let n = collect_once(&store, &mut collectors, &labels);
+            let n = collect_once(&store, &mut collectors, &labels, Some(interval.as_secs()));
             tracing::debug!(
                 changes = n,
                 elapsed_ms = started.elapsed().as_millis() as u64,

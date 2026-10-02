@@ -294,7 +294,7 @@ fn run_ctl(store: &Store, db: &Path, config: &Config, command: Ctl) -> anyhow::R
             let _lock = CollectorLock::try_acquire(db)?
                 .context("a node is already collecting into this database")?;
             let mut collectors = default_collectors();
-            let n = collect_once(store, &mut collectors, &config.labels);
+            let n = collect_once(store, &mut collectors, &config.labels, None);
             print_json(&serde_json::json!({
                 "changes": n,
                 "as_of_seq": store.current_seq()?,

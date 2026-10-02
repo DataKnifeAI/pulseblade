@@ -259,6 +259,24 @@ pub struct Change {
     pub after: Option<Value>,
 }
 
+/// One collector pass, persisted so any process can judge collector health.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct CollectorRun {
+    /// Collector name; also the `source` that owns its resources.
+    pub source: String,
+    pub ts: DateTime<Utc>,
+    pub duration_ms: u64,
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub resource_count: usize,
+    pub sample_count: usize,
+    pub change_count: usize,
+    /// Configured seconds between passes; absent for one-off runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval_secs: Option<u64>,
+}
+
 /// A named position in the change journal.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Checkpoint {
