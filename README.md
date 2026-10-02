@@ -1,5 +1,7 @@
 # Pulseblade
 
+![Pulseblade — an amber pulse sweeping out from a central hub across a fleet of infrastructure nodes, revealing healthy and degraded hosts](docs/assets/pulseblade-hero.jpg)
+
 **Pulseblade** — a pulse that reveals what is moving across your infrastructure.
 
 Pulseblade is a self-hosted infrastructure monitor built for **AI agents as the primary consumer**. A lightweight per-host **node** collects metrics and state, keeps a change journal, and exposes everything through the [Model Context Protocol](https://modelcontextprotocol.io) (MCP). Agents ask "what changed since checkpoint X?" instead of drowning in alert storms; dashboards are a later, degraded view of the same data.
