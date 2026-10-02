@@ -1,0 +1,336 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pulseblade</title>
+<style>
+  :root {
+    --bg: #0a1020; --panel: #111a2c; --panel2: #16213a; --line: #22304d;
+    --text: #d8e0ee; --muted: #8592ab; --amber: #f5a524; --ok: #2dd4a7;
+    --warn: #f97343; --bad: #ef4444; --unknown: #6b7890;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: radial-gradient(1200px 600px at 50% -200px, #1a2440 0%, var(--bg) 60%);
+    color: var(--text); font: 13px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; min-height: 100vh; }
+  header { display: flex; align-items: center; gap: 16px; padding: 12px 20px; border-bottom: 1px solid var(--line);
+    background: rgba(10,16,32,.85); position: sticky; top: 0; z-index: 2; backdrop-filter: blur(6px); }
+  .brand { font-weight: 700; font-size: 16px; letter-spacing: .5px; display: flex; align-items: center; gap: 8px; }
+  .pulse { width: 10px; height: 10px; border-radius: 50%; background: var(--amber); box-shadow: 0 0 0 0 rgba(245,165,36,.7);
+    animation: pulse 2s infinite; }
+  .paused .pulse { animation: none; opacity: .4; }
+  @keyframes pulse { 70% { box-shadow: 0 0 0 10px rgba(245,165,36,0); } 100% { box-shadow: 0 0 0 0 rgba(245,165,36,0); } }
+  .spacer { flex: 1; }
+  .meta { color: var(--muted); }
+  button, select, input { background: var(--panel2); color: var(--text); border: 1px solid var(--line); border-radius: 6px;
+    padding: 5px 9px; font: inherit; }
+  button { cursor: pointer; } button:hover { border-color: var(--amber); }
+  main { padding: 16px 20px; display: grid; gap: 14px; grid-template-columns: repeat(12, 1fr); }
+  section { background: linear-gradient(180deg, var(--panel), #0f1727); border: 1px solid var(--line); border-radius: 10px;
+    padding: 12px 14px; min-width: 0; }
+  h2 { margin: 0 0 10px; font-size: 11px; text-transform: uppercase; letter-spacing: 1.2px; color: var(--muted); font-weight: 600;
+    display: flex; align-items: center; gap: 8px; }
+  h2 .right { margin-left: auto; text-transform: none; letter-spacing: 0; font-weight: 400; }
+  .c3 { grid-column: span 3; } .c4 { grid-column: span 4; } .c5 { grid-column: span 5; } .c6 { grid-column: span 6; }
+  .c7 { grid-column: span 7; } .c8 { grid-column: span 8; } .c12 { grid-column: span 12; }
+  @media (max-width: 1100px) { .c3, .c4, .c5, .c6, .c7, .c8 { grid-column: span 12; } }
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; }
+  .kv dt { color: var(--muted); } .kv dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; vertical-align: middle; flex: none; }
+  .ok { background: var(--ok); } .degraded { background: var(--warn); } .failed { background: var(--bad); } .unknown { background: var(--unknown); }
+  .t-ok { color: var(--ok); } .t-degraded { color: var(--warn); } .t-failed { color: var(--bad); } .t-unknown { color: var(--muted); }
+  .row { display: flex; align-items: center; gap: 8px; padding: 4px 0; border-bottom: 1px dashed var(--line); }
+  .row:last-child { border-bottom: 0; }
+  .num { font-variant-numeric: tabular-nums; }
+  .bar { height: 6px; background: var(--panel2); border-radius: 3px; overflow: hidden; margin-top: 3px; }
+  .bar > i { display: block; height: 100%; background: var(--ok); }
+  .metric { margin-bottom: 8px; }
+  .metric .lbl { display: flex; justify-content: space-between; color: var(--muted); }
+  .metric .lbl b { color: var(--text); font-weight: 600; }
+  table { width: 100%; border-collapse: collapse; }
+  th { text-align: left; color: var(--muted); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: .8px;
+    padding: 6px 8px; border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--panel); }
+  td { padding: 5px 8px; border-bottom: 1px solid #1a2540; vertical-align: top; }
+  tbody tr.click { cursor: pointer; } tbody tr.click:hover { background: #18233c; } tr.sel { background: #1d2a48 !important; }
+  .scroll { max-height: 420px; overflow: auto; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; overflow-wrap: anywhere; }
+  .muted { color: var(--muted); }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip { background: var(--panel2); border: 1px solid var(--line); border-radius: 999px; padding: 2px 9px; cursor: pointer; }
+  .chip.on { border-color: var(--amber); color: var(--amber); }
+  .counts td.num { text-align: right; }
+  .err { background: #3a1620; border: 1px solid var(--bad); color: #ffd6d6; padding: 8px 12px; border-radius: 8px; grid-column: span 12; }
+  .empty { color: var(--muted); padding: 6px 0; }
+  .filters { display: flex; gap: 8px; margin-bottom: 8px; } .filters input { flex: 1; }
+  svg.spark { width: 100%; height: 120px; display: block; background: #0c1426; border: 1px solid var(--line); border-radius: 8px; }
+  .chg-changed { color: var(--amber); } .chg-appeared { color: var(--ok); } .chg-disappeared { color: var(--bad); }
+</style>
+</head>
+<body>
+<header id="hdr">
+  <div class="brand"><span class="pulse"></span>Pulseblade</div>
+  <span class="meta" id="hdr-meta">loading…</span>
+  <span class="spacer"></span>
+  <span class="meta" id="updated"></span>
+  <select id="interval" title="Refresh interval">
+    <option value="5">5s</option><option value="15" selected>15s</option><option value="60">60s</option>
+  </select>
+  <button id="toggle">Pause</button>
+</header>
+<main id="main">
+  <div class="err" id="err" hidden></div>
+  <section class="c3"><h2>Pulseblade</h2><dl class="kv" id="self"></dl></section>
+  <section class="c3"><h2>Collectors</h2><div id="collectors"></div></section>
+  <section class="c3"><h2>Host</h2><div id="hosts"></div></section>
+  <section class="c3"><h2>Resources by kind</h2><table class="counts"><thead><tr><th>Kind</th><th style="text-align:right">Total</th>
+    <th style="text-align:right">Failed</th><th style="text-align:right">Degraded</th></tr></thead><tbody id="counts"></tbody></table></section>
+  <section class="c12"><h2>Unhealthy <span class="right muted" id="unhealthy-n"></span></h2><div id="unhealthy"></div></section>
+  <section class="c7">
+    <h2>Resources <span class="right muted" id="res-n"></span></h2>
+    <div class="filters"><select id="kind"><option value="">all kinds</option></select>
+      <input id="q" placeholder="filter by id or name…"></div>
+    <div class="scroll"><table><thead><tr><th></th><th>Resource</th><th>State</th></tr></thead><tbody id="resources"></tbody></table></div>
+  </section>
+  <section class="c5" id="detail-panel">
+    <h2>Details <span class="right"><select id="range"><option>15m</option><option selected>1h</option><option>6h</option><option>24h</option></select></span></h2>
+    <div id="detail"><div class="empty">Select a resource to see its attributes, metrics, and recent changes.</div></div>
+  </section>
+  <section class="c12">
+    <h2>Recent changes <span class="right"><select id="window"><option>15m</option><option selected>1h</option><option>6h</option><option>24h</option><option>7d</option></select></span></h2>
+    <div class="scroll"><table><thead><tr><th>Time</th><th>Seq</th><th>Resource</th><th>Change</th></tr></thead><tbody id="changes"></tbody></table></div>
+  </section>
+</main>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+// Deep links: ?kind=service&q=ssh&select=<resource id>&metric=<metric>
+const link = new URLSearchParams(location.search);
+const state = { timer: null, paused: false, resources: [], selected: link.get("select"),
+  metric: link.get("metric"), kind: link.get("kind") || "" };
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+async function api(path) {
+  const r = await fetch(path, { headers: { accept: "application/json" } });
+  const body = await r.json().catch(() => ({ error: r.statusText }));
+  if (!r.ok) throw new Error(body.error || r.statusText);
+  return body;
+}
+
+function bytes(n) {
+  if (n == null) return "–";
+  const u = ["B", "KB", "MB", "GB", "TB"]; let i = 0;
+  while (Math.abs(n) >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return (i ? n.toFixed(1) : Math.round(n)) + " " + u[i];
+}
+function fmt(metric, v) {
+  if (v == null) return "–";
+  if (metric.endsWith("_pct")) return v.toFixed(1) + "%";
+  if (metric.endsWith("bytes_per_s")) return bytes(v) + "/s";
+  if (metric.endsWith("_bytes")) return bytes(v);
+  return Number.isInteger(v) ? String(v) : v.toFixed(2);
+}
+function ago(secs) {
+  if (secs == null) return "–";
+  if (secs < 60) return secs + "s ago";
+  if (secs < 3600) return Math.round(secs / 60) + "m ago";
+  if (secs < 86400) return (secs / 3600).toFixed(1) + "h ago";
+  return (secs / 86400).toFixed(1) + "d ago";
+}
+function dur(secs) {
+  if (secs == null) return "–";
+  const d = Math.floor(secs / 86400), h = Math.floor(secs % 86400 / 3600), m = Math.floor(secs % 3600 / 60);
+  return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : `${m}m ${secs % 60}s`;
+}
+const time = (ts) => new Date(ts).toLocaleTimeString();
+const dot = (h) => `<span class="dot ${esc(h)}" title="${esc(h)}"></span>`;
+const rid = (id) => `<span class="mono">${esc(id)}</span>`;
+const showError = (e) => { $("err").hidden = !e; $("err").textContent = e ? "Could not reach Pulseblade: " + e.message : ""; };
+
+function summary(r) {
+  const m = r.metrics || {}, a = r.attrs || {};
+  switch (r.kind) {
+    case "host": return `cpu ${fmt("cpu.used_pct", m["cpu.used_pct"])} · mem ${fmt("mem.used_pct", m["mem.used_pct"])} · load ${fmt("load.1m", m["load.1m"])}`;
+    case "disk": return `${fmt("disk.used_pct", m["disk.used_pct"])} used · ${fmt("disk.available_bytes", m["disk.available_bytes"])} free`;
+    case "net_iface": return `rx ${fmt("net.rx_bytes_per_s", m["net.rx_bytes_per_s"])} · tx ${fmt("net.tx_bytes_per_s", m["net.tx_bytes_per_s"])}`;
+    case "service": return [a.active, a.sub, a.unit_file_state].filter(Boolean).join(" · ");
+    default: return Object.keys(m).slice(0, 2).map((k) => `${k} ${fmt(k, m[k])}`).join(" · ");
+  }
+}
+
+function renderStatus(s) {
+  $("hdr-meta").textContent = `v${s.version} · seq ${s.as_of_seq}`;
+  $("self").innerHTML = [
+    ["Version", s.version], ["Uptime", dur(s.uptime_secs)], ["Journal seq", s.as_of_seq],
+    ["Resources", s.resources.total], ["Samples", s.samples.toLocaleString()], ["Changes", s.changes.toLocaleString()],
+    ["Checkpoints", s.checkpoints], ["Database", bytes(s.db.size_bytes)],
+  ].map(([k, v]) => `<dt>${k}</dt><dd>${esc(v)}</dd>`).join("") +
+    (s.db.path ? `<dt>Path</dt><dd class="mono muted" title="${esc(s.db.path)}">${esc(s.db.path.split("/").pop())}</dd>` : "");
+  $("collectors").innerHTML = s.collectors.length ? s.collectors.map((c) => `
+    <div class="row">${dot(c.ok ? "ok" : c.stale ? "degraded" : "failed")}<b>${esc(c.source)}</b>
+      <span class="spacer"></span><span class="muted num">${ago(c.age_secs)} · ${c.duration_ms} ms · ${c.resource_count} res</span></div>
+    ${c.error ? `<div class="t-failed mono">${esc(c.error)}</div>` : ""}
+    ${c.stale ? `<div class="t-degraded">stale: no pass in ${ago(c.age_secs).replace(" ago", "")}</div>` : ""}`).join("")
+    : `<div class="empty">No collector runs recorded yet.</div>`;
+  $("counts").innerHTML = Object.entries(s.resources.by_kind).map(([k, c]) => `
+    <tr><td>${esc(k)}</td><td class="num">${c.total}</td>
+    <td class="num ${c.failed ? "t-failed" : "muted"}">${c.failed || 0}</td>
+    <td class="num ${c.degraded ? "t-degraded" : "muted"}">${c.degraded || 0}</td></tr>`).join("");
+}
+
+function renderHosts(list) {
+  const hosts = list.filter((r) => r.kind === "host");
+  $("hosts").innerHTML = hosts.length ? hosts.map((h) => {
+    const m = h.metrics || {};
+    const bar = (k, label) => {
+      const v = m[k]; if (v == null) return "";
+      const color = v >= 90 ? "var(--bad)" : v >= 75 ? "var(--warn)" : "var(--ok)";
+      return `<div class="metric"><div class="lbl"><span>${label}</span><b>${fmt(k, v)}</b></div>
+        <div class="bar"><i style="width:${Math.min(100, v)}%;background:${color}"></i></div></div>`;
+    };
+    return `<div class="row">${dot(h.health)}<b>${esc(h.name || h.id.slice(5))}</b><span class="spacer"></span>
+      <span class="muted">load ${fmt("load.1m", m["load.1m"])} / ${fmt("load.5m", m["load.5m"])} / ${fmt("load.15m", m["load.15m"])}</span></div>
+      ${bar("cpu.used_pct", "CPU")}${bar("mem.used_pct", "Memory")}${bar("swap.used_pct", "Swap")}
+      <div class="lbl muted">available memory <b>${fmt("mem.available_bytes", m["mem.available_bytes"])}</b></div>`;
+  }).join("") : `<div class="empty">No host resource.</div>`;
+}
+
+function renderUnhealthy(list) {
+  const bad = list.filter((r) => r.health === "failed" || r.health === "degraded");
+  $("unhealthy-n").textContent = bad.length ? `${bad.length} resource(s)` : "";
+  $("unhealthy").innerHTML = bad.length ? bad.map((r) => `
+    <div class="row click" data-id="${esc(r.id)}" style="cursor:pointer">${dot(r.health)}
+      <span class="t-${esc(r.health)}">${esc(r.health)}</span>${rid(r.id)}<span class="spacer"></span>
+      <span class="muted">${esc(summary(r))}</span></div>`).join("")
+    : `<div class="empty t-ok">Everything reporting is healthy.</div>`;
+}
+
+function renderResources() {
+  const kind = $("kind").value, q = $("q").value.trim().toLowerCase();
+  const rows = state.resources.filter((r) => (!kind || r.kind === kind) &&
+    (!q || r.id.toLowerCase().includes(q) || (r.name || "").toLowerCase().includes(q)));
+  $("res-n").textContent = `${rows.length} of ${state.resources.length}`;
+  $("resources").innerHTML = rows.map((r) => `
+    <tr class="click ${r.id === state.selected ? "sel" : ""}" data-id="${esc(r.id)}">
+      <td>${dot(r.health)}</td><td>${rid(r.id)}</td><td class="muted">${esc(summary(r))}</td></tr>`).join("");
+}
+
+function fillKinds(list) {
+  const sel = $("kind"), cur = sel.value || state.kind;
+  state.kind = "";
+  const kinds = [...new Set(list.map((r) => r.kind))].sort();
+  sel.innerHTML = `<option value="">all kinds</option>` + kinds.map((k) => `<option ${k === cur ? "selected" : ""}>${esc(k)}</option>`).join("");
+}
+
+function changeText(c) {
+  const v = (x) => x == null ? "∅" : typeof x === "object" ? (x.health ? `${x.kind} ${x.health}` : JSON.stringify(x)) : String(x);
+  if (c.kind === "changed") return `${esc(c.field)}: ${esc(v(c.before))} → ${esc(v(c.after))}`;
+  return c.kind === "appeared" ? `appeared (${esc(v(c.after))})` : `disappeared (was ${esc(v(c.before))})`;
+}
+
+async function refreshChanges() {
+  const cs = await api(`/api/v1/changes?since=${encodeURIComponent($("window").value)}&limit=1000&compact=false`);
+  const list = cs.changes.slice().reverse().slice(0, 300);
+  $("changes").innerHTML = list.length ? list.map((c) => `
+    <tr class="click" data-id="${esc(c.resource_id)}"><td class="num muted">${time(c.ts)}</td><td class="num muted">${c.seq}</td>
+    <td>${rid(c.resource_id)}</td><td class="chg-${esc(c.kind)}">${changeText(c)}</td></tr>`).join("")
+    : `<tr><td colspan="4" class="empty">No changes in this window.</td></tr>`;
+}
+
+function spark(series) {
+  const vals = series.values, present = vals.filter((v) => v != null);
+  if (!present.length) return `<div class="empty">No samples in range.</div>`;
+  const W = 600, H = 120, P = 8, min = Math.min(...present), max = Math.max(...present), span = max - min || 1;
+  const x = (i) => P + (vals.length < 2 ? (W - 2 * P) / 2 : i * (W - 2 * P) / (vals.length - 1));
+  const y = (v) => H - P - (v - min) / span * (H - 2 * P);
+  let d = "", dots = "", pen = false;
+  vals.forEach((v, i) => {
+    if (v == null) { pen = false; return; }
+    const p = `${x(i).toFixed(1)},${y(v).toFixed(1)}`;
+    d += `${pen ? "L" : "M"}${p} `;
+    if (!pen && vals[i + 1] == null) dots += `M${p} l0.01,0 `;
+    pen = true;
+  });
+  const s = series.stats;
+  return `<svg class="spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
+      <path d="${d}" fill="none" stroke="var(--amber)" stroke-width="2" vector-effect="non-scaling-stroke"/>
+      <path d="${dots}" stroke="var(--amber)" stroke-width="5" stroke-linecap="round" vector-effect="non-scaling-stroke"/></svg>
+    <div class="muted num" style="display:flex;justify-content:space-between;margin-top:4px">
+      <span>min ${fmt(series.metric, s.min)}</span><span>avg ${fmt(series.metric, s.avg)}</span>
+      <span>max ${fmt(series.metric, s.max)}</span><span>last <b style="color:var(--text)">${fmt(series.metric, s.last)}</b></span>
+      <span>step ${series.step_secs}s</span></div>`;
+}
+
+async function refreshDetail() {
+  const id = state.selected; if (!id) return;
+  const e = await api(`/api/v1/resources/${encodeURIComponent(id)}?changes_limit=10`);
+  const r = e.resource, metrics = Object.keys(e.metrics);
+  if (!metrics.includes(state.metric)) state.metric = metrics[0] || null;
+  let chart = "";
+  if (state.metric) {
+    const s = await api(`/api/v1/metrics?id=${encodeURIComponent(id)}&metric=${encodeURIComponent(state.metric)}&range=${$("range").value}`);
+    chart = spark(s);
+  }
+  const kv = (obj) => Object.entries(obj || {}).map(([k, v]) =>
+    `<dt>${esc(k)}</dt><dd class="mono">${esc(typeof v === "object" ? JSON.stringify(v) : v)}</dd>`).join("");
+  $("detail").innerHTML = `
+    <div class="row">${dot(r.health)}<b class="mono">${esc(r.id)}</b><span class="spacer"></span><span class="t-${esc(r.health)}">${esc(r.health)}</span></div>
+    <dl class="kv" style="margin:8px 0">
+      <dt>kind</dt><dd>${esc(r.kind)}</dd><dt>source</dt><dd>${esc(r.source)}</dd>
+      ${r.parent ? `<dt>parent</dt><dd class="mono">${esc(r.parent)}</dd>` : ""}
+      <dt>first seen</dt><dd>${esc(new Date(r.first_seen).toLocaleString())}</dd>
+      ${e.children.total ? `<dt>children</dt><dd>${e.children.total} (${e.children.unhealthy.length} unhealthy)</dd>` : ""}
+      ${kv(r.labels)}${kv(r.attrs)}</dl>
+    ${metrics.length ? `<div class="chips" style="margin-bottom:8px">${metrics.map((m) =>
+      `<span class="chip ${m === state.metric ? "on" : ""}" data-metric="${esc(m)}">${esc(m)} <b>${fmt(m, e.metrics[m].value)}</b></span>`).join("")}</div>${chart}` : ""}
+    <h2 style="margin-top:12px">Recent changes here and on parent</h2>
+    ${e.recent_changes.length ? e.recent_changes.map((c) => `<div class="row"><span class="muted num">${time(c.ts)}</span>
+      ${rid(c.resource_id === r.id ? "" : c.resource_id)}<span class="chg-${esc(c.kind)}">${changeText(c)}</span></div>`).join("")
+      : `<div class="empty">None retained.</div>`}`;
+}
+
+function select(id) {
+  state.selected = id; state.metric = null;
+  renderResources();
+  refreshDetail().catch(showError);
+  if (window.innerWidth < 1100) $("detail-panel").scrollIntoView({ behavior: "smooth" });
+}
+
+async function refresh() {
+  try {
+    const [status, snap] = await Promise.all([api("/api/v1/status"), api("/api/v1/snapshot?detail=full&limit=500")]);
+    state.resources = snap.resources;
+    renderStatus(status); renderHosts(snap.resources); renderUnhealthy(snap.resources);
+    fillKinds(snap.resources); renderResources();
+    await Promise.all([refreshChanges(), refreshDetail()]);
+    $("updated").textContent = "updated " + new Date().toLocaleTimeString();
+    showError(null);
+  } catch (e) { showError(e); }
+}
+
+function schedule() {
+  clearInterval(state.timer);
+  if (!state.paused) state.timer = setInterval(refresh, Number($("interval").value) * 1000);
+}
+
+document.addEventListener("click", (ev) => {
+  const chip = ev.target.closest("[data-metric]");
+  if (chip) { state.metric = chip.dataset.metric; refreshDetail().catch(showError); return; }
+  const row = ev.target.closest("[data-id]");
+  if (row) select(row.dataset.id);
+});
+$("toggle").onclick = () => {
+  state.paused = !state.paused;
+  $("toggle").textContent = state.paused ? "Resume" : "Pause";
+  $("hdr").classList.toggle("paused", state.paused);
+  schedule(); if (!state.paused) refresh();
+};
+$("interval").onchange = schedule;
+$("kind").onchange = renderResources;
+$("q").oninput = renderResources;
+$("window").onchange = () => refreshChanges().catch(showError);
+$("range").onchange = () => refreshDetail().catch(showError);
+$("q").value = link.get("q") || "";
+refresh(); schedule();
+</script>
+</body>
+</html>
