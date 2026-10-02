@@ -8,7 +8,7 @@ Pulseblade grows from a single host to a mixed fleet (hosts, containers, Proxmox
 
 Cargo workspace, CI (`make vet`, `make test`), Makefile, license, README, architecture notes.
 
-### M1 — Single-host agent (in progress)
+### M1 — Single-host agent (done)
 
 - Host, CPU, memory, disk, network, and systemd service collectors.
 - SQLite store: resource state, change journal, checkpoints, samples with retention.
@@ -16,14 +16,14 @@ Cargo workspace, CI (`make vet`, `make test`), Makefile, license, README, archit
 - Semantic labels from config.
 - Verified end-to-end with Cursor as the MCP client.
 
-### M2 — Detection and memory
+### M2 — Detection and memory ([#1](https://github.com/DataKnifeAI/pulseblade/issues/1))
 
 - `pulseblade-detect`: threshold rules (config) and EWMA/z-score anomaly detection.
 - Findings carry causal context: recent changes on the resource, its parent, and its dependencies.
 - Tools: `findings_list`, `finding_ack`, `memory_note`, `memory_search`.
 - MCP resources `pulseblade://state` and `pulseblade://findings` with update notifications; optional outbound webhook.
 
-### M3 — Gated remediation
+### M3 — Gated remediation ([#2](https://github.com/DataKnifeAI/pulseblade/issues/2))
 
 - `pulseblade-act`: action registry in TOML. Each action has a JSON-schema for params, preconditions, an idempotency key, a risk tier (`auto` / `approve` / `deny`), dry-run, and rate limits.
 - Tools: `actions_list`, `action_plan`, `action_execute`, `action_status`.
@@ -31,17 +31,17 @@ Cargo workspace, CI (`make vet`, `make test`), Makefile, license, README, archit
 - Built-ins: `systemd.restart`, `docker.restart`, `disk.prune_path` (allow-listed), `script.run` (allow-listed).
 - `resource_explain` gains notes and prior actions.
 
-### M4 — Docker and Proxmox
+### M4 — Docker and Proxmox ([#3](https://github.com/DataKnifeAI/pulseblade/issues/3))
 
 - Collectors behind `docker` (`bollard`) and `proxmox` (REST) features, with matching actions.
 
-### M5 — Hub mode
+### M5 — Hub mode ([#4](https://github.com/DataKnifeAI/pulseblade/issues/4))
 
 - `pulseblade hub`: agents push deltas; hub holds fleet state and serves a global MCP endpoint.
 - Action routing via agent long-poll (no inbound ports on agents); token or mTLS auth.
 - Dockerfile and systemd unit.
 
-### M6 — Kubernetes
+### M6 — Kubernetes ([#5](https://github.com/DataKnifeAI/pulseblade/issues/5))
 
 - Collector and actions (rollout restart, scale) behind a `k8s` feature (`kube`).
 - DaemonSet / Helm chart.

@@ -63,6 +63,8 @@ Or stdio, with no daemon required:
 }
 ```
 
+Use an absolute path (e.g. `~/.cargo/bin/pulseblade`, expanded) if `~/.cargo/bin` is not on the PATH your editor launches with.
+
 ### Debug from the shell
 
 ```bash
