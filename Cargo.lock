@@ -867,6 +867,7 @@ name = "pulseblade"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "pulseblade-collect",
  "pulseblade-core",
@@ -875,6 +876,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tokio-util",
  "toml",
  "tracing",
  "tracing-subscriber",
@@ -921,12 +923,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "chrono",
  "pulseblade-core",
  "pulseblade-store",
  "rmcp",
  "schemars",
  "serde",
  "serde_json",
+ "thiserror",
  "tokio",
  "tokio-util",
  "tracing",
