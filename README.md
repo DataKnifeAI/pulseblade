@@ -45,8 +45,9 @@ make install            # cargo install --path crates/pulseblade
 # dashboard at http://127.0.0.1:7171/
 pulseblade node
 
-# Or serve MCP over stdio (collects in-process unless a node already owns the database)
-pulseblade mcp
+# Or serve MCP over stdio (collects in-process unless a node already owns the database).
+# `--dashboard` also serves the HTTP dashboard and API from this process.
+pulseblade mcp --dashboard
 
 # Serve an existing database without collecting (offline inspection, copied databases, demos)
 pulseblade --db ./copy.db node --no-collect
@@ -73,6 +74,8 @@ Or stdio, with no daemon required:
   }
 }
 ```
+
+`pulseblade mcp --dashboard` (args `["mcp", "--dashboard"]`) serves the HTTP dashboard and API on the listen address alongside stdio. `--listen 127.0.0.1:7171` implies `--dashboard` and overrides the config `listen` address. `dashboard = true` in the config file turns the same server on with no flag. The stdio MCP process can serve the dashboard when it is the collector, so a second `pulseblade node` is unnecessary. If that listen address is already in use, stdio MCP keeps running and the dashboard is skipped.
 
 Use an absolute path (e.g. `~/.cargo/bin/pulseblade`, expanded) if `~/.cargo/bin` is not on the PATH your editor launches with.
 
@@ -219,6 +222,9 @@ Optional TOML at `~/.config/pulseblade/pulseblade.toml` (or `--config`):
 interval_secs = 15
 retention_hours = 24
 listen = "127.0.0.1:7171"
+# Set `dashboard = true` so `pulseblade mcp` serves the HTTP dashboard and API
+# when that process is the collector.
+dashboard = false
 allowed_hosts = []        # extra Host header values, e.g. a reverse proxy's hostname
 
 # Semantic labels attached to matching resource ids (`*` wildcard).

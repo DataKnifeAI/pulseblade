@@ -49,7 +49,15 @@ enum Command {
         no_collect: bool,
     },
     /// Serve MCP over stdio; collects in-process unless a node owns the database.
-    Mcp,
+    /// With `--dashboard` or `--listen`, also serves the HTTP dashboard and API.
+    Mcp {
+        /// Also serve the HTTP dashboard, JSON API, Prometheus metrics, and `/mcp`.
+        #[arg(long)]
+        dashboard: bool,
+        /// HTTP listen address; implies `--dashboard` [default: from config, 127.0.0.1:7171]
+        #[arg(long)]
+        listen: Option<SocketAddr>,
+    },
     /// Control node: aggregate many nodes into fleet state (M6).
     Hub,
     /// Query and manage the local store from the shell.
@@ -158,6 +166,69 @@ fn print_json<T: Serialize>(v: &T) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Hosts accepted by the HTTP server: loopback, the listen address, and config extras.
+fn http_allowed_hosts(config: &Config, addr: SocketAddr) -> Vec<String> {
+    let mut allowed = vec!["localhost".into(), "127.0.0.1".into(), "::1".into()];
+    allowed.push(addr.ip().to_string());
+    allowed.extend(config.allowed_hosts.iter().cloned());
+    allowed
+}
+
+/// Listen address for the MCP dashboard, if it should run.
+///
+/// `--listen` or `--dashboard` enables it; otherwise `config.dashboard` does.
+/// `--listen` overrides `config.listen`.
+fn mcp_dashboard_addr(
+    dashboard: bool,
+    listen: Option<SocketAddr>,
+    config: &Config,
+) -> anyhow::Result<Option<SocketAddr>> {
+    if listen.is_none() && !dashboard && !config.dashboard {
+        return Ok(None);
+    }
+    Ok(Some(match listen {
+        Some(addr) => addr,
+        None => config
+            .listen
+            .parse()
+            .with_context(|| format!("invalid listen address `{}`", config.listen))?,
+    }))
+}
+
+fn is_addr_in_use(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::AddrInUse)
+    })
+}
+
+/// Serve the HTTP dashboard until `shutdown`. A busy port is logged and ignored so
+/// stdio MCP keeps running when several `pulseblade mcp` processes start together.
+async fn serve_mcp_dashboard(
+    store: Arc<Store>,
+    addr: SocketAddr,
+    allowed: Vec<String>,
+    shutdown: CancellationToken,
+) {
+    match pulseblade_mcp::serve_http(store, addr, allowed, shutdown).await {
+        Ok(()) => {}
+        Err(e) if is_addr_in_use(&e) => {
+            tracing::warn!(
+                %addr,
+                "listen address already in use; serving stdio MCP without the dashboard"
+            );
+        }
+        Err(e) => {
+            tracing::error!(
+                %addr,
+                error = %e,
+                "HTTP server failed; serving stdio MCP without the dashboard"
+            );
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -198,9 +269,7 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!("shutting down");
                 ctrl_c.cancel();
             });
-            let mut allowed = vec!["localhost".into(), "127.0.0.1".into(), "::1".into()];
-            allowed.push(addr.ip().to_string());
-            allowed.extend(config.allowed_hosts.iter().cloned());
+            let allowed = http_allowed_hosts(&config, addr);
             let served = pulseblade_mcp::serve_http(store, addr, allowed, shutdown.clone()).await;
             shutdown.cancel();
             if let Some(c) = collector {
@@ -208,9 +277,10 @@ async fn main() -> anyhow::Result<()> {
             }
             served
         }
-        Command::Mcp => {
+        Command::Mcp { dashboard, listen } => {
             let store = open_store(&db)?;
             let shutdown = CancellationToken::new();
+            let dashboard_addr = mcp_dashboard_addr(dashboard, listen, &config)?;
             let collector = match CollectorLock::try_acquire(&db)? {
                 Some(lock) => Some(spawn_collector(
                     store.clone(),
@@ -225,8 +295,34 @@ async fn main() -> anyhow::Result<()> {
                     None
                 }
             };
-            let served = pulseblade_mcp::serve_stdio(store).await;
+            let http_task = if let Some(addr) = dashboard_addr {
+                let allowed = http_allowed_hosts(&config, addr);
+                let http_store = store.clone();
+                let http_shutdown = shutdown.clone();
+                let ctrl_c = shutdown.clone();
+                tokio::spawn(async move {
+                    let _ = tokio::signal::ctrl_c().await;
+                    tracing::info!("shutting down");
+                    ctrl_c.cancel();
+                });
+                Some(tokio::spawn(async move {
+                    serve_mcp_dashboard(http_store, addr, allowed, http_shutdown).await;
+                }))
+            } else {
+                None
+            };
+            let served = if http_task.is_some() {
+                tokio::select! {
+                    result = pulseblade_mcp::serve_stdio(store) => result,
+                    () = shutdown.cancelled() => Ok(()),
+                }
+            } else {
+                pulseblade_mcp::serve_stdio(store).await
+            };
             shutdown.cancel();
+            if let Some(task) = http_task {
+                let _ = task.await;
+            }
             if let Some(c) = collector {
                 let _ = tokio::task::spawn_blocking(move || c.join()).await;
             }
@@ -338,5 +434,83 @@ fn run_ctl(store: &Store, db: &Path, config: &Config, command: Ctl) -> anyhow::R
                 "as_of_seq": store.current_seq()?,
             }))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Command {
+        Cli::try_parse_from(args).unwrap().command
+    }
+
+    #[test]
+    fn mcp_flags_parse() {
+        match parse(&["pulseblade", "mcp"]) {
+            Command::Mcp { dashboard, listen } => {
+                assert!(!dashboard);
+                assert!(listen.is_none());
+            }
+            _ => panic!("expected mcp"),
+        }
+        match parse(&["pulseblade", "mcp", "--dashboard"]) {
+            Command::Mcp { dashboard, listen } => {
+                assert!(dashboard);
+                assert!(listen.is_none());
+            }
+            _ => panic!("expected mcp"),
+        }
+        match parse(&["pulseblade", "mcp", "--listen", "127.0.0.1:7391"]) {
+            Command::Mcp { dashboard, listen } => {
+                assert!(!dashboard);
+                assert_eq!(listen, Some("127.0.0.1:7391".parse().unwrap()));
+            }
+            _ => panic!("expected mcp"),
+        }
+    }
+
+    #[test]
+    fn mcp_dashboard_addr_follows_flag_then_config() {
+        let mut config = Config::default();
+        assert!(mcp_dashboard_addr(false, None, &config).unwrap().is_none());
+
+        config.dashboard = true;
+        assert_eq!(
+            mcp_dashboard_addr(false, None, &config).unwrap(),
+            Some("127.0.0.1:7171".parse().unwrap())
+        );
+
+        config.dashboard = false;
+        config.listen = "127.0.0.1:7172".into();
+        assert_eq!(
+            mcp_dashboard_addr(true, None, &config).unwrap(),
+            Some("127.0.0.1:7172".parse().unwrap())
+        );
+
+        let flag: SocketAddr = "127.0.0.1:7391".parse().unwrap();
+        assert_eq!(
+            mcp_dashboard_addr(false, Some(flag), &config).unwrap(),
+            Some(flag)
+        );
+        config.dashboard = true;
+        assert_eq!(
+            mcp_dashboard_addr(true, Some(flag), &config).unwrap(),
+            Some(flag)
+        );
+
+        config.listen = "not-an-address".into();
+        assert!(mcp_dashboard_addr(false, None, &config).is_err());
+        assert_eq!(
+            mcp_dashboard_addr(false, Some(flag), &config).unwrap(),
+            Some(flag)
+        );
+    }
+
+    #[test]
+    fn addr_in_use_is_recognized() {
+        let err = anyhow::Error::from(std::io::Error::new(std::io::ErrorKind::AddrInUse, "in use"));
+        assert!(is_addr_in_use(&err));
+        assert!(!is_addr_in_use(&anyhow::Error::msg("nope")));
     }
 }

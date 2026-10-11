@@ -15,6 +15,9 @@ pub struct Config {
     pub change_retention_days: u64,
     /// Address for the node's HTTP MCP endpoint.
     pub listen: String,
+    /// When true, `pulseblade mcp` also serves the HTTP dashboard and API.
+    #[serde(default)]
+    pub dashboard: bool,
     /// Extra `Host` header values accepted by the HTTP endpoint (loopback is always allowed).
     pub allowed_hosts: Vec<String>,
     /// Semantic labels applied to matching resource ids.
@@ -28,6 +31,7 @@ impl Default for Config {
             retention_hours: 24,
             change_retention_days: 30,
             listen: "127.0.0.1:7171".to_string(),
+            dashboard: false,
             allowed_hosts: Vec::new(),
             labels: Vec::new(),
         }
@@ -82,20 +86,41 @@ mod tests {
             r#"
             interval_secs = 15
             retention_hours = 24
+            listen = "127.0.0.1:7171"
+            # Set `dashboard = true` so `pulseblade mcp` serves the HTTP dashboard and API
+            # when that process is the collector.
+            dashboard = false
+            allowed_hosts = []        # extra Host header values, e.g. a reverse proxy's hostname
 
+            # Semantic labels attached to matching resource ids (`*` wildcard).
             [[labels]]
             match = "unit:*:sshd.service"
             set = { criticality = "high", role = "access" }
+
+            [[labels]]
+            match = "disk:*:/"
+            set = { criticality = "high" }
             "#,
         )
         .unwrap();
-        assert_eq!(cfg.labels.len(), 1);
+        assert_eq!(cfg.labels.len(), 2);
         assert_eq!(cfg.labels[0].set["role"], "access");
         assert_eq!(cfg.listen, "127.0.0.1:7171");
+        assert!(!cfg.dashboard);
+    }
+
+    #[test]
+    fn dashboard_defaults_false_and_parses_true() {
+        assert!(!Config::default().dashboard);
+        let omitted: Config = toml::from_str("interval_secs = 30").unwrap();
+        assert!(!omitted.dashboard);
+        let enabled: Config = toml::from_str("dashboard = true").unwrap();
+        assert!(enabled.dashboard);
     }
 
     #[test]
     fn rejects_unknown_keys() {
         assert!(toml::from_str::<Config>("intervl_secs = 5").is_err());
+        assert!(toml::from_str::<Config>("dashbord = true").is_err());
     }
 }

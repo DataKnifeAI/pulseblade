@@ -90,7 +90,7 @@ Every collector pass is recorded in a `collector_runs` table (source, time, dura
 
 ## HTTP surface
 
-`pulseblade node` serves one axum router on its listen address (loopback by default):
+`pulseblade node` serves one axum router on its listen address (loopback by default). `pulseblade mcp` serves the same router alongside stdio when the dashboard is enabled (`--dashboard`, `--listen`, or `dashboard = true`); a busy listen address is logged and stdio keeps running.
 
 - `/mcp` — MCP streamable HTTP.
 - `/api/v1/*` — JSON API: `status`, `snapshot`, `resources/{id}`, `metrics`, `changes`, `checkpoints`. Handlers call the same `query` functions as the MCP tools; errors are `{error}` with 400 or 404.
