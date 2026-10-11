@@ -21,10 +21,14 @@ pub enum ResourceKind {
     Vm,
     Node,
     Pod,
+    /// A process notable for CPU or memory use.
+    Process,
+    /// The user session this node is collecting for.
+    Session,
 }
 
 impl ResourceKind {
-    pub const ALL: [ResourceKind; 8] = [
+    pub const ALL: [ResourceKind; 10] = [
         Self::Host,
         Self::Disk,
         Self::NetIface,
@@ -33,6 +37,8 @@ impl ResourceKind {
         Self::Vm,
         Self::Node,
         Self::Pod,
+        Self::Process,
+        Self::Session,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -45,6 +51,8 @@ impl ResourceKind {
             Self::Vm => "vm",
             Self::Node => "node",
             Self::Pod => "pod",
+            Self::Process => "process",
+            Self::Session => "session",
         }
     }
 }
@@ -203,12 +211,23 @@ impl Sample {
     }
 }
 
+/// One journal line. Collectors store error lines here; fast-moving counts are samples.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct LogLine {
+    pub ts: DateTime<Utc>,
+    pub resource_id: String,
+    pub message: String,
+}
+
 /// Everything one collector saw in one pass. `resources` is the complete set the
 /// collector owns, so anything missing is treated as disappeared.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Observation {
     pub resources: Vec<Resource>,
     pub samples: Vec<Sample>,
+    /// Error log lines observed this pass. Not change-tracked.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub logs: Vec<LogLine>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -312,12 +331,58 @@ pub enum Severity {
     Critical,
 }
 
+impl Severity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Info => "info",
+            Self::Warning => "warning",
+            Self::Critical => "critical",
+        }
+    }
+}
+
+impl FromStr for Severity {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "info" => Ok(Self::Info),
+            "warning" => Ok(Self::Warning),
+            "critical" => Ok(Self::Critical),
+            other => Err(format!("unknown severity `{other}`")),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum FindingStatus {
     Open,
     Acked,
     Resolved,
+}
+
+impl FindingStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Acked => "acked",
+            Self::Resolved => "resolved",
+        }
+    }
+}
+
+impl FromStr for FindingStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "open" => Ok(Self::Open),
+            "acked" => Ok(Self::Acked),
+            "resolved" => Ok(Self::Resolved),
+            other => Err(format!("unknown finding status `{other}`")),
+        }
+    }
 }
 
 /// A detected problem with the context an agent needs to reason about cause (M2).
@@ -330,8 +395,11 @@ pub struct Finding {
     pub status: FindingStatus,
     pub summary: String,
     pub opened_at: DateTime<Utc>,
-    /// Changes on the resource and its relatives shortly before the finding opened.
+    /// Changes on the resource, its parent, and its dependencies.
     pub context: Vec<Change>,
+    /// Recent error lines on the resource, its parent, and its dependencies.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub logs: Vec<LogLine>,
 }
 
 /// How much human oversight an action requires (M3).
@@ -367,6 +435,43 @@ pub enum ActionRunStatus {
     Succeeded,
     Failed,
     Rejected,
+    Expired,
+}
+
+impl ActionRunStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Planned => "planned",
+            Self::AwaitingApproval => "awaiting_approval",
+            Self::Running => "running",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Rejected => "rejected",
+            Self::Expired => "expired",
+        }
+    }
+
+    /// Still in flight: a repeat plan with the same idempotency key returns this run.
+    pub fn is_open(self) -> bool {
+        matches!(self, Self::Planned | Self::AwaitingApproval | Self::Running)
+    }
+}
+
+impl FromStr for ActionRunStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "planned" => Ok(Self::Planned),
+            "awaiting_approval" => Ok(Self::AwaitingApproval),
+            "running" => Ok(Self::Running),
+            "succeeded" => Ok(Self::Succeeded),
+            "failed" => Ok(Self::Failed),
+            "rejected" => Ok(Self::Rejected),
+            "expired" => Ok(Self::Expired),
+            other => Err(format!("unknown action status `{other}`")),
+        }
+    }
 }
 
 /// One planned or executed action, recorded in the audit chain (M3).
@@ -377,8 +482,13 @@ pub struct ActionRun {
     pub resource_id: String,
     pub params: Value,
     pub idempotency_key: String,
+    pub tier: RiskTier,
     pub status: ActionRunStatus,
     pub created_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dry_run: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<String>,
 }

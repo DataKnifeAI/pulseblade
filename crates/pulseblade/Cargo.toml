@@ -11,7 +11,10 @@ authors.workspace = true
 pulseblade-core.workspace = true
 pulseblade-store.workspace = true
 pulseblade-collect.workspace = true
+pulseblade-detect.workspace = true
+pulseblade-act.workspace = true
 pulseblade-mcp.workspace = true
+ureq = { version = "2.12", default-features = false, features = ["json", "tls"] }
 anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true

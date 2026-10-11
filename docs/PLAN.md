@@ -23,7 +23,7 @@ Cargo workspace, CI (`make vet`, `make test`), Makefile, license, README, archit
 - Token-efficient MCP: `state_snapshot` `detail` (`summary` default, `brief`, `full`) and `if_changed_since`, compact `metrics_query` series, compact `changes_since`, measured in a token-budget test (see [ARCHITECTURE.md](ARCHITECTURE.md#token-efficiency)).
 - Docs for reverse-proxy access, Prometheus/Grafana, and Homepage.
 
-### M2 — OS and user signals, detection, memory ([#1](https://github.com/DataKnifeAI/pulseblade/issues/1))
+### M2 — OS and user signals, detection, memory (done, [#1](https://github.com/DataKnifeAI/pulseblade/issues/1))
 
 - Collectors: journald (per-unit error rate, recent error lines), top processes by CPU and memory, user systemd units (`systemctl --user`) and session.
 - `pulseblade-detect`: threshold rules (config) and EWMA/z-score anomaly detection.
@@ -31,7 +31,7 @@ Cargo workspace, CI (`make vet`, `make test`), Makefile, license, README, archit
 - Tools: `findings_list`, `finding_ack`, `memory_note`, `memory_search`, `logs_query`.
 - MCP resources `pulseblade://state` and `pulseblade://findings` with update notifications; optional outbound webhook.
 
-### M3 — Gated remediation ([#2](https://github.com/DataKnifeAI/pulseblade/issues/2))
+### M3 — Gated remediation (done, [#2](https://github.com/DataKnifeAI/pulseblade/issues/2))
 
 - `pulseblade-act`: action registry in TOML. Each action has a JSON-schema for params, preconditions, an idempotency key, a risk tier (`auto` / `approve` / `deny`), dry-run, and rate limits. Policy is node-local.
 - Tools: `actions_list`, `action_plan`, `action_execute`, `action_status`.

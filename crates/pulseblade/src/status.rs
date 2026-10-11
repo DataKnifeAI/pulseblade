@@ -144,6 +144,32 @@ pub fn render(store: &Store, recent: usize) -> anyhow::Result<String> {
         writeln!(o, "  … more; see `pulseblade ctl snapshot --unhealthy`")?;
     }
 
+    let findings = query::findings(
+        store,
+        query::FindingsParams {
+            limit: Some(recent.max(1)),
+            ..Default::default()
+        },
+    )?;
+    writeln!(o, "\nFindings ({} open)", findings.total)?;
+    if findings.findings.is_empty() {
+        writeln!(o, "  none")?;
+    }
+    for f in &findings.findings {
+        writeln!(
+            o,
+            "  {:<8}  {}  {}  {}",
+            f.severity.as_str(),
+            f.resource_id,
+            f.rule,
+            f.summary
+        )?;
+    }
+    let awaiting = store.awaiting_action_count()?;
+    if awaiting > 0 {
+        writeln!(o, "\nActions awaiting approval: {awaiting}")?;
+    }
+
     if recent > 0 {
         let cs = query::changes(
             store,
@@ -263,6 +289,7 @@ mod tests {
                             .attr("fs", "ext4"),
                     ],
                     samples: vec![Sample::new("host:h", "cpu.used_pct", 7.25)],
+                    logs: vec![],
                 },
             )
             .unwrap();

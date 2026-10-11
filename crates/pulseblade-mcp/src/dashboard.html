@@ -85,6 +85,8 @@
   <section class="c3"><h2>Resources by kind</h2><table class="counts"><thead><tr><th>Kind</th><th style="text-align:right">Total</th>
     <th style="text-align:right">Failed</th><th style="text-align:right">Degraded</th></tr></thead><tbody id="counts"></tbody></table></section>
   <section class="c12"><h2>Unhealthy <span class="right muted" id="unhealthy-n"></span></h2><div id="unhealthy"></div></section>
+  <section class="c12"><h2>Findings <span class="right muted" id="findings-n"></span></h2><div id="findings"></div></section>
+  <section class="c12"><h2>Actions <span class="right muted" id="actions-n"></span></h2><div id="actions"></div></section>
   <section class="c7">
     <h2>Resources <span class="right muted" id="res-n"></span></h2>
     <div class="filters"><select id="kind"><option value="">all kinds</option></select>
@@ -153,6 +155,8 @@ function summary(r) {
     case "disk": return `${fmt("disk.used_pct", m["disk.used_pct"])} used · ${fmt("disk.available_bytes", m["disk.available_bytes"])} free`;
     case "net_iface": return `rx ${fmt("net.rx_bytes_per_s", m["net.rx_bytes_per_s"])} · tx ${fmt("net.tx_bytes_per_s", m["net.tx_bytes_per_s"])}`;
     case "service": return [a.active, a.sub, a.unit_file_state].filter(Boolean).join(" · ");
+    case "process": return `cpu ${fmt("proc.cpu_pct", m["proc.cpu_pct"])} · mem ${fmt("proc.mem_pct", m["proc.mem_pct"])}`;
+    case "session": return [a.user, a.state, a.linger === "yes" ? "linger" : ""].filter(Boolean).join(" · ");
     default: return Object.keys(m).slice(0, 2).map((k) => `${k} ${fmt(k, m[k])}`).join(" · ");
   }
 }
@@ -161,7 +165,9 @@ function renderStatus(s) {
   $("hdr-meta").textContent = `v${s.version} · seq ${s.as_of_seq}`;
   $("self").innerHTML = [
     ["Version", s.version], ["Uptime", dur(s.uptime_secs)], ["Journal seq", s.as_of_seq],
-    ["Resources", s.resources.total], ["Samples", s.samples.toLocaleString()], ["Changes", s.changes.toLocaleString()],
+    ["Resources", s.resources.total], ["Open findings", s.open_findings ?? 0],
+    ["Awaiting approval", s.awaiting_actions ?? 0],
+    ["Samples", s.samples.toLocaleString()], ["Changes", s.changes.toLocaleString()],
     ["Checkpoints", s.checkpoints], ["Database", bytes(s.db.size_bytes)],
   ].map(([k, v]) => `<dt>${k}</dt><dd>${esc(v)}</dd>`).join("") +
     (s.db.path ? `<dt>Path</dt><dd class="mono muted" title="${esc(s.db.path)}">${esc(s.db.path.split("/").pop())}</dd>` : "");
@@ -202,6 +208,27 @@ function renderUnhealthy(list) {
       <span class="t-${esc(r.health)}">${esc(r.health)}</span>${rid(r.id)}<span class="spacer"></span>
       <span class="muted">${esc(summary(r))}</span></div>`).join("")
     : `<div class="empty t-ok">Everything reporting is healthy.</div>`;
+}
+
+function renderActions(page) {
+  const runs = (page && page.runs) || [];
+  $("actions-n").textContent = runs.length ? String(runs.length) : "";
+  $("actions").innerHTML = runs.length ? runs.map((a) =>
+    `<div class="row"><span class="muted">${esc(a.status)}</span><b>${esc(a.action)}</b>
+      <span class="mono">${esc(a.resource_id)}</span><span class="spacer"></span>
+      <span class="muted">${esc(a.tier || "")}</span></div>`).join("")
+    : `<div class="empty">No actions recorded.</div>`;
+}
+
+function renderFindings(page) {
+  const rows = (page && page.findings) || [];
+  $("findings-n").textContent = page && page.total ? `${page.total} open` : "";
+  $("findings").innerHTML = rows.length ? rows.map((f) => `
+    <div class="row click" data-id="${esc(f.resource_id)}" style="cursor:pointer">
+      <span class="t-${f.severity === "critical" ? "failed" : f.severity === "warning" ? "degraded" : "unknown"}">${esc(f.severity)}</span>
+      ${rid(f.resource_id)}<span class="muted">${esc(f.rule)}</span><span class="spacer"></span>
+      <span>${esc(f.summary)}</span></div>`).join("")
+    : `<div class="empty t-ok">No open findings.</div>`;
 }
 
 function renderResources() {
@@ -285,7 +312,15 @@ async function refreshDetail() {
     <h2 style="margin-top:12px">Recent changes here and on parent</h2>
     ${e.recent_changes.length ? e.recent_changes.map((c) => `<div class="row"><span class="muted num">${time(c.ts)}</span>
       ${rid(c.resource_id === r.id ? "" : c.resource_id)}<span class="chg-${esc(c.kind)}">${changeText(c)}</span></div>`).join("")
-      : `<div class="empty">None retained.</div>`}`;
+      : `<div class="empty">None retained.</div>`}
+    ${(e.findings || []).length ? `<h2 style="margin-top:12px">Findings</h2>` + e.findings.map((f) =>
+      `<div class="row"><span class="t-${f.severity === "critical" ? "failed" : "degraded"}">${esc(f.severity)}</span>
+      <span>${esc(f.summary)}</span></div>` + (f.logs || []).slice(0, 3).map((l) =>
+        `<div class="muted mono">${esc(l.message)}</div>`).join("")).join("") : ""}
+    ${(e.notes || []).length ? `<h2 style="margin-top:12px">Notes</h2>` + e.notes.map((n) =>
+      `<div class="row"><span class="muted">${esc(n.author)}</span><span>${esc(n.text)}</span></div>`).join("") : ""}
+    ${(e.actions || []).length ? `<h2 style="margin-top:12px">Prior actions</h2>` + e.actions.map((a) =>
+      `<div class="row"><span class="muted">${esc(a.status)}</span><span>${esc(a.action)}</span></div>`).join("") : ""}`;
 }
 
 function select(id) {
@@ -297,9 +332,12 @@ function select(id) {
 
 async function refresh() {
   try {
-    const [status, snap] = await Promise.all([api("/api/v1/status"), api("/api/v1/snapshot?detail=full&limit=500")]);
+    const [status, snap, findings, actions] = await Promise.all([
+      api("/api/v1/status"), api("/api/v1/snapshot?detail=full&limit=500"),
+      api("/api/v1/findings?limit=20"), api("/api/v1/actions")]);
     state.resources = snap.resources;
     renderStatus(status); renderHosts(snap.resources); renderUnhealthy(snap.resources);
+    renderFindings(findings); renderActions(actions);
     fillKinds(snap.resources); renderResources();
     await Promise.all([refreshChanges(), refreshDetail()]);
     $("updated").textContent = "updated " + new Date().toLocaleTimeString();

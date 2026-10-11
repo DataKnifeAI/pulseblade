@@ -87,6 +87,8 @@ pulseblade ctl snapshot --detail brief # JSON, same shapes as the MCP tools
 pulseblade ctl checkpoint before-deploy
 pulseblade ctl changes --since before-deploy
 pulseblade ctl export --since 1h > dump.jsonl
+pulseblade ctl findings --detail
+pulseblade ctl approve <run_id>
 ```
 
 ## MCP tools (M1)
@@ -94,11 +96,21 @@ pulseblade ctl export --since 1h > dump.jsonl
 | Tool | Purpose |
 |------|---------|
 | `state_snapshot` | `summary` by default: counts by kind, collector health, host key metrics, unhealthy resources, `as_of_seq`. `detail=brief\|full` for lists; `if_changed_since` for near-free polling |
-| `resource_explain` | One resource: labels, attributes, parent/children, latest metrics, recent changes |
+| `resource_explain` | One resource: labels, attributes, parent/children, latest metrics, recent changes, notes, open findings, prior actions |
 | `metrics_query` | Bounded, downsampled series as a compact `values` array (`range`, `step`, `agg`) |
 | `checkpoint_create` | Name the current point in the change journal |
 | `changes_since` | Changes since a checkpoint, sequence number, timestamp, or relative duration |
 | `export_bulk` | JSONL dump of resources and changes for offline analysis |
+| `findings_list` | Open findings by default. Summaries only; `detail=true` adds causal context and error lines |
+| `finding_ack` | Acknowledge a finding. An optional note is stored on its resource |
+| `memory_note` / `memory_search` | Attach a short note, or search notes by substring |
+| `logs_query` | Recent error lines for one resource (default 1h, capped) |
+| `actions_list` | Built-in remediations with risk tier, parameter schema, preconditions, and rate limit |
+| `action_plan` | Plan a run. Returns `plan_id` (same as `run_id`) and the tier. Does not execute |
+| `action_execute` | `auto` runs now; `approve` waits; `deny` is rejected. A finished run is not repeated |
+| `action_status` | One run, including output when it has finished |
+
+MCP resources `pulseblade://state` and `pulseblade://findings` notify subscribers when the journal or the open-findings set changes.
 
 The cheap agent loop is: summary snapshot, remember `as_of_seq`, poll `changes_since` or `if_changed_since`, drill down only on what changed. Measured sizes are in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#token-efficiency).
 
@@ -116,6 +128,10 @@ The node serves a read-only, LLM-free view of the same data on its HTTP port, ne
 | `/api/v1/metrics` | `metrics_query`: `id`, `metric`, `range`, `step`, `agg` |
 | `/api/v1/changes` | `changes_since`: `since` (default `1h`), `kind`, `prefix`, `limit`, `compact` |
 | `/api/v1/checkpoints` | Checkpoints, newest first |
+| `/api/v1/findings` | `findings_list`: `status`, `severity`, `limit`, `detail` |
+| `/api/v1/logs` | `logs_query`: `resource`, `since`, `limit` |
+| `/api/v1/actions` | Recent action runs |
+| `POST /api/v1/actions/{id}/approve` | Approve a waiting run. Sends `Authorization: Bearer <actions.approve_token>` when that token is set |
 | `/healthz` | `ok` |
 
 Errors are JSON `{"error": "..."}` with 400 for invalid input and 404 for unknown resources, metrics, checkpoints, or endpoints.
@@ -124,7 +140,7 @@ Errors are JSON `{"error": "..."}` with 400 for invalid input and 404 for unknow
 
 *Synthetic demo data, not a real machine.*
 
-The dashboard shows collector status, host key metrics, counts by kind, unhealthy resources first, a filterable resource table, recent changes over a selectable window, and per-resource details with a sparkline of any metric. It refreshes every 15 seconds (pausable). Deep links work: `/?kind=service&q=ssh&select=unit:web1:sshd.service&metric=...`.
+The dashboard shows collector status, host key metrics, counts by kind, unhealthy resources first, open findings, recent actions, a filterable resource table, recent changes over a selectable window, and per-resource details (metrics, notes, findings, prior actions) with a sparkline of any metric. It refreshes every 15 seconds (pausable). Deep links work: `/?kind=service&q=ssh&select=unit:web1:sshd.service&metric=...`.
 
 To reproduce the screenshot, seed two hours of deterministic demo data (written through the normal store API, ending now) and serve it within a minute, before the collectors read as stale:
 
@@ -169,6 +185,7 @@ scrape_configs:
 | Series | Meaning |
 |--------|---------|
 | `pulseblade_up`, `pulseblade_build_info{version}`, `pulseblade_journal_seq` | Node liveness, version, journal position |
+| `pulseblade_open_findings`, `pulseblade_actions_awaiting` | Open findings, and runs waiting for approval |
 | `pulseblade_collector_up{collector}` | 1 when the last pass succeeded and is recent |
 | `pulseblade_collector_last_run_timestamp_seconds`, `..._last_success_timestamp_seconds`, `..._last_duration_seconds`, `..._consecutive_failures`, `..._resources` | Per-collector detail |
 | `pulseblade_resource_health{id,kind,host,...}` | **0 ok, 1 unknown, 2 degraded, 3 failed** |
@@ -235,7 +252,40 @@ set = { criticality = "high", role = "access" }
 [[labels]]
 match = "disk:*:/"
 set = { criticality = "high" }
+
+# Detection. Missing keys keep the defaults (EWMA on, no threshold rules, no webhook).
+[detect]
+webhook = ""          # POST a small JSON body when new findings open; empty disables it
+
+[[detect.rules]]
+match = "disk:*:*"
+metric = "disk.used_pct"
+op = ">="
+value = 95
+severity = "critical"
+
+# Remediation policy is node-local. Omit a tier to keep the built-in default.
+[actions]
+approval_ttl = "1h"   # 30s, 15m, 1h, or 1d; how long an approve-tier run waits
+approve_token = ""    # when set, the approval webhook requires Authorization: Bearer
+
+[actions.systemd_restart]   # default tier: approve
+tier = "approve"
+rate_per_hour = 12
+
+[actions.docker_restart]    # default tier: approve
+tier = "approve"
+
+[actions.disk_prune]        # default tier: approve; only these directories can be pruned
+tier = "approve"
+allow = []
+
+[actions.script_run]        # default tier: deny; only these absolute paths can run
+tier = "deny"
+allow = []
 ```
+
+`systemd.restart` takes `unit` (a bare name gets `.service`) and optional `user: true` for `systemctl --user`. `docker.restart` takes `container` and shells out to `docker`. `disk.prune_path` deletes regular files in an allow-listed directory and refuses `/`, `/home`, `/etc`, `/usr`, `/var`, `/boot`, and the other system roots. `script.run` runs an allow-listed program with an `args` array and no shell. `action_plan` with `dry_run: true` records the run without invoking the command. Approve a waiting run with `pulseblade ctl approve <run_id>` or `POST /api/v1/actions/{id}/approve`.
 
 State lives in `~/.local/state/pulseblade/pulseblade.db` by default (`--db` to override).
 

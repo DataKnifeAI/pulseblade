@@ -1,7 +1,9 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
+use pulseblade_act::ActionsConfig;
 use pulseblade_core::LabelRule;
+use pulseblade_detect::DetectConfig;
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -22,6 +24,12 @@ pub struct Config {
     pub allowed_hosts: Vec<String>,
     /// Semantic labels applied to matching resource ids.
     pub labels: Vec<LabelRule>,
+    /// Threshold rules, anomaly detection, and an optional findings webhook.
+    #[serde(default)]
+    pub detect: DetectConfig,
+    /// Node-local action policy. Missing keys keep the built-in tiers and allow lists.
+    #[serde(default)]
+    pub actions: ActionsConfig,
 }
 
 impl Default for Config {
@@ -34,6 +42,8 @@ impl Default for Config {
             dashboard: false,
             allowed_hosts: Vec::new(),
             labels: Vec::new(),
+            detect: DetectConfig::default(),
+            actions: ActionsConfig::default(),
         }
     }
 }
@@ -100,6 +110,35 @@ mod tests {
             [[labels]]
             match = "disk:*:/"
             set = { criticality = "high" }
+
+            [detect]
+            webhook = ""
+
+            [[detect.rules]]
+            match = "disk:*:*"
+            metric = "disk.used_pct"
+            op = ">="
+            value = 95
+            severity = "critical"
+
+            [actions]
+            approval_ttl = "1h"
+            approve_token = ""
+
+            [actions.systemd_restart]
+            tier = "approve"
+            rate_per_hour = 12
+
+            [actions.docker_restart]
+            tier = "approve"
+
+            [actions.disk_prune]
+            tier = "approve"
+            allow = []
+
+            [actions.script_run]
+            tier = "deny"
+            allow = []
             "#,
         )
         .unwrap();
@@ -107,6 +146,10 @@ mod tests {
         assert_eq!(cfg.labels[0].set["role"], "access");
         assert_eq!(cfg.listen, "127.0.0.1:7171");
         assert!(!cfg.dashboard);
+        assert_eq!(cfg.detect.rules.len(), 1);
+        assert_eq!(cfg.actions.approval_ttl, "1h");
+        assert!(cfg.actions.disk_prune.allow.is_empty());
+        assert_eq!(cfg.actions.script_run.rate_per_hour, 4);
     }
 
     #[test]

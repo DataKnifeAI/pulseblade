@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use chrono::Utc;
 use pulseblade_collect::{default_collectors, Collector};
-use pulseblade_core::{ChangeKind, CollectorRun, LabelRule};
+use pulseblade_core::{ChangeKind, CollectorRun, Finding, LabelRule};
+use pulseblade_detect::DetectConfig;
 use pulseblade_store::Store;
 use tokio_util::sync::CancellationToken;
 
@@ -103,6 +104,38 @@ pub fn collect_once(
     total
 }
 
+/// Run detection after a collection pass. Disabled config leaves findings untouched.
+pub fn detect_pass(store: &Store, detect: &DetectConfig) {
+    if !detect.enabled {
+        return;
+    }
+    match pulseblade_detect::sync(store, detect, Utc::now()) {
+        Ok(findings) => notify_findings(detect, &findings),
+        Err(e) => tracing::warn!(error = %e, "detection failed"),
+    }
+}
+
+fn notify_findings(detect: &DetectConfig, findings: &[Finding]) {
+    if findings.is_empty() {
+        return;
+    }
+    for finding in findings {
+        tracing::info!(
+            id = %finding.id,
+            resource = %finding.resource_id,
+            severity = finding.severity.as_str(),
+            summary = %finding.summary,
+            "finding"
+        );
+    }
+    if detect.webhook.is_empty() {
+        return;
+    }
+    if let Err(e) = crate::webhook::post(&detect.webhook, findings) {
+        tracing::warn!(error = %e, "finding webhook failed");
+    }
+}
+
 /// Collect on a dedicated thread every `interval_secs` until `shutdown` fires.
 pub fn spawn_collector(
     store: Arc<Store>,
@@ -112,6 +145,7 @@ pub fn spawn_collector(
 ) -> JoinHandle<()> {
     let interval = Duration::from_secs(config.interval_secs.max(1));
     let labels = config.labels.clone();
+    let detect = config.detect.clone();
     let sample_retention = chrono::Duration::hours(config.retention_hours as i64);
     let change_retention = chrono::Duration::days(config.change_retention_days as i64);
     std::thread::spawn(move || {
@@ -126,6 +160,10 @@ pub fn spawn_collector(
         while !shutdown.is_cancelled() {
             let started = Instant::now();
             let n = collect_once(&store, &mut collectors, &labels, Some(interval.as_secs()));
+            detect_pass(&store, &detect);
+            if let Err(e) = store.expire_actions(Utc::now()) {
+                tracing::warn!(error = %e, "expiring actions failed");
+            }
             tracing::debug!(
                 changes = n,
                 elapsed_ms = started.elapsed().as_millis() as u64,

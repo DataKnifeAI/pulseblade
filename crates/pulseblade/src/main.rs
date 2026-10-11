@@ -1,6 +1,7 @@
 mod config;
 mod node;
 mod status;
+mod webhook;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -16,7 +17,7 @@ use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{default_db_path, Config};
-use crate::node::{collect_once, spawn_collector, CollectorLock};
+use crate::node::{collect_once, detect_pass, spawn_collector, CollectorLock};
 
 /// Agent-first infrastructure monitor: MCP-native telemetry, change checkpoints,
 /// and gated remediation.
@@ -129,6 +130,28 @@ enum Ctl {
     },
     /// Run one collection pass now (fails if a node is already collecting).
     Collect,
+    /// Open findings by default.
+    Findings {
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Include causal context and error lines.
+        #[arg(long)]
+        detail: bool,
+    },
+    /// Acknowledge a finding, optionally recording a note.
+    Ack {
+        id: String,
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Attach a note to a resource.
+    Note { resource: String, text: String },
+    /// Recent action runs, newest first.
+    Actions,
+    /// Approve an action that is waiting for a human.
+    Approve { run_id: String },
 }
 
 fn parse_agg(s: &str) -> Result<Aggregation, String> {
@@ -205,13 +228,24 @@ fn is_addr_in_use(err: &anyhow::Error) -> bool {
 
 /// Serve the HTTP dashboard until `shutdown`. A busy port is logged and ignored so
 /// stdio MCP keeps running when several `pulseblade mcp` processes start together.
+fn action_registry(config: &Config) -> anyhow::Result<Arc<pulseblade_act::Registry>> {
+    Ok(Arc::new(
+        pulseblade_act::Registry::new(
+            config.actions.clone(),
+            Arc::new(pulseblade_act::SystemRunner),
+        )
+        .map_err(|e| anyhow::anyhow!(e))?,
+    ))
+}
+
 async fn serve_mcp_dashboard(
     store: Arc<Store>,
     addr: SocketAddr,
     allowed: Vec<String>,
     shutdown: CancellationToken,
+    actions: Arc<pulseblade_act::Registry>,
 ) {
-    match pulseblade_mcp::serve_http(store, addr, allowed, shutdown).await {
+    match pulseblade_mcp::serve_http(store, addr, allowed, shutdown, actions).await {
         Ok(()) => {}
         Err(e) if is_addr_in_use(&e) => {
             tracing::warn!(
@@ -270,7 +304,9 @@ async fn main() -> anyhow::Result<()> {
                 ctrl_c.cancel();
             });
             let allowed = http_allowed_hosts(&config, addr);
-            let served = pulseblade_mcp::serve_http(store, addr, allowed, shutdown.clone()).await;
+            let actions = action_registry(&config)?;
+            let served =
+                pulseblade_mcp::serve_http(store, addr, allowed, shutdown.clone(), actions).await;
             shutdown.cancel();
             if let Some(c) = collector {
                 let _ = tokio::task::spawn_blocking(move || c.join()).await;
@@ -295,9 +331,11 @@ async fn main() -> anyhow::Result<()> {
                     None
                 }
             };
+            let actions = action_registry(&config)?;
             let http_task = if let Some(addr) = dashboard_addr {
                 let allowed = http_allowed_hosts(&config, addr);
                 let http_store = store.clone();
+                let http_actions = actions.clone();
                 let http_shutdown = shutdown.clone();
                 let ctrl_c = shutdown.clone();
                 tokio::spawn(async move {
@@ -306,18 +344,19 @@ async fn main() -> anyhow::Result<()> {
                     ctrl_c.cancel();
                 });
                 Some(tokio::spawn(async move {
-                    serve_mcp_dashboard(http_store, addr, allowed, http_shutdown).await;
+                    serve_mcp_dashboard(http_store, addr, allowed, http_shutdown, http_actions)
+                        .await;
                 }))
             } else {
                 None
             };
             let served = if http_task.is_some() {
                 tokio::select! {
-                    result = pulseblade_mcp::serve_stdio(store) => result,
+                    result = pulseblade_mcp::serve_stdio(store, actions) => result,
                     () = shutdown.cancelled() => Ok(()),
                 }
             } else {
-                pulseblade_mcp::serve_stdio(store).await
+                pulseblade_mcp::serve_stdio(store, actions).await
             };
             shutdown.cancel();
             if let Some(task) = http_task {
@@ -429,10 +468,46 @@ fn run_ctl(store: &Store, db: &Path, config: &Config, command: Ctl) -> anyhow::R
                 .context("a node is already collecting into this database")?;
             let mut collectors = default_collectors();
             let n = collect_once(store, &mut collectors, &config.labels, None);
+            detect_pass(store, &config.detect);
             print_json(&serde_json::json!({
                 "changes": n,
                 "as_of_seq": store.current_seq()?,
             }))
+        }
+        Ctl::Findings {
+            status,
+            limit,
+            detail,
+        } => {
+            let status = status
+                .as_deref()
+                .map(|s| s.parse().map_err(|e: String| anyhow::anyhow!(e)))
+                .transpose()?;
+            print_json(&query::findings(
+                store,
+                query::FindingsParams {
+                    status,
+                    severity: None,
+                    limit,
+                    detail: Some(detail),
+                },
+            )?)
+        }
+        Ctl::Ack { id, note } => {
+            print_json(&query::ack_finding(store, query::AckParams { id, note })?)
+        }
+        Ctl::Note { resource, text } => print_json(&query::memory_note(
+            store,
+            query::NoteParams {
+                resource,
+                text,
+                author: Some("ctl".into()),
+            },
+        )?),
+        Ctl::Actions => print_json(&store.recent_actions(None, 20)?),
+        Ctl::Approve { run_id } => {
+            let reg = action_registry(config)?;
+            print_json(&reg.approve(store, &run_id)?)
         }
     }
 }

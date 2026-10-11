@@ -4,10 +4,18 @@
 //! the store turns successive passes into a change journal.
 
 mod host;
+mod journal;
+mod processes;
 mod systemd;
+mod user;
 
 pub use host::HostCollector;
+pub use journal::JournaldCollector;
+pub use processes::ProcessCollector;
 pub use systemd::SystemdCollector;
+pub use user::UserCollector;
+
+use std::process::Command;
 
 use pulseblade_core::Observation;
 
@@ -19,6 +27,20 @@ pub enum CollectError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+}
+
+pub(crate) fn run_command(bin: &'static str, args: &[&str]) -> Result<Vec<u8>, CollectError> {
+    let out = Command::new(bin).args(args).output()?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let err = if err.is_empty() {
+            format!("exit {}", out.status)
+        } else {
+            err
+        };
+        return Err(CollectError::Command(bin, err));
+    }
+    Ok(out.stdout)
 }
 
 pub trait Collector: Send {
@@ -38,9 +60,20 @@ pub fn default_collectors() -> Vec<Box<dyn Collector>> {
     let host = hostname();
     let mut out: Vec<Box<dyn Collector>> = vec![Box::new(HostCollector::new(host.clone()))];
     if SystemdCollector::available() {
-        out.push(Box::new(SystemdCollector::new(host)));
+        out.push(Box::new(SystemdCollector::new(host.clone())));
     } else {
         tracing::info!("systemctl not found; systemd collector disabled");
     }
+    if UserCollector::available() {
+        out.push(Box::new(UserCollector::new(host.clone())));
+    } else {
+        tracing::info!("user systemd bus unavailable; user collector disabled");
+    }
+    if JournaldCollector::available() {
+        out.push(Box::new(JournaldCollector::new(host.clone())));
+    } else {
+        tracing::info!("journalctl not found; journald collector disabled");
+    }
+    out.push(Box::new(ProcessCollector::new(host)));
     out
 }

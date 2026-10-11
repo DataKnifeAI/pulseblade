@@ -215,6 +215,7 @@ fn services(ago: i64) -> Observation {
     Observation {
         resources,
         samples: Vec::new(),
+        logs: vec![],
     }
 }
 

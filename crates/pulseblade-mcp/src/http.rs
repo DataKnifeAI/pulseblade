@@ -8,10 +8,11 @@ use std::sync::Arc;
 
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Path, Query, Request, State};
+use axum::http::HeaderMap;
 use axum::http::{header, uri::Authority, StatusCode};
 use axum::middleware::Next;
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use pulseblade_core::ResourceKind;
@@ -28,10 +29,24 @@ const DASHBOARD: &str = include_str!("dashboard.html");
 struct AppState {
     store: Arc<Store>,
     started: DateTime<Utc>,
+    actions: Arc<pulseblade_act::Registry>,
 }
 
 /// Routes for `/`, `/metrics`, and `/api/v1/*`. `started` feeds `uptime_secs`.
 pub fn router(store: Arc<Store>, started: DateTime<Utc>) -> Router {
+    router_with(
+        store,
+        started,
+        Arc::new(pulseblade_act::Registry::builtin()),
+    )
+}
+
+/// Same routes with the node's action registry (approval and the action list).
+pub fn router_with(
+    store: Arc<Store>,
+    started: DateTime<Utc>,
+    actions: Arc<pulseblade_act::Registry>,
+) -> Router {
     let api = Router::new()
         .route("/status", get(status))
         .route("/snapshot", get(snapshot))
@@ -39,12 +54,20 @@ pub fn router(store: Arc<Store>, started: DateTime<Utc>) -> Router {
         .route("/metrics", get(metrics))
         .route("/changes", get(changes))
         .route("/checkpoints", get(checkpoints))
+        .route("/findings", get(findings))
+        .route("/logs", get(logs))
+        .route("/actions", get(actions_list))
+        .route("/actions/{id}/approve", post(approve_action))
         .fallback(|| async { ApiError::not_found("no such API endpoint") });
     Router::new()
         .route("/", get(|| async { Html(DASHBOARD) }))
         .route("/metrics", get(prometheus))
         .nest("/api/v1", api)
-        .with_state(AppState { store, started })
+        .with_state(AppState {
+            store,
+            started,
+            actions,
+        })
 }
 
 pub struct ApiError(StatusCode, String);
@@ -202,6 +225,104 @@ async fn checkpoints(State(st): State<AppState>) -> ApiResult {
     ok(blocking(&st, query::checkpoints).await?)
 }
 
+#[derive(Debug, Deserialize)]
+struct FindingsQuery {
+    status: Option<pulseblade_core::FindingStatus>,
+    severity: Option<pulseblade_core::Severity>,
+    limit: Option<usize>,
+    detail: Option<bool>,
+}
+
+async fn findings(
+    State(st): State<AppState>,
+    q: Result<Query<FindingsQuery>, QueryRejection>,
+) -> ApiResult {
+    let Query(q) = q?;
+    let params = query::FindingsParams {
+        status: q.status,
+        severity: q.severity,
+        limit: q.limit,
+        detail: q.detail,
+    };
+    ok(blocking(&st, move |s| query::findings(s, params)).await?)
+}
+
+#[derive(Debug, Deserialize)]
+struct LogsQuery {
+    resource: String,
+    since: Option<String>,
+    limit: Option<usize>,
+}
+
+async fn actions_list(State(st): State<AppState>) -> ApiResult {
+    ok(blocking(&st, |s| {
+        Ok(serde_json::json!({ "runs": s.recent_actions(None, 20)? }))
+    })
+    .await?)
+}
+
+async fn approve_action(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult {
+    if let Some(expected) = st.actions.approve_token() {
+        let presented = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .unwrap_or("");
+        if !token_matches(expected, presented) {
+            return Err(ApiError(
+                StatusCode::UNAUTHORIZED,
+                "approval token required".into(),
+            ));
+        }
+    }
+    let actions = st.actions.clone();
+    let store = st.store.clone();
+    let run = tokio::task::spawn_blocking(move || actions.approve(&store, &id))
+        .await
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(act_error)?;
+    ok(run)
+}
+
+fn token_matches(expected: &str, presented: &str) -> bool {
+    let a = expected.as_bytes();
+    let b = presented.as_bytes();
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+fn act_error(e: pulseblade_act::ActError) -> ApiError {
+    let status = match &e {
+        pulseblade_act::ActError::NotFound(_) => StatusCode::NOT_FOUND,
+        pulseblade_act::ActError::Invalid(_) => StatusCode::BAD_REQUEST,
+        pulseblade_act::ActError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    ApiError(status, e.to_string())
+}
+
+async fn logs(
+    State(st): State<AppState>,
+    q: Result<Query<LogsQuery>, QueryRejection>,
+) -> ApiResult {
+    let Query(q) = q?;
+    let params = query::LogsParams {
+        resource: q.resource,
+        since: q.since,
+        limit: q.limit,
+    };
+    ok(blocking(&st, move |s| query::logs(s, params)).await?)
+}
+
 async fn prometheus(State(st): State<AppState>) -> ApiResult {
     let text = blocking(&st, prom::render).await?;
     Ok(([(header::CONTENT_TYPE, prom::CONTENT_TYPE)], text).into_response())
@@ -283,6 +404,7 @@ mod tests {
                             Sample::new("host:h", "cpu.used_pct", cpu),
                             Sample::new("disk:h:/home", "disk.used_pct", 93.0),
                         ],
+                        logs: vec![],
                     },
                 )
                 .unwrap();

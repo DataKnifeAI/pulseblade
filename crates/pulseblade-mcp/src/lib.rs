@@ -10,6 +10,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use chrono::Utc;
+use pulseblade_act::Registry;
 use pulseblade_store::Store;
 use rmcp::transport::streamable_http_server::{
     session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
@@ -20,8 +21,8 @@ use tokio_util::sync::CancellationToken;
 pub use server::PulsebladeServer;
 
 /// Serve MCP over stdin/stdout until the client disconnects.
-pub async fn serve_stdio(store: Arc<Store>) -> anyhow::Result<()> {
-    let service = PulsebladeServer::new(store)
+pub async fn serve_stdio(store: Arc<Store>, actions: Arc<Registry>) -> anyhow::Result<()> {
+    let service = PulsebladeServer::with_actions(store, actions)
         .serve(rmcp::transport::stdio())
         .await?;
     service.waiting().await?;
@@ -36,6 +37,7 @@ pub async fn serve_http(
     addr: SocketAddr,
     allowed_hosts: Vec<String>,
     shutdown: CancellationToken,
+    actions: Arc<Registry>,
 ) -> anyhow::Result<()> {
     let mut config = StreamableHttpServerConfig::default()
         .with_json_response(true)
@@ -44,12 +46,18 @@ pub async fn serve_http(
         config = config.with_allowed_hosts(allowed_hosts.clone());
     }
     let mcp_store = store.clone();
+    let mcp_actions = actions.clone();
     let service = StreamableHttpService::new(
-        move || Ok(PulsebladeServer::new(mcp_store.clone())),
+        move || {
+            Ok(PulsebladeServer::with_actions(
+                mcp_store.clone(),
+                mcp_actions.clone(),
+            ))
+        },
         Arc::new(LocalSessionManager::default()),
         config,
     );
-    let router = http::router(store, Utc::now())
+    let router = http::router_with(store, Utc::now(), actions)
         .nest_service("/mcp", service)
         .route("/healthz", axum::routing::get(|| async { "ok" }))
         .layer(axum::middleware::from_fn_with_state(

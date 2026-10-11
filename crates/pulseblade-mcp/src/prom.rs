@@ -170,6 +170,18 @@ pub fn render(store: &Store) -> query::Result<String> {
         1.0,
     );
     x.gauge(
+        "pulseblade_open_findings",
+        "Findings with status open.",
+        &[],
+        store.open_finding_count()? as f64,
+    );
+    x.gauge(
+        "pulseblade_actions_awaiting",
+        "Action runs waiting for approval.",
+        &[],
+        store.awaiting_action_count()? as f64,
+    );
+    x.gauge(
         "pulseblade_journal_seq",
         "Current end of the change journal.",
         &[],
@@ -295,6 +307,7 @@ mod tests {
                         Sample::new("host:h", "cpu.used_pct", 12.5),
                         Sample::new("disk:h:/", "disk.used_pct", 99.0),
                     ],
+                    logs: vec![],
                 },
             )
             .unwrap();

@@ -63,26 +63,29 @@ flowchart LR
 | Crate | Responsibility |
 |-------|----------------|
 | `pulseblade-core` | Schema types (`Resource`, `Sample`, `Change`, `Checkpoint`, `Finding`, `ActionSpec`, `ActionRun`, `Note`), label matching, duration parsing. Every type derives `JsonSchema`. |
-| `pulseblade-store` | SQLite (`rusqlite`, bundled, WAL). Resource state, append-only change journal, checkpoints, samples with retention and query-time downsampling. |
-| `pulseblade-collect` | `Collector` trait plus host (`sysinfo`) and systemd collectors; journald, processes, and user units next. Docker, Proxmox, and Kubernetes arrive behind Cargo features. |
-| `pulseblade-detect` | (M2) Threshold rules and EWMA anomaly detection producing findings with causal context. |
-| `pulseblade-act` | (M3) Action registry, node-local risk tiers, dry-run plans, approval gate, hash-chained audit. |
+| `pulseblade-store` | SQLite (`rusqlite`, bundled, WAL). Resource state, append-only change journal, checkpoints, samples with retention and query-time downsampling, logs, notes, findings, action runs, and the hash-chained audit log. |
+| `pulseblade-collect` | `Collector` trait plus host (`sysinfo`), systemd, user systemd and session, journald, and top processes. Docker, Proxmox, and Kubernetes arrive behind Cargo features. |
+| `pulseblade-detect` | Threshold rules and EWMA anomaly detection. Findings carry recent changes and error lines for the resource, its parent, and its dependencies. |
+| `pulseblade-act` | Built-in action registry, node-local risk tiers, dry-run plans, approval gate, hash-chained audit. The node enforces its own policy. |
 | `pulseblade-mcp` | Shared query layer (`query.rs`), the `rmcp` tool surface over stdio and streamable HTTP, and the node's read-only HTTP surface: JSON API, Prometheus exposition, embedded dashboard. |
 | `pulseblade-pilot` | (M4) Event-driven reasoning loop over MCP using an OpenAI-compatible model endpoint. |
 | `pulseblade` | CLI binary, node loop, config loading. |
 
 ## Data model
 
-- **Resource** — anything observable. Ids are stable and hierarchical by convention: `host:<hostname>`, `disk:<hostname>:<mount>`, `net:<hostname>:<iface>`, `unit:<hostname>:<unit>`. Each carries `kind`, `labels` (semantic, from collectors and config), `attrs` (slow-moving state facts that are change-tracked), and an optional `parent`.
+- **Resource** — anything observable. Ids are stable and hierarchical by convention: `host:<hostname>`, `disk:<hostname>:<mount>`, `net:<hostname>:<iface>`, `unit:<hostname>:<unit>`, `unit:<hostname>:user:<unit>`, `proc:<hostname>:<pid>`, `session:<hostname>`. Each carries `kind`, `labels` (semantic, from collectors and config), `attrs` (slow-moving state facts that are change-tracked), and an optional `parent`.
 - **Sample** — `(resource, metric, ts, value)`. Fast-moving numbers live here, not in `attrs`, so they never generate change noise.
 - **Change** — append-only journal entry with a monotonically increasing `seq`: `appeared`, `disappeared`, or `changed` with `before`/`after`.
 - **Checkpoint** — a name bound to a `seq`. `changes_since` accepts a checkpoint name, `seq:<n>`, an RFC 3339 timestamp, or a relative duration like `15m`.
+- **Finding** — an open, acked, or resolved condition. Context is the recent changes and error lines on the resource, its parent, and its dependencies. Listings omit that context unless the caller asks.
+- **Note** — short text attached to a resource, returned by `resource_explain` and `memory_search`.
+- **Action run** — a planned or executed remediation. `auto` runs on execute, `approve` waits for a human, `deny` never runs. Each transition appends to the audit log, whose hash chains to the previous row.
 
 Collectors report the full set of resources they own on each pass. The store diffs that set against the previous one to produce changes, so disappearance is detected without collector-side bookkeeping.
 
 ## Concurrency
 
-Only one process collects per database. Collection takes an exclusive lock on `<db>.lock`; `pulseblade mcp` collects only if the lock is free, otherwise it serves the database a running node maintains. `pulseblade node --no-collect` never takes the lock and only serves an existing database (offline inspection, demo data). SQLite runs in WAL mode so readers never block the collector.
+Only one process collects per database. Collection takes an exclusive lock on `<db>.lock`; `pulseblade mcp` collects only if the lock is free, otherwise it serves the database a running node maintains. `pulseblade node --no-collect` never takes the lock and only serves an existing database (offline inspection, demo data). Detection runs on the collector thread after each pass, so a read-only MCP process does not open findings of its own. SQLite runs in WAL mode so readers never block the collector.
 
 ## Self-observability
 
@@ -93,7 +96,7 @@ Every collector pass is recorded in a `collector_runs` table (source, time, dura
 `pulseblade node` serves one axum router on its listen address (loopback by default). `pulseblade mcp` serves the same router alongside stdio when the dashboard is enabled (`--dashboard`, `--listen`, or `dashboard = true`); a busy listen address is logged and stdio keeps running.
 
 - `/mcp` — MCP streamable HTTP.
-- `/api/v1/*` — JSON API: `status`, `snapshot`, `resources/{id}`, `metrics`, `changes`, `checkpoints`. Handlers call the same `query` functions as the MCP tools; errors are `{error}` with 400 or 404.
+- `/api/v1/*` — JSON API: `status`, `snapshot`, `resources/{id}`, `metrics`, `changes`, `checkpoints`, `findings`, `logs`, `actions`. `POST /api/v1/actions/{id}/approve` is the approval webhook (optional `Authorization: Bearer` when `actions.approve_token` is set). Handlers call the same functions as the MCP tools; errors are `{error}` with 400 or 404. The host allow-list wraps this route too.
 - `/metrics` — Prometheus text exposition 0.0.4. Resource health is encoded 0 ok, 1 unknown, 2 degraded, 3 failed.
 - `/` — a single self-contained HTML page (`include_str!`, vanilla JS, no CDN or build step) that polls the JSON API.
 

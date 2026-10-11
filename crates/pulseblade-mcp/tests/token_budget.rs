@@ -155,6 +155,7 @@ fn dataset() -> Store {
                 &Observation {
                     resources,
                     samples: host_samples(pass),
+                    logs: vec![],
                 },
             )
             .unwrap();
@@ -165,6 +166,7 @@ fn dataset() -> Store {
                 &Observation {
                     resources: services(pass),
                     samples: vec![],
+                    logs: vec![],
                 },
             )
             .unwrap();

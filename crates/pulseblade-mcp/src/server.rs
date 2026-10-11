@@ -4,14 +4,27 @@ use pulseblade_core::Checkpoint;
 use pulseblade_store::Store;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{Implementation, ServerCapabilities, ServerConfig},
-    tool, tool_handler, tool_router, Json, ServerHandler,
+    model::{
+        Implementation, ListResourcesResult, ReadResourceRequestParams, ReadResourceResult,
+        ResourceContents, ServerCapabilities, ServerConfig, SubscribeRequestParams,
+        SubscriptionFilter,
+    },
+    service::{RequestContext, RoleServer, SubscriptionContext},
+    tool, tool_handler, tool_router, ErrorData as McpError, Json, ServerHandler,
 };
 
 use crate::query::{
-    self, ChangeSet, ChangesParams, CheckpointParams, ExplainParams, Explanation, ExportParams,
-    MetricsParams, Series, Snapshot, SnapshotParams,
+    self, AckParams, AckResult, ChangeSet, ChangesParams, CheckpointParams, ExplainParams,
+    Explanation, ExportParams, FindingPage, FindingsParams, LogPage, LogsParams, MetricsParams,
+    NotePage, NoteParams, SearchParams, Series, Snapshot, SnapshotParams,
 };
+
+const STATE_URI: &str = "pulseblade://state";
+const FINDINGS_URI: &str = "pulseblade://findings";
+
+fn known_uri(uri: &str) -> bool {
+    uri == STATE_URI || uri == FINDINGS_URI
+}
 
 const INSTRUCTIONS: &str = "\
 Pulseblade is an infrastructure monitor built for agents. Responses are small by default; \
@@ -22,25 +35,40 @@ unhealthy resources only). Remember `as_of_seq`, or name the moment with checkpo
 `if_changed_since: <as_of_seq>`, which returns just `{as_of_seq, unchanged: true}` when nothing \
 changed. Continue from `next_cursor`.
 3. Drill down only on what changed or is unhealthy: resource_explain for one resource \
-(attributes, children, latest metrics, recent changes on it and its parent), metrics_query for \
-one metric's history (compact `values` array).
+(attributes, children, latest metrics, recent changes, notes, and open findings), \
+metrics_query for one metric's history (compact `values` array).
+4. findings_list for open problems (detail=true adds the causal context and error lines). \
+finding_ack to acknowledge one. logs_query for recent error lines. memory_note and \
+memory_search for notes on a resource.
+5. actions_list shows node-local remediation and its risk tier. action_plan does not run \
+anything. action_execute runs `auto` immediately, leaves `approve` waiting for a human \
+(`pulseblade ctl approve` or POST /api/v1/actions/{id}/approve), and rejects `deny`. \
+action_status reads the run. Pass dry_run to plan when you only want the audit record.
 Use state_snapshot filters (kind, query, labels) or detail=brief|full only when you need lists; \
 export_bulk returns everything as JSONL and is large.
 Collectors with `ok: false` or `stale: true` mean data is failing or going stale.
-Resource ids: host:<host>, disk:<host>:<mount>, net:<host>:<iface>, unit:<host>:<unit>.";
+Resource ids: host:<host>, disk:<host>:<mount>, net:<host>:<iface>, unit:<host>:<unit>, \
+unit:<host>:user:<unit>, proc:<host>:<pid>, session:<host>.
+MCP resources pulseblade://state and pulseblade://findings notify on change.";
 
 /// MCP handler exposing Pulseblade's read tools.
 #[derive(Clone)]
 pub struct PulsebladeServer {
     store: Arc<Store>,
+    actions: Arc<pulseblade_act::Registry>,
     tool_router: ToolRouter<Self>,
 }
 
 #[tool_router]
 impl PulsebladeServer {
     pub fn new(store: Arc<Store>) -> Self {
+        Self::with_actions(store, Arc::new(pulseblade_act::Registry::builtin()))
+    }
+
+    pub fn with_actions(store: Arc<Store>, actions: Arc<pulseblade_act::Registry>) -> Self {
         Self {
             store,
+            actions,
             tool_router: Self::tool_router(),
         }
     }
@@ -71,7 +99,7 @@ impl PulsebladeServer {
     }
 
     #[tool(
-        description = "Everything about one resource: attributes, labels, parent, children summary (unhealthy children in full), latest metrics, and recent changes on it and its parent for causal context.",
+        description = "Everything about one resource: attributes, labels, parent, children summary (unhealthy children in full), latest metrics, recent changes on it and its parent, notes, open findings, and prior actions.",
         annotations(title = "Explain resource", read_only_hint = true)
     )]
     async fn resource_explain(
@@ -134,15 +162,295 @@ impl PulsebladeServer {
     async fn export_bulk(&self, params: Parameters<ExportParams>) -> Result<String, String> {
         self.run(move |s| query::export(s, params.0)).await
     }
+
+    #[tool(
+        description = "Open findings by default (status, severity). Summaries only; pass detail=true for the causal context and recent error lines. Critical first, capped.",
+        annotations(title = "List findings", read_only_hint = true)
+    )]
+    async fn findings_list(
+        &self,
+        params: Parameters<FindingsParams>,
+    ) -> Result<Json<FindingPage>, String> {
+        self.run(move |s| query::findings(s, params.0))
+            .await
+            .map(Json)
+    }
+
+    #[tool(
+        description = "Acknowledge an open finding. An optional note is stored on its resource and shows up in resource_explain.",
+        annotations(
+            title = "Acknowledge finding",
+            read_only_hint = false,
+            idempotent_hint = true,
+            destructive_hint = false
+        )
+    )]
+    async fn finding_ack(&self, params: Parameters<AckParams>) -> Result<Json<AckResult>, String> {
+        self.run(move |s| query::ack_finding(s, params.0))
+            .await
+            .map(Json)
+    }
+
+    #[tool(
+        description = "Attach a short note to a resource. Notes come back from resource_explain and memory_search.",
+        annotations(
+            title = "Remember a note",
+            read_only_hint = false,
+            idempotent_hint = false,
+            destructive_hint = false
+        )
+    )]
+    async fn memory_note(
+        &self,
+        params: Parameters<NoteParams>,
+    ) -> Result<Json<pulseblade_core::Note>, String> {
+        self.run(move |s| query::memory_note(s, params.0))
+            .await
+            .map(Json)
+    }
+
+    #[tool(
+        description = "Search notes by a case-insensitive substring of the text or resource id. Newest first, capped.",
+        annotations(title = "Search notes", read_only_hint = true)
+    )]
+    async fn memory_search(
+        &self,
+        params: Parameters<SearchParams>,
+    ) -> Result<Json<NotePage>, String> {
+        self.run(move |s| query::memory_search(s, params.0))
+            .await
+            .map(Json)
+    }
+
+    #[tool(
+        description = "Recent error log lines for one resource, newest first. Default window 1h, capped. Does not return a bulk journal.",
+        annotations(title = "Query logs", read_only_hint = true)
+    )]
+    async fn logs_query(&self, params: Parameters<LogsParams>) -> Result<Json<LogPage>, String> {
+        self.run(move |s| query::logs(s, params.0)).await.map(Json)
+    }
+
+    #[tool(
+        description = "Remediation actions this node allows, with risk tier (auto, approve, deny), parameter schema, preconditions, and hourly rate limit. Policy is node-local.",
+        annotations(title = "List actions", read_only_hint = true)
+    )]
+    async fn actions_list(
+        &self,
+        _params: Parameters<pulseblade_act::ActionsParams>,
+    ) -> Result<Json<pulseblade_act::ActionCatalog>, String> {
+        Ok(Json(self.actions.list()))
+    }
+
+    #[tool(
+        description = "Plan a remediation. Returns plan_id (also the run_id) and the risk tier. Does not run the command. dry_run records a plan that execute will not invoke. Repeating an idempotency key returns the in-flight run.",
+        annotations(
+            title = "Plan action",
+            read_only_hint = false,
+            idempotent_hint = true,
+            destructive_hint = false
+        )
+    )]
+    async fn action_plan(
+        &self,
+        params: Parameters<pulseblade_act::PlanParams>,
+    ) -> Result<Json<pulseblade_act::PlanResult>, String> {
+        let store = self.store.clone();
+        let actions = self.actions.clone();
+        tokio::task::spawn_blocking(move || actions.plan(&store, params.0))
+            .await
+            .map_err(|e| format!("internal error: {e}"))?
+            .map(Json)
+            .map_err(|e| e.to_string())
+    }
+
+    #[tool(
+        description = "Execute a planned action. auto runs now. approve returns awaiting_approval and does not run until a human approves. deny is rejected. A finished run is returned unchanged.",
+        annotations(
+            title = "Execute action",
+            read_only_hint = false,
+            idempotent_hint = true,
+            destructive_hint = true
+        )
+    )]
+    async fn action_execute(
+        &self,
+        params: Parameters<pulseblade_act::ExecuteParams>,
+    ) -> Result<Json<pulseblade_core::ActionRun>, String> {
+        let store = self.store.clone();
+        let actions = self.actions.clone();
+        let plan_id = params.0.plan_id;
+        tokio::task::spawn_blocking(move || actions.execute(&store, &plan_id))
+            .await
+            .map_err(|e| format!("internal error: {e}"))?
+            .map(Json)
+            .map_err(|e| e.to_string())
+    }
+
+    #[tool(
+        description = "Status of one action run, including output when it has finished. Expired approvals are marked here.",
+        annotations(title = "Action status", read_only_hint = true)
+    )]
+    async fn action_status(
+        &self,
+        params: Parameters<pulseblade_act::StatusParams>,
+    ) -> Result<Json<pulseblade_core::ActionRun>, String> {
+        let store = self.store.clone();
+        let actions = self.actions.clone();
+        let run_id = params.0.run_id;
+        tokio::task::spawn_blocking(move || actions.status(&store, &run_id))
+            .await
+            .map_err(|e| format!("internal error: {e}"))?
+            .map(Json)
+            .map_err(|e| e.to_string())
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for PulsebladeServer {
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("pulseblade", env!("CARGO_PKG_VERSION")))
-            .with_instructions(INSTRUCTIONS)
+        ServerConfig::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .enable_resources_subscribe()
+                .build(),
+        )
+        .with_server_info(Implementation::new("pulseblade", env!("CARGO_PKG_VERSION")))
+        .with_instructions(INSTRUCTIONS)
     }
+
+    async fn list_resources(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, McpError> {
+        Ok(ListResourcesResult::with_all_items(vec![
+            rmcp::model::Resource::new(STATE_URI, "state")
+                .with_title("Pulseblade state")
+                .with_description(
+                    "Summary snapshot: counts, collector health, unhealthy resources.",
+                )
+                .with_mime_type("application/json"),
+            rmcp::model::Resource::new(FINDINGS_URI, "findings")
+                .with_title("Pulseblade findings")
+                .with_description(
+                    "Open findings, without log lines. findings_list detail=true adds context.",
+                )
+                .with_mime_type("application/json"),
+        ]))
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::ReadResourceResponse, McpError> {
+        let uri = request.uri;
+        let document = if uri == STATE_URI {
+            self.run(query::state_document).await
+        } else if uri == FINDINGS_URI {
+            self.run(query::findings_document).await
+        } else {
+            return Err(McpError::resource_not_found(
+                format!("unknown resource `{uri}`"),
+                None,
+            ));
+        };
+        let text = document.map_err(|e| McpError::internal_error(e, None))?;
+        Ok(ReadResourceResult::new(vec![
+            ResourceContents::text(text, uri).with_mime_type("application/json")
+        ])
+        .into())
+    }
+
+    fn accepted_subscription_filter(
+        &self,
+        requested: &SubscriptionFilter,
+    ) -> Option<SubscriptionFilter> {
+        let mut filter = SubscriptionFilter::new();
+        if let Some(uris) = &requested.resource_subscriptions {
+            let accepted: Vec<String> = uris.iter().filter(|u| known_uri(u)).cloned().collect();
+            if !accepted.is_empty() {
+                filter.resource_subscriptions = Some(accepted);
+            }
+        }
+        Some(filter)
+    }
+
+    async fn listen(&self, context: SubscriptionContext) -> Result<(), McpError> {
+        let store = self.store.clone();
+        let mut prev = read_revision(store.clone()).await.unwrap_or((0, 0));
+        loop {
+            tokio::select! {
+                () = context.cancelled() => return Ok(()),
+                () = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
+            }
+            let Ok(next) = read_revision(store.clone()).await else {
+                continue;
+            };
+            let uris = context
+                .accepted()
+                .resource_subscriptions
+                .clone()
+                .unwrap_or_default();
+            if next.0 != prev.0 && uris.iter().any(|u| u == STATE_URI) {
+                let _ = context.sink().notify_resource_updated(STATE_URI).await;
+            }
+            if next.1 != prev.1 && uris.iter().any(|u| u == FINDINGS_URI) {
+                let _ = context.sink().notify_resource_updated(FINDINGS_URI).await;
+            }
+            prev = next;
+        }
+    }
+
+    fn subscribe(
+        &self,
+        request: SubscribeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<(), McpError>> + Send {
+        if !known_uri(&request.uri) {
+            return std::future::ready(Err(McpError::invalid_params(
+                format!("unknown resource `{}`", request.uri),
+                None,
+            )));
+        }
+        let uri = request.uri;
+        let store = self.store.clone();
+        let peer = context.peer.clone();
+        let ct = context.ct.clone();
+        tokio::spawn(async move {
+            let mut prev = read_revision(store.clone()).await.unwrap_or((0, 0));
+            loop {
+                tokio::select! {
+                    () = ct.cancelled() => break,
+                    () = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
+                }
+                let Ok(next) = read_revision(store.clone()).await else {
+                    continue;
+                };
+                let changed = (uri == STATE_URI && next.0 != prev.0)
+                    || (uri == FINDINGS_URI && next.1 != prev.1);
+                if changed {
+                    let _ = peer
+                        .notify_resource_updated(
+                            rmcp::model::ResourceUpdatedNotificationParam::new(uri.clone()),
+                        )
+                        .await;
+                }
+                prev = next;
+            }
+        });
+        std::future::ready(Ok(()))
+    }
+}
+
+async fn read_revision(store: Arc<Store>) -> Result<(i64, i64), String> {
+    tokio::task::spawn_blocking(move || {
+        Ok::<_, pulseblade_store::StoreError>((store.current_seq()?, store.findings_token()?))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -165,6 +473,7 @@ mod tests {
                         .health(Health::Ok)
                         .attr("os", "linux")],
                     samples: vec![Sample::new("host:h", "cpu.used_pct", 5.0)],
+                    logs: vec![],
                 },
             )
             .unwrap();
@@ -179,6 +488,7 @@ mod tests {
                             .health(Health::Ok)
                             .attr("os", "linux")],
                         samples: vec![Sample::new("host:h", "cpu.used_pct", ago as f64)],
+                        logs: vec![],
                     },
                 )
                 .unwrap();
@@ -197,6 +507,7 @@ mod tests {
                             .parent("host:h"),
                     ],
                     samples: vec![],
+                    logs: vec![],
                 },
             )
             .unwrap();
@@ -214,6 +525,7 @@ mod tests {
                     .health(Health::Ok)
                     .attr("active", "active")],
                     samples: vec![],
+                    logs: vec![],
                 },
             )
             .unwrap();
@@ -358,5 +670,251 @@ mod tests {
         .unwrap();
         assert!(empty.changes.is_empty());
         assert_matches_output_schema(&server, "changes_since", empty);
+
+        let opened = store
+            .reconcile_findings(
+                &[pulseblade_store::FindingDraft {
+                    dedupe_key: "health\0unit:h:a.service".into(),
+                    resource_id: "unit:h:a.service".into(),
+                    rule: "health".into(),
+                    severity: pulseblade_core::Severity::Critical,
+                    summary: "a.service is failed".into(),
+                    context: vec![pulseblade_core::Change {
+                        seq: 1,
+                        ts: Utc::now(),
+                        resource_id: "unit:h:a.service".into(),
+                        kind: pulseblade_core::ChangeKind::Changed,
+                        field: Some("health".into()),
+                        before: Some(serde_json::json!("ok")),
+                        after: Some(serde_json::json!("failed")),
+                    }],
+                    logs: vec![pulseblade_core::LogLine {
+                        ts: Utc::now(),
+                        resource_id: "unit:h:a.service".into(),
+                        message: "failed to start".into(),
+                    }],
+                }],
+                Utc::now(),
+            )
+            .unwrap();
+        let listed = query::findings(&store, query::FindingsParams::default()).unwrap();
+        assert_eq!(listed.findings.len(), 1);
+        assert!(listed.findings[0].context.is_empty());
+        assert_matches_output_schema(&server, "findings_list", listed);
+        let detailed = query::findings(
+            &store,
+            query::FindingsParams {
+                detail: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(!detailed.findings[0].logs.is_empty());
+        assert_matches_output_schema(&server, "findings_list", detailed);
+        let empty_findings = query::findings(
+            &store,
+            query::FindingsParams {
+                status: Some(pulseblade_core::FindingStatus::Resolved),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(empty_findings.findings.is_empty());
+        assert_matches_output_schema(&server, "findings_list", empty_findings);
+
+        let acked = query::ack_finding(
+            &store,
+            query::AckParams {
+                id: opened[0].id.clone(),
+                note: Some("known during the deploy".into()),
+            },
+        )
+        .unwrap();
+        assert!(acked.note.is_some());
+        assert_matches_output_schema(&server, "finding_ack", acked);
+        let acked_again = query::ack_finding(
+            &store,
+            query::AckParams {
+                id: opened[0].id.clone(),
+                note: None,
+            },
+        )
+        .unwrap();
+        assert!(acked_again.note.is_none());
+        assert_matches_output_schema(&server, "finding_ack", acked_again);
+
+        let note = query::memory_note(
+            &store,
+            query::NoteParams {
+                resource: "host:h".into(),
+                text: "backup fills the disk".into(),
+                author: None,
+            },
+        )
+        .unwrap();
+        assert_matches_output_schema(&server, "memory_note", note);
+        let found = query::memory_search(
+            &store,
+            query::SearchParams {
+                query: "backup".into(),
+                limit: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(found.notes.len(), 1);
+        assert_matches_output_schema(&server, "memory_search", found);
+        let none = query::memory_search(
+            &store,
+            query::SearchParams {
+                query: "zzzz-no-such-note".into(),
+                limit: Some(1),
+            },
+        )
+        .unwrap();
+        assert!(none.notes.is_empty());
+        assert_matches_output_schema(&server, "memory_search", none);
+
+        store
+            .apply(
+                "journald",
+                Utc::now(),
+                &Observation {
+                    resources: vec![],
+                    samples: vec![],
+                    logs: vec![pulseblade_core::LogLine {
+                        ts: Utc::now(),
+                        resource_id: "unit:h:a.service".into(),
+                        message: "accepted connection failed".into(),
+                    }],
+                },
+            )
+            .unwrap();
+        let logs = query::logs(
+            &store,
+            query::LogsParams {
+                resource: "unit:h:a.service".into(),
+                since: Some("1h".into()),
+                limit: Some(5),
+            },
+        )
+        .unwrap();
+        assert!(!logs.lines.is_empty());
+        assert_matches_output_schema(&server, "logs_query", logs);
+        let quiet = query::logs(
+            &store,
+            query::LogsParams {
+                resource: "host:h".into(),
+                since: None,
+                limit: None,
+            },
+        )
+        .unwrap();
+        assert!(quiet.lines.is_empty());
+        assert_matches_output_schema(&server, "logs_query", quiet);
+
+        let explained = query::explain(
+            &store,
+            ExplainParams {
+                id: "unit:h:a.service".into(),
+                changes_limit: None,
+            },
+        )
+        .unwrap();
+        assert!(!explained.notes.is_empty());
+        assert!(!explained.findings.is_empty());
+        assert!(explained.actions.is_empty());
+        assert_matches_output_schema(&server, "resource_explain", explained);
+
+        struct Nop;
+        impl pulseblade_act::CommandRunner for Nop {
+            fn run(&self, _: &str, _: &[String]) -> Result<String, String> {
+                Err("schema test must not run a command".into())
+            }
+        }
+        let mut policy = pulseblade_act::ActionsConfig::default();
+        policy.script_run.tier = Some(pulseblade_core::RiskTier::Auto);
+        policy.script_run.allow = vec!["/usr/local/lib/pulseblade/hook".into()];
+        let reg = pulseblade_act::Registry::new(policy, Arc::new(Nop)).unwrap();
+        let catalog = reg.list();
+        assert_eq!(catalog.actions.len(), 4);
+        assert_matches_output_schema(&server, "actions_list", &catalog);
+        let planned = reg
+            .plan(
+                &store,
+                pulseblade_act::PlanParams {
+                    action: "script.run".into(),
+                    params: serde_json::json!({"script": "/usr/local/lib/pulseblade/hook"}),
+                    resource_id: Some("host:h".into()),
+                    idempotency_key: None,
+                    dry_run: true,
+                },
+            )
+            .unwrap();
+        assert!(planned.dry_run);
+        assert_matches_output_schema(&server, "action_plan", &planned);
+        let executed = reg.execute(&store, &planned.plan_id).unwrap();
+        assert_eq!(executed.status, pulseblade_core::ActionRunStatus::Succeeded);
+        assert_matches_output_schema(&server, "action_execute", &executed);
+        let status = reg.status(&store, &executed.id).unwrap();
+        assert_matches_output_schema(&server, "action_status", &status);
+
+        let waiting = reg
+            .plan(
+                &store,
+                pulseblade_act::PlanParams {
+                    action: "systemd.restart".into(),
+                    params: serde_json::json!({"unit": "a.service"}),
+                    resource_id: Some("unit:h:a.service".into()),
+                    idempotency_key: Some("restart-a".into()),
+                    dry_run: false,
+                },
+            )
+            .unwrap();
+        assert!(!waiting.dry_run);
+        assert_matches_output_schema(&server, "action_plan", &waiting);
+        let held = reg.execute(&store, &waiting.plan_id).unwrap();
+        assert_eq!(
+            held.status,
+            pulseblade_core::ActionRunStatus::AwaitingApproval
+        );
+        assert_matches_output_schema(&server, "action_execute", &held);
+        assert_matches_output_schema(
+            &server,
+            "action_status",
+            reg.status(&store, &held.id).unwrap(),
+        );
+
+        let with_actions = query::explain(
+            &store,
+            ExplainParams {
+                id: "host:h".into(),
+                changes_limit: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(with_actions.actions.len(), 1);
+        assert_matches_output_schema(&server, "resource_explain", with_actions);
+
+        let info = server.get_info();
+        assert_eq!(
+            info.capabilities
+                .resources
+                .as_ref()
+                .and_then(|r| r.subscribe),
+            Some(true)
+        );
+        assert_eq!(
+            server.accepted_subscription_filter(
+                &rmcp::model::SubscriptionFilter::builder()
+                    .resource_subscription(STATE_URI)
+                    .resource_subscription("pulseblade://nope")
+                    .build()
+            ),
+            Some(
+                rmcp::model::SubscriptionFilter::builder()
+                    .resource_subscription(STATE_URI)
+                    .build()
+            )
+        );
     }
 }

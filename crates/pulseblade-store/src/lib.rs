@@ -9,6 +9,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 use chrono::{DateTime, TimeZone, Utc};
+mod actions;
+mod memory;
+
+pub use actions::{ActionTransition, NewAction};
+pub use memory::{FindingDraft, FindingFilter};
+
 use pulseblade_core::{
     Aggregation, Change, ChangeKind, Checkpoint, CollectorRun, Health, Observation, Point,
     Resource, ResourceKind, Since, StoredResource,
@@ -26,6 +32,12 @@ pub enum StoreError {
     UnknownCheckpoint(String),
     #[error("corrupt row: {0}")]
     Corrupt(String),
+    #[error("unknown finding `{0}`")]
+    UnknownFinding(String),
+    #[error("unknown action `{0}`")]
+    UnknownAction(String),
+    #[error("{0}")]
+    Invalid(String),
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -94,6 +106,67 @@ CREATE TABLE IF NOT EXISTS collector_runs (
     interval_secs  INTEGER
 );
 CREATE INDEX IF NOT EXISTS collector_runs_source ON collector_runs(source, id);
+
+CREATE TABLE IF NOT EXISTS logs (
+    ts          INTEGER NOT NULL,
+    resource_id TEXT NOT NULL,
+    message     TEXT NOT NULL,
+    PRIMARY KEY (resource_id, ts, message)
+);
+CREATE INDEX IF NOT EXISTS logs_ts ON logs(ts);
+
+CREATE TABLE IF NOT EXISTS notes (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    resource_id TEXT NOT NULL,
+    author      TEXT NOT NULL,
+    text        TEXT NOT NULL,
+    created_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS notes_resource ON notes(resource_id, created_at);
+
+CREATE TABLE IF NOT EXISTS findings (
+    id          TEXT PRIMARY KEY,
+    dedupe_key  TEXT NOT NULL,
+    resource_id TEXT NOT NULL,
+    rule        TEXT NOT NULL,
+    severity    TEXT NOT NULL,
+    status      TEXT NOT NULL,
+    summary     TEXT NOT NULL,
+    opened_at   INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL,
+    context     TEXT NOT NULL,
+    logs        TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS findings_status ON findings(status, opened_at);
+CREATE INDEX IF NOT EXISTS findings_key ON findings(dedupe_key);
+CREATE INDEX IF NOT EXISTS findings_resource ON findings(resource_id);
+
+CREATE TABLE IF NOT EXISTS action_runs (
+    id               TEXT PRIMARY KEY,
+    action           TEXT NOT NULL,
+    resource_id      TEXT NOT NULL,
+    params           TEXT NOT NULL,
+    idempotency_key  TEXT NOT NULL,
+    tier             TEXT NOT NULL,
+    status           TEXT NOT NULL,
+    dry_run          INTEGER NOT NULL,
+    output           TEXT,
+    created_at       INTEGER NOT NULL,
+    updated_at       INTEGER NOT NULL,
+    expires_at       INTEGER
+);
+CREATE INDEX IF NOT EXISTS action_runs_key ON action_runs(idempotency_key, status);
+CREATE INDEX IF NOT EXISTS action_runs_resource ON action_runs(resource_id, created_at);
+
+CREATE TABLE IF NOT EXISTS audit (
+    seq       INTEGER PRIMARY KEY,
+    ts        INTEGER NOT NULL,
+    run_id    TEXT NOT NULL,
+    event     TEXT NOT NULL,
+    payload   TEXT NOT NULL,
+    prev_hash TEXT NOT NULL,
+    hash      TEXT NOT NULL
+);
 "#;
 
 /// Collector runs kept per source; older rows are pruned on insert.
@@ -400,6 +473,23 @@ impl Store {
             }
         }
 
+        {
+            let mut ins = tx.prepare_cached(
+                "INSERT OR IGNORE INTO logs (ts, resource_id, message) VALUES (?1, ?2, ?3)",
+            )?;
+            for line in &obs.logs {
+                let message = clip_log(&line.message);
+                if line.resource_id.is_empty() || message.is_empty() {
+                    continue;
+                }
+                ins.execute(params![
+                    line.ts.timestamp_millis(),
+                    line.resource_id,
+                    message
+                ])?;
+            }
+        }
+
         tx.commit()?;
         Ok(changes)
     }
@@ -623,6 +713,10 @@ impl Store {
             "DELETE FROM samples WHERE ts < ?1",
             [samples_before.timestamp_millis()],
         )?;
+        conn.execute(
+            "DELETE FROM logs WHERE ts < ?1",
+            [samples_before.timestamp_millis()],
+        )?;
         let c = conn.execute(
             "DELETE FROM changes WHERE ts < ?1",
             [changes_before.timestamp_millis()],
@@ -685,6 +779,18 @@ fn diff_map<V: PartialEq>(
 
 fn json_opt(v: &Option<String>) -> Option<Value> {
     v.as_ref().map(|s| json!(s))
+}
+
+/// Keep log lines short enough to store and return without a bulk dump.
+fn clip_log(message: &str) -> String {
+    const MAX: usize = 400;
+    let flat: String = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= MAX {
+        return flat;
+    }
+    let mut out: String = flat.chars().take(MAX - 1).collect();
+    out.push('…');
+    out
 }
 
 fn summary(r: &Resource) -> Value {
@@ -770,6 +876,7 @@ mod tests {
         Observation {
             resources,
             samples: vec![],
+            logs: vec![],
         }
     }
 
@@ -968,6 +1075,7 @@ mod tests {
                     &Observation {
                         resources: vec![Resource::new("host:h", ResourceKind::Host, "h")],
                         samples: vec![Sample::new("host:h", "cpu.used_pct", i as f64)],
+                        logs: vec![],
                     },
                 )
                 .unwrap();

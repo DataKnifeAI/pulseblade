@@ -9,10 +9,10 @@ use std::collections::{BTreeMap, HashMap};
 
 use chrono::{DateTime, Duration, Utc};
 use pulseblade_core::{
-    parse_duration, Aggregation, Change, ChangeKind, Checkpoint, Health, ResourceKind, Since,
-    StoredResource,
+    parse_duration, ActionRun, Aggregation, Change, ChangeKind, Checkpoint, FindingStatus, Health,
+    LogLine, Note, ResourceKind, Severity, Since, StoredResource,
 };
-use pulseblade_store::{ChangeFilter, ResourceFilter, Store, StoreError};
+use pulseblade_store::{ChangeFilter, FindingFilter, ResourceFilter, Store, StoreError};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -36,11 +36,21 @@ const KEY_HOST_METRICS: &[&str] = &["cpu.used_pct", "mem.used_pct", "load.1m", "
 #[derive(Debug, thiserror::Error)]
 pub enum QueryError {
     #[error(transparent)]
-    Store(#[from] StoreError),
+    Store(StoreError),
     #[error("{0}")]
     Invalid(String),
     #[error("{0}")]
     NotFound(String),
+}
+
+impl From<StoreError> for QueryError {
+    fn from(e: StoreError) -> Self {
+        match e {
+            StoreError::UnknownFinding(id) => Self::NotFound(format!("no finding `{id}`")),
+            StoreError::Invalid(msg) => Self::Invalid(msg),
+            other => Self::Store(other),
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, QueryError>;
@@ -166,6 +176,10 @@ pub struct Status {
     pub samples: u64,
     pub changes: u64,
     pub checkpoints: u64,
+    /// Findings with status `open`.
+    pub open_findings: u64,
+    /// Action runs waiting for a human.
+    pub awaiting_actions: u64,
 }
 
 /// Self-health. `process_started` is the serving process's start time, if any.
@@ -194,6 +208,8 @@ pub fn status(store: &Store, process_started: Option<DateTime<Utc>>) -> Result<S
         samples: stats.samples,
         changes: stats.changes,
         checkpoints: stats.checkpoints,
+        open_findings: store.open_finding_count()?,
+        awaiting_actions: store.awaiting_action_count()?,
     })
 }
 
@@ -507,6 +523,15 @@ pub struct Explanation {
     pub children: ChildrenSummary,
     /// Recent changes on this resource and its parent, newest first: causal context.
     pub recent_changes: Vec<Change>,
+    /// Notes attached to this resource, newest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<Note>,
+    /// Open and acked findings on this resource. Context and logs are included.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub findings: Vec<FindingView>,
+    /// Recent action runs filed on this resource, newest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<ActionRun>,
 }
 
 pub fn explain(store: &Store, p: ExplainParams) -> Result<Explanation> {
@@ -552,6 +577,21 @@ pub fn explain(store: &Store, p: ExplainParams) -> Result<Explanation> {
     let mut ids = vec![p.id.clone()];
     ids.extend(resource.resource.parent.clone());
     let recent_changes = store.recent_changes(&ids, p.changes_limit.unwrap_or(20).min(200))?;
+    let notes = store.notes_for(&p.id, 10)?;
+    let (matched, _) = store.findings(
+        &FindingFilter {
+            resource_id: Some(p.id.clone()),
+            ..Default::default()
+        },
+        20,
+    )?;
+    let findings = matched
+        .into_iter()
+        .filter(|f| matches!(f.status, FindingStatus::Open | FindingStatus::Acked))
+        .take(5)
+        .map(|f| finding_view(f, true))
+        .collect();
+    let actions = store.recent_actions(Some(&p.id), 8)?;
 
     Ok(Explanation {
         as_of_seq,
@@ -564,6 +604,9 @@ pub fn explain(store: &Store, p: ExplainParams) -> Result<Explanation> {
             unhealthy,
         },
         recent_changes,
+        notes,
+        findings,
+        actions,
     })
 }
 
@@ -940,6 +983,255 @@ fn round2(v: f64) -> f64 {
     (v * 100.0).round() / 100.0
 }
 
+// ---------------------------------------------------------------------------
+// findings, notes, logs
+
+const DEFAULT_FINDINGS: usize = 20;
+const MAX_FINDINGS: usize = 100;
+const DEFAULT_LOGS: usize = 20;
+const MAX_LOGS: usize = 100;
+const DEFAULT_NOTES: usize = 10;
+const MAX_NOTES: usize = 50;
+const MAX_NOTE_CHARS: usize = 2000;
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct FindingsParams {
+    /// `open` (default), `acked`, or `resolved`.
+    #[serde(default)]
+    pub status: Option<FindingStatus>,
+    #[serde(default)]
+    pub severity: Option<Severity>,
+    /// Maximum findings (default 20, max 100). Critical first.
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Include causal context and recent error lines. Default false.
+    #[serde(default)]
+    pub detail: Option<bool>,
+}
+
+/// A finding as returned to agents. Context and logs are omitted unless requested.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct FindingView {
+    pub id: String,
+    pub resource_id: String,
+    pub rule: String,
+    pub severity: Severity,
+    pub status: FindingStatus,
+    pub summary: String,
+    pub opened_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context: Vec<Change>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub logs: Vec<LogLine>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct FindingPage {
+    pub as_of_seq: i64,
+    pub total: usize,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub truncated: bool,
+    pub findings: Vec<FindingView>,
+}
+
+pub fn findings(store: &Store, p: FindingsParams) -> Result<FindingPage> {
+    let limit = p.limit.unwrap_or(DEFAULT_FINDINGS).clamp(1, MAX_FINDINGS);
+    let detail = p.detail.unwrap_or(false);
+    let (rows, total) = store.findings(
+        &FindingFilter {
+            status: Some(p.status.unwrap_or(FindingStatus::Open)),
+            severity: p.severity,
+            resource_id: None,
+        },
+        limit,
+    )?;
+    Ok(FindingPage {
+        as_of_seq: store.current_seq()?,
+        total,
+        truncated: total > rows.len(),
+        findings: rows.into_iter().map(|f| finding_view(f, detail)).collect(),
+    })
+}
+
+fn finding_view(f: pulseblade_core::Finding, detail: bool) -> FindingView {
+    FindingView {
+        id: f.id,
+        resource_id: f.resource_id,
+        rule: f.rule,
+        severity: f.severity,
+        status: f.status,
+        summary: f.summary,
+        opened_at: f.opened_at,
+        context: if detail { f.context } else { Vec::new() },
+        logs: if detail { f.logs } else { Vec::new() },
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct AckParams {
+    pub id: String,
+    /// Optional note recorded on the finding's resource.
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct AckResult {
+    pub as_of_seq: i64,
+    pub finding: FindingView,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<Note>,
+}
+
+pub fn ack_finding(store: &Store, p: AckParams) -> Result<AckResult> {
+    let finding = store.ack_finding(&p.id, Utc::now())?;
+    let note = match p.note.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        Some(text) => Some(write_note(store, &finding.resource_id, None, text)?),
+        None => None,
+    };
+    Ok(AckResult {
+        as_of_seq: store.current_seq()?,
+        finding: finding_view(finding, true),
+        note,
+    })
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct NoteParams {
+    /// Resource id the note is about.
+    pub resource: String,
+    pub text: String,
+    /// Who wrote it (default `agent`).
+    #[serde(default)]
+    pub author: Option<String>,
+}
+
+pub fn memory_note(store: &Store, p: NoteParams) -> Result<Note> {
+    write_note(store, &p.resource, p.author.as_deref(), &p.text)
+}
+
+fn write_note(store: &Store, resource: &str, author: Option<&str>, text: &str) -> Result<Note> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err(QueryError::Invalid("note text is empty".into()));
+    }
+    if text.chars().count() > MAX_NOTE_CHARS {
+        return Err(QueryError::Invalid(format!(
+            "note text is longer than {MAX_NOTE_CHARS} characters"
+        )));
+    }
+    if store.resource(resource)?.is_none() {
+        return Err(not_found_with_suggestions(store, resource)?);
+    }
+    let author = author.unwrap_or("agent").trim();
+    let author = if author.is_empty() { "agent" } else { author };
+    let author = author.chars().take(64).collect::<String>();
+    Ok(store.insert_note(resource, &author, text, Utc::now())?)
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SearchParams {
+    /// Case-insensitive substring of note text or resource id.
+    pub query: String,
+    /// Maximum notes (default 10, max 50).
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct NotePage {
+    pub as_of_seq: i64,
+    pub total: usize,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub truncated: bool,
+    pub notes: Vec<Note>,
+}
+
+pub fn memory_search(store: &Store, p: SearchParams) -> Result<NotePage> {
+    let query = p.query.trim();
+    if query.is_empty() {
+        return Err(QueryError::Invalid("query is empty".into()));
+    }
+    let limit = p.limit.unwrap_or(DEFAULT_NOTES).clamp(1, MAX_NOTES);
+    let (notes, total) = store.search_notes(query, limit)?;
+    Ok(NotePage {
+        as_of_seq: store.current_seq()?,
+        total,
+        truncated: total > notes.len(),
+        notes,
+    })
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct LogsParams {
+    /// Resource id, e.g. `unit:web1:sshd.service`.
+    pub resource: String,
+    /// Look-back window such as `15m` or an RFC 3339 timestamp (default `1h`).
+    #[serde(default)]
+    pub since: Option<String>,
+    /// Maximum lines, newest first (default 20, max 100).
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct LogPage {
+    pub as_of_seq: i64,
+    pub resource: String,
+    pub total: usize,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub truncated: bool,
+    /// Recent error lines. Empty when the journal has been quiet.
+    pub lines: Vec<LogLine>,
+}
+
+pub fn logs(store: &Store, p: LogsParams) -> Result<LogPage> {
+    let since = match Since::parse(p.since.as_deref().unwrap_or("1h"), Utc::now()) {
+        Since::Time(t) => t,
+        Since::Seq(_) | Since::Checkpoint(_) => {
+            return Err(QueryError::Invalid(
+                "since must be a duration like 15m or an RFC 3339 timestamp".into(),
+            ));
+        }
+    };
+    let limit = p.limit.unwrap_or(DEFAULT_LOGS).clamp(1, MAX_LOGS);
+    let (lines, total) = store.logs_since(&p.resource, since, limit)?;
+    if lines.is_empty() && store.resource(&p.resource)?.is_none() {
+        return Err(not_found_with_suggestions(store, &p.resource)?);
+    }
+    Ok(LogPage {
+        as_of_seq: store.current_seq()?,
+        resource: p.resource,
+        total,
+        truncated: total > lines.len(),
+        lines,
+    })
+}
+
+/// JSON document for the `pulseblade://state` MCP resource.
+pub fn state_document(store: &Store) -> Result<String> {
+    let snap = snapshot(
+        store,
+        SnapshotParams {
+            detail: Some(Detail::Summary),
+            ..Default::default()
+        },
+    )?;
+    serde_json::to_string(&snap).map_err(|e| QueryError::Invalid(e.to_string()))
+}
+
+/// JSON document for the `pulseblade://findings` MCP resource: open findings, no logs.
+pub fn findings_document(store: &Store) -> Result<String> {
+    let page = findings(
+        store,
+        FindingsParams {
+            limit: Some(DEFAULT_FINDINGS),
+            ..Default::default()
+        },
+    )?;
+    serde_json::to_string(&page).map_err(|e| QueryError::Invalid(e.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -960,6 +1252,7 @@ mod tests {
                         Sample::new("host:h", "cpu.used_pct", 12.345),
                         Sample::new("host:h", "load.5m", 1.0),
                     ],
+                    logs: vec![],
                 },
             )
             .unwrap();
@@ -981,6 +1274,7 @@ mod tests {
                             .attr("active", "failed"),
                     ],
                     samples: vec![],
+                    logs: vec![],
                 },
             )
             .unwrap();
@@ -1190,6 +1484,7 @@ mod tests {
                     &Observation {
                         resources: vec![Resource::new("host:h", ResourceKind::Host, "h")],
                         samples: vec![Sample::new("host:h", "cpu.used_pct", v)],
+                        logs: vec![],
                     },
                 )
                 .unwrap();
