@@ -1,6 +1,6 @@
 # Pulseblade
 
-![Pulseblade — an amber pulse sweeping out from a central hub across a fleet of infrastructure nodes, revealing healthy and degraded hosts](docs/assets/pulseblade-hero.jpg)
+![Pulseblade — a person walking a lane of infrastructure nodes as an amber pulse sweeps ahead, revealing healthy and degraded hosts](docs/assets/pulseblade-hero.jpg)
 
 **Pulseblade** — a pulse that reveals what is moving across your infrastructure.
 
