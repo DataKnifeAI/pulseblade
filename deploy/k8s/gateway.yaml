@@ -1,0 +1,33 @@
+# Exposes the Pulseblade hub on the existing rke2 nginx Ingress.
+# poc-apps already terminates TLS with the Let's Encrypt wildcard
+# kube-system/wildcard-dataknife-net-tls (*.dataknife.net), the same default
+# certificate grafana.dataknife.net and harbor.dataknife.net use. Do not add a
+# second gateway controller or a new issuer.
+#
+# The hub ConfigMap allow-list must include this hostname; any other Host
+# header is rejected with 403. DNS should be a CNAME to the worker record,
+# matching the other apps:
+#   pb-hub-poc.dataknife.net  CNAME  poc-apps-wk.dataknife.net
+#
+#   curl -fsS https://pb-hub-poc.dataknife.net/
+#   curl -fsS https://pb-hub-poc.dataknife.net/api/v1/status
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: pulseblade-hub
+  namespace: pulseblade
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: pb-hub-poc.dataknife.net
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: pulseblade-hub
+                port:
+                  number: 7170

@@ -216,8 +216,18 @@ fn kind_of(action: &str, raw: Option<&str>) -> Result<String, ActError> {
 
 #[cfg(feature = "k8s")]
 pub struct KubeApi {
-    rt: tokio::runtime::Runtime,
+    /// Taken on drop. Dropping a runtime inside `#[tokio::main]` panics.
+    rt: Option<tokio::runtime::Runtime>,
     client: kube::Client,
+}
+
+#[cfg(feature = "k8s")]
+impl Drop for KubeApi {
+    fn drop(&mut self) {
+        if let Some(rt) = self.rt.take() {
+            rt.shutdown_background();
+        }
+    }
 }
 
 #[cfg(feature = "k8s")]
@@ -245,15 +255,28 @@ impl KubeApi {
         cfg.connect_timeout = Some(std::time::Duration::from_secs(5));
         cfg.read_timeout = Some(std::time::Duration::from_secs(10));
         cfg.default_retry = false;
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()
-            .map_err(|e| e.to_string())?;
-        let client = rt
-            .block_on(async move { kube::Client::try_from(cfg) })
-            .map_err(|e| format!("kubernetes client: {e}"))?;
-        Ok(Self { rt, client })
+        // `pulseblade node` is already a tokio runtime. Building a second
+        // multi-thread runtime on that thread panics, so build it on a fresh
+        // thread and hand the runtime back. Worker threads keep driving it.
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let built = (|| {
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .enable_all()
+                    .build()
+                    .map_err(|e| e.to_string())?;
+                let client = rt
+                    .block_on(async move { kube::Client::try_from(cfg) })
+                    .map_err(|e| format!("kubernetes client: {e}"))?;
+                Ok(Self {
+                    rt: Some(rt),
+                    client,
+                })
+            })();
+            let _ = tx.send(built);
+        });
+        rx.recv().map_err(|e| e.to_string())?
     }
 
     fn call<T: Send + 'static>(
@@ -261,9 +284,12 @@ impl KubeApi {
         fut: impl std::future::Future<Output = T> + Send + 'static,
     ) -> Result<T, String> {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        self.rt.spawn(async move {
-            let _ = tx.send(fut.await);
-        });
+        self.rt
+            .as_ref()
+            .ok_or("kubernetes runtime is shut down")?
+            .spawn(async move {
+                let _ = tx.send(fut.await);
+            });
         rx.recv().map_err(|e| e.to_string())
     }
 }
@@ -386,4 +412,31 @@ pub fn serve_patch(hits: std::sync::Arc<std::sync::Mutex<Vec<String>>>) -> Strin
         }
     });
     format!("http://{addr}")
+}
+
+#[cfg(all(test, feature = "k8s"))]
+#[test]
+fn connect_from_inside_a_runtime_does_not_panic() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        std::env::set_var("PULSEBLADE_K8S_CONNECT_TEST", "token");
+        let endpoint = K8sEndpoint {
+            api_url: "https://127.0.0.1:9".into(),
+            token_env: "PULSEBLADE_K8S_CONNECT_TEST".into(),
+            cluster: "test".into(),
+            verify_tls: false,
+            ca: String::new(),
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            KubeApi::connect(&endpoint)
+        }));
+        assert!(
+            result.is_ok(),
+            "KubeApi::connect panicked inside a tokio runtime"
+        );
+    });
 }

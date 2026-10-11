@@ -14,6 +14,19 @@ spec:
       serviceAccountName: {{ .Release.Name }}
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
+      # emptyDir is root:root 0755. The image user cannot create the database
+      # unless the pod runs as this group and kubelet chowns the volume.
+      securityContext:
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
       containers:
         - name: pulseblade
           image: {{ .Values.image }}
