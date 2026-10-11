@@ -1,0 +1,16 @@
+[Unit]
+Description=Pulseblade hub
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pulseblade
+Environment=PULSEBLADE_CONFIG=/etc/pulseblade/pulseblade.toml
+Environment=PULSEBLADE_DB=/var/lib/pulseblade/hub.db
+ExecStart=/usr/local/bin/pulseblade hub
+Restart=on-failure
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

@@ -15,9 +15,26 @@ use rmcp::{
 
 use crate::query::{
     self, AckParams, AckResult, ChangeSet, ChangesParams, CheckpointParams, ExplainParams,
-    Explanation, ExportParams, FindingPage, FindingsParams, LogPage, LogsParams, MetricsParams,
-    NotePage, NoteParams, SearchParams, Series, Snapshot, SnapshotParams,
+    Explanation, ExportParams, FindingPage, FindingsParams, FleetOverview, FleetParams, LogPage,
+    LogsParams, MetricsParams, NotePage, NoteParams, SearchParams, Series, Snapshot,
+    SnapshotParams,
 };
+
+/// Hub action calls. The node still plans and executes against its own policy.
+pub trait ActionRoute: Send + Sync {
+    fn plan(
+        &self,
+        params: pulseblade_act::PlanParams,
+    ) -> Result<pulseblade_act::PlanResult, String>;
+    fn execute(
+        &self,
+        params: pulseblade_act::ExecuteParams,
+    ) -> Result<pulseblade_core::ActionRun, String>;
+    fn status(
+        &self,
+        params: pulseblade_act::StatusParams,
+    ) -> Result<pulseblade_core::ActionRun, String>;
+}
 
 const STATE_URI: &str = "pulseblade://state";
 const FINDINGS_URI: &str = "pulseblade://findings";
@@ -43,7 +60,10 @@ memory_search for notes on a resource.
 5. actions_list shows node-local remediation and its risk tier. action_plan does not run \
 anything. action_execute runs `auto` immediately, leaves `approve` waiting for a human \
 (`pulseblade ctl approve` or POST /api/v1/actions/{id}/approve), and rejects `deny`. \
-action_status reads the run. Pass dry_run to plan when you only want the audit record.
+action_status reads the run. Pass dry_run to plan when you only want the audit record. \
+On a hub, those action calls are routed to the node that owns the resource; that node \
+applies its own tier. fleet_overview groups the fleet by role, cluster, criticality, and \
+host: unhealthy resources in full, everything else as counts.
 Use state_snapshot filters (kind, query, labels) or detail=brief|full only when you need lists; \
 export_bulk returns everything as JSONL and is large.
 Collectors with `ok: false` or `stale: true` mean data is failing or going stale.
@@ -57,6 +77,7 @@ MCP resources pulseblade://state and pulseblade://findings notify on change.";
 pub struct PulsebladeServer {
     store: Arc<Store>,
     actions: Arc<pulseblade_act::Registry>,
+    route: Option<Arc<dyn ActionRoute>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -67,9 +88,20 @@ impl PulsebladeServer {
     }
 
     pub fn with_actions(store: Arc<Store>, actions: Arc<pulseblade_act::Registry>) -> Self {
+        Self::with_route(store, actions, None)
+    }
+
+    /// `route` sends action_plan, action_execute, and action_status to another tier.
+    /// The local registry is still what `actions_list` describes.
+    pub fn with_route(
+        store: Arc<Store>,
+        actions: Arc<pulseblade_act::Registry>,
+        route: Option<Arc<dyn ActionRoute>>,
+    ) -> Self {
         Self {
             store,
             actions,
+            route,
             tool_router: Self::tool_router(),
         }
     }
@@ -255,6 +287,12 @@ impl PulsebladeServer {
         &self,
         params: Parameters<pulseblade_act::PlanParams>,
     ) -> Result<Json<pulseblade_act::PlanResult>, String> {
+        if let Some(route) = self.route.clone() {
+            return tokio::task::spawn_blocking(move || route.plan(params.0))
+                .await
+                .map_err(|e| format!("internal error: {e}"))?
+                .map(Json);
+        }
         let store = self.store.clone();
         let actions = self.actions.clone();
         tokio::task::spawn_blocking(move || actions.plan(&store, params.0))
@@ -277,6 +315,12 @@ impl PulsebladeServer {
         &self,
         params: Parameters<pulseblade_act::ExecuteParams>,
     ) -> Result<Json<pulseblade_core::ActionRun>, String> {
+        if let Some(route) = self.route.clone() {
+            return tokio::task::spawn_blocking(move || route.execute(params.0))
+                .await
+                .map_err(|e| format!("internal error: {e}"))?
+                .map(Json);
+        }
         let store = self.store.clone();
         let actions = self.actions.clone();
         let plan_id = params.0.plan_id;
@@ -295,6 +339,12 @@ impl PulsebladeServer {
         &self,
         params: Parameters<pulseblade_act::StatusParams>,
     ) -> Result<Json<pulseblade_core::ActionRun>, String> {
+        if let Some(route) = self.route.clone() {
+            return tokio::task::spawn_blocking(move || route.status(params.0))
+                .await
+                .map_err(|e| format!("internal error: {e}"))?
+                .map(Json);
+        }
         let store = self.store.clone();
         let actions = self.actions.clone();
         let run_id = params.0.run_id;
@@ -303,6 +353,19 @@ impl PulsebladeServer {
             .map_err(|e| format!("internal error: {e}"))?
             .map(Json)
             .map_err(|e| e.to_string())
+    }
+
+    #[tool(
+        description = "Fleet rollup grouped by host and by the semantic labels role, cluster, and criticality. Unhealthy resources are listed in full; everything else is a count, so a large fleet stays small.",
+        annotations(title = "Fleet overview", read_only_hint = true)
+    )]
+    async fn fleet_overview(
+        &self,
+        params: Parameters<FleetParams>,
+    ) -> Result<Json<FleetOverview>, String> {
+        self.run(move |s| query::fleet_overview(s, params.0))
+            .await
+            .map(Json)
     }
 }
 
@@ -825,6 +888,18 @@ mod tests {
         assert!(!explained.findings.is_empty());
         assert!(explained.actions.is_empty());
         assert_matches_output_schema(&server, "resource_explain", explained);
+
+        let fleet = query::fleet_overview(&store, query::FleetParams::default()).unwrap();
+        assert!(!fleet.unhealthy.is_empty() || fleet.hosts > 0 || fleet.as_of_seq >= 0);
+        assert_matches_output_schema(&server, "fleet_overview", &fleet);
+        let fleet_one = query::fleet_overview(
+            &store,
+            query::FleetParams {
+                host: Some("h".into()),
+            },
+        )
+        .unwrap();
+        assert_matches_output_schema(&server, "fleet_overview", &fleet_one);
 
         struct Nop;
         impl pulseblade_act::CommandRunner for Nop {

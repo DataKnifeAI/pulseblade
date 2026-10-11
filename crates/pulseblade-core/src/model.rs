@@ -82,6 +82,18 @@ impl FromStr for ResourceKind {
     }
 }
 
+/// Host or node name encoded in a resource id (`unit:web1:sshd.service` -> `web1`).
+pub fn host_of_id(id: &str) -> Option<&str> {
+    let mut parts = id.splitn(3, ':');
+    let _kind = parts.next()?;
+    let host = parts.next()?;
+    if host.is_empty() {
+        None
+    } else {
+        Some(host)
+    }
+}
+
 /// Coarse health as judged by the collector that owns the resource.
 #[derive(
     Debug,

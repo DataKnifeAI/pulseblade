@@ -93,7 +93,7 @@ pub struct ActionCatalog {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ActionsParams {}
 
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct PlanParams {
     /// `systemd.restart`, `docker.restart`, `disk.prune_path`, or `script.run`.
     pub action: String,
@@ -111,7 +111,7 @@ pub struct PlanParams {
     pub dry_run: bool,
 }
 
-#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct PlanResult {
     pub plan_id: String,
     /// Same id `action_execute` and `action_status` use.
@@ -124,12 +124,12 @@ pub struct PlanResult {
     pub expires_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ExecuteParams {
     pub plan_id: String,
 }
 
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct StatusParams {
     pub run_id: String,
 }

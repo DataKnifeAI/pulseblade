@@ -10,10 +10,12 @@ use std::sync::{Mutex, MutexGuard};
 
 use chrono::{DateTime, TimeZone, Utc};
 mod actions;
+mod hub;
 mod memory;
 mod pilot;
 
 pub use actions::{ActionTransition, NewAction};
+pub use hub::{IngestResult, NodeBatch, NodeCursor, RouteJob, StampedSample};
 pub use memory::{FindingDraft, FindingFilter};
 pub use pilot::{NewPilotRun, PilotRunRow};
 
@@ -40,6 +42,9 @@ pub enum StoreError {
     UnknownAction(String),
     #[error("{0}")]
     Invalid(String),
+    /// A node sent a journal seq the hub has not caught up to yet.
+    #[error("journal gap for node {node}: hub has seq {have}, next change is {next}")]
+    Gap { node: String, have: i64, next: i64 },
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -182,6 +187,34 @@ CREATE TABLE IF NOT EXISTS pilot_runs (
     proposed   TEXT NOT NULL,
     status     TEXT NOT NULL,
     detail     TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS node_cursors (
+    node_id   TEXT PRIMARY KEY,
+    seq       INTEGER NOT NULL,
+    sample_ms INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS route_rpc (
+    id         TEXT PRIMARY KEY,
+    node_id    TEXT NOT NULL,
+    op         TEXT NOT NULL,
+    body       TEXT NOT NULL,
+    status     TEXT NOT NULL,
+    result     TEXT,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS route_rpc_node ON route_rpc(node_id, status);
+
+CREATE TABLE IF NOT EXISTS route_plans (
+    plan_id TEXT PRIMARY KEY,
+    node_id TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS route_results (
+    id      TEXT PRIMARY KEY,
+    node_id TEXT NOT NULL,
+    body    TEXT NOT NULL
 );
 "#;
 

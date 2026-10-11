@@ -43,6 +43,12 @@ pub struct Config {
     /// Optional event-driven investigator. The node does not start it.
     #[serde(default)]
     pub pilot: PilotConfig,
+    /// Fleet control node. Ignored by `pulseblade node`.
+    #[serde(default)]
+    pub hub: HubConfig,
+    /// When `url` is set, this node pushes its journal to a hub and long-polls for actions.
+    #[serde(default)]
+    pub upstream: UpstreamConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -101,6 +107,77 @@ impl ProxmoxFile {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HubConfig {
+    pub listen: String,
+    pub nodes: Vec<HubNode>,
+    pub tls: HubTls,
+    /// How long a routed action call waits for the node.
+    pub action_wait_secs: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HubNode {
+    pub id: String,
+    /// Environment variable that holds this node's bearer token. Not the token.
+    pub token_env: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HubTls {
+    pub cert: String,
+    pub key: String,
+    pub client_ca: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UpstreamConfig {
+    pub url: String,
+    /// Empty uses this machine's hostname.
+    pub node_id: String,
+    pub token_env: String,
+    pub poll_secs: u64,
+    /// CA that signed the hub certificate. Required with `cert` and `key`.
+    pub ca: String,
+    pub cert: String,
+    pub key: String,
+}
+
+impl Default for HubConfig {
+    fn default() -> Self {
+        Self {
+            listen: "127.0.0.1:7170".into(),
+            nodes: Vec::new(),
+            tls: HubTls::default(),
+            action_wait_secs: 20,
+        }
+    }
+}
+
+impl HubTls {
+    pub fn enabled(&self) -> bool {
+        !self.cert.is_empty() || !self.key.is_empty() || !self.client_ca.is_empty()
+    }
+}
+
+impl Default for UpstreamConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            node_id: String::new(),
+            token_env: "PULSEBLADE_HUB_TOKEN".into(),
+            poll_secs: 15,
+            ca: String::new(),
+            cert: String::new(),
+            key: String::new(),
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -116,6 +193,8 @@ impl Default for Config {
             collect: CollectConfig::default(),
             proxmox: ProxmoxFile::default(),
             pilot: PilotConfig::default(),
+            hub: HubConfig::default(),
+            upstream: UpstreamConfig::default(),
         }
     }
 }
@@ -257,6 +336,28 @@ mod tests {
             kind = "openai_compatible"
             base_url = "http://127.0.0.1:11434/v1"
             model = "local"
+
+            [hub]
+            listen = "127.0.0.1:7170"
+            action_wait_secs = 20
+
+            [[hub.nodes]]
+            id = "web1"
+            token_env = "PULSEBLADE_NODE_WEB1"
+
+            [hub.tls]
+            cert = ""
+            key = ""
+            client_ca = ""
+
+            [upstream]
+            url = ""
+            node_id = ""
+            token_env = "PULSEBLADE_HUB_TOKEN"
+            poll_secs = 15
+            ca = ""
+            cert = ""
+            key = ""
             "#,
         )
         .unwrap();
@@ -273,6 +374,9 @@ mod tests {
         assert!(!cfg.pilot.execute_auto);
         assert_eq!(cfg.pilot.tiers.len(), 1);
         assert_eq!(cfg.pilot.budget.max_tool_calls, 12);
+        assert_eq!(cfg.hub.listen, "127.0.0.1:7170");
+        assert_eq!(cfg.hub.nodes[0].id, "web1");
+        assert!(cfg.upstream.url.is_empty());
     }
 
     #[test]

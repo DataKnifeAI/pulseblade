@@ -1,0 +1,17 @@
+[Unit]
+Description=Pulseblade node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pulseblade
+Environment=PULSEBLADE_CONFIG=/etc/pulseblade/pulseblade.toml
+Environment=PULSEBLADE_DB=/var/lib/pulseblade/node.db
+# The hub is reached outbound. This listen address is the local MCP and dashboard.
+ExecStart=/usr/local/bin/pulseblade node
+Restart=on-failure
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

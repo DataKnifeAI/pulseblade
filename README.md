@@ -26,14 +26,15 @@ Existing tools are either human-first monitoring stacks with an agent bolted on,
 
 ## Status
 
-Milestones **M1** through **M5** are done — see [docs/PLAN.md](docs/PLAN.md).
+Milestones **M1** through **M6** are done — see [docs/PLAN.md](docs/PLAN.md).
 
 | Works today | Planned |
 |-------------|---------|
-| Host, CPU, memory, disk, network, systemd, journald, processes, user session | Hub for multi-node fleets (M6) |
-| Change journal, checkpoints, findings, notes, gated actions | Kubernetes collector and actions (M7) |
+| Host, CPU, memory, disk, network, systemd, journald, processes, user session | Kubernetes collector and actions (M7) |
+| Change journal, checkpoints, findings, notes, gated actions | |
 | Pilot over any OpenAI-compatible endpoint | |
 | Docker and Proxmox collectors and actions | |
+| Hub: per-node cursors, `fleet_overview`, routed actions | |
 | Dashboard, REST API, Prometheus `/metrics`, `ctl status` | |
 | MCP over stdio and streamable HTTP | |
 
@@ -92,6 +93,9 @@ pulseblade ctl findings --detail
 pulseblade ctl approve <run_id>
 pulseblade ctl runs
 pulseblade pilot --once
+
+# Fleet hub. Nodes connect out; set [upstream] on each node and [[hub.nodes]] here.
+pulseblade hub
 ```
 
 ## MCP tools (M1)
@@ -329,11 +333,38 @@ name = "triage"
 kind = "openai_compatible"
 base_url = "http://127.0.0.1:11434/v1"
 model = "local"
+
+# Hub. Empty nodes means `pulseblade node` ignores this section.
+# token_env is the name of an environment variable, never the token.
+[hub]
+listen = "127.0.0.1:7170"
+action_wait_secs = 20
+
+[[hub.nodes]]
+id = "web1"
+token_env = "PULSEBLADE_NODE_WEB1"
+
+[hub.tls]
+cert = ""
+key = ""
+client_ca = ""
+
+# Node push. An empty url leaves the node standalone.
+[upstream]
+url = ""
+node_id = ""
+token_env = "PULSEBLADE_HUB_TOKEN"
+poll_secs = 15
+ca = ""
+cert = ""
+key = ""
 ```
 
 `systemd.restart` takes `unit` (a bare name gets `.service`) and optional `user: true` for `systemctl --user`. `docker.restart` takes `container` and shells out to `docker`. `disk.prune_path` deletes regular files in an allow-listed directory and refuses `/`, `/home`, `/etc`, `/usr`, `/var`, `/boot`, and the other system roots. `script.run` runs an allow-listed program with an `args` array and no shell. `proxmox.start` and `proxmox.stop` take `node`, `vmid`, and optional `guest` (`qemu` or `lxc`). `proxmox.migrate` takes `node`, `vmid`, and `target`. Those three wait for approval unless the tier is changed. `action_plan` with `dry_run: true` records the run without invoking the command. Approve a waiting run with `pulseblade ctl approve <run_id>` or `POST /api/v1/actions/{id}/approve`.
 
 `pulseblade pilot` polls the MCP server and calls the model only when a new finding, a journal change, or the heartbeat says so. A quiet `--once` prints `{"investigated": false}` and does not call the model. Conclusions are `memory_note`s; proposed remediations are `action_plan`s. The node still applies its own tier. `pulseblade ctl runs` lists recorded investigations.
+
+`pulseblade hub` serves the same MCP tools for every node that pushes to it, plus `fleet_overview`. Point the pilot at the hub with `mcp_url`; the pilot does not change. An action the hub routes still runs only when the target node's own tier allows it. Image and unit files: `deploy/Dockerfile`, `deploy/pulseblade-hub.service`, `deploy/pulseblade-node.service`.
 
 State lives in `~/.local/state/pulseblade/pulseblade.db` by default (`--db` to override).
 

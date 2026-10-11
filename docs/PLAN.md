@@ -51,7 +51,7 @@ Cargo workspace, CI (`make vet`, `make test`), Makefile, license, README, archit
 
 - Collectors behind `docker` (`bollard`) and `proxmox` (REST) features, with matching actions. A missing daemon or API degrades that collector and leaves the node running. Resource ids: `ctr:<host>:<name>`, `img:<host>:<name>`, `node:<name>`, `vm:<node>:<vmid>`, `lxc:<node>:<vmid>`, `storage:<node>:<name>`. `proxmox.start`, `proxmox.stop`, and `proxmox.migrate` default to the approve tier.
 
-### M6 — Hub ([#4](https://github.com/DataKnifeAI/pulseblade/issues/4))
+### M6 — Hub (done, [#4](https://github.com/DataKnifeAI/pulseblade/issues/4))
 
 - `pulseblade hub`: per-node journal cursors, catch-up after disconnect, fleet state, and the same MCP tools fleet-wide.
 - `fleet_overview`: grouped by labels and host, unhealthy in full, the rest as counts.

@@ -9,6 +9,7 @@ mod server;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use axum::Router;
 use chrono::Utc;
 use pulseblade_act::Registry;
 use pulseblade_store::Store;
@@ -18,7 +19,7 @@ use rmcp::transport::streamable_http_server::{
 use rmcp::ServiceExt;
 use tokio_util::sync::CancellationToken;
 
-pub use server::PulsebladeServer;
+pub use server::{ActionRoute, PulsebladeServer};
 
 /// Serve MCP over stdin/stdout until the client disconnects.
 pub async fn serve_stdio(store: Arc<Store>, actions: Arc<Registry>) -> anyhow::Result<()> {
@@ -51,6 +52,32 @@ pub async fn serve_listener(
     shutdown: CancellationToken,
     actions: Arc<Registry>,
 ) -> anyhow::Result<()> {
+    let router = build_router(
+        store,
+        allowed_hosts,
+        shutdown.clone(),
+        actions,
+        None,
+        Router::new(),
+    );
+    let bound = listener.local_addr()?;
+    tracing::info!(%bound, "listening: MCP http://{bound}/mcp, dashboard http://{bound}/");
+    axum::serve(listener, router)
+        .with_graceful_shutdown(async move { shutdown.cancelled().await })
+        .await?;
+    Ok(())
+}
+
+/// Dashboard, JSON API, `/mcp`, and optional extra routes. Every route sits behind
+/// the host allow-list. `route` replaces local action execution with a hub router.
+pub fn build_router(
+    store: Arc<Store>,
+    allowed_hosts: Vec<String>,
+    shutdown: CancellationToken,
+    actions: Arc<Registry>,
+    route: Option<Arc<dyn ActionRoute>>,
+    extra: Router,
+) -> Router {
     let mut config = StreamableHttpServerConfig::default()
         .with_json_response(true)
         .with_cancellation_token(shutdown.child_token());
@@ -59,27 +86,24 @@ pub async fn serve_listener(
     }
     let mcp_store = store.clone();
     let mcp_actions = actions.clone();
+    let mcp_route = route.clone();
     let service = StreamableHttpService::new(
         move || {
-            Ok(PulsebladeServer::with_actions(
+            Ok(PulsebladeServer::with_route(
                 mcp_store.clone(),
                 mcp_actions.clone(),
+                mcp_route.clone(),
             ))
         },
         Arc::new(LocalSessionManager::default()),
         config,
     );
-    let router = http::router_with(store, Utc::now(), actions)
+    http::router_with(store, Utc::now(), actions)
+        .merge(extra)
         .nest_service("/mcp", service)
         .route("/healthz", axum::routing::get(|| async { "ok" }))
         .layer(axum::middleware::from_fn_with_state(
             Arc::new(allowed_hosts),
             http::check_host,
-        ));
-    let bound = listener.local_addr()?;
-    tracing::info!(%bound, "listening: MCP http://{bound}/mcp, dashboard http://{bound}/");
-    axum::serve(listener, router)
-        .with_graceful_shutdown(async move { shutdown.cancelled().await })
-        .await?;
-    Ok(())
+        ))
 }

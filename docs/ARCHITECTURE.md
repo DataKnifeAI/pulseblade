@@ -7,7 +7,7 @@ Pulseblade separates three roles that "agent" would otherwise blur:
 | Role | What it is | Command |
 |------|------------|---------|
 | **Node** | Per-host daemon: collectors, local store and change journal, action runner, MCP server, read-only HTTP view (dashboard, JSON API, Prometheus) | `pulseblade node` (stdio: `pulseblade mcp`) |
-| **Hub** | Control node: consumes every node's journal into fleet state and serves the same MCP tools fleet-wide (M6) | `pulseblade hub` |
+| **Hub** | Control node: consumes every node's journal into fleet state and serves the same MCP tools fleet-wide | `pulseblade hub` |
 | **Pilot** | Optional reasoning loop: an MCP client driven by any OpenAI-compatible model endpoint, local or remote, that investigates findings and proposes actions (M4) | `pulseblade pilot` |
 
 `pulseblade ctl` gives shell access to the same queries (`status`, snapshot, checkpoint, changes, export; later `approve`).
@@ -69,7 +69,7 @@ flowchart LR
 | `pulseblade-act` | Built-in action registry, node-local risk tiers, dry-run plans, approval gate, hash-chained audit. The node enforces its own policy. |
 | `pulseblade-mcp` | Shared query layer (`query.rs`), the `rmcp` tool surface over stdio and streamable HTTP, and the node's read-only HTTP surface: JSON API, Prometheus exposition, embedded dashboard. |
 | `pulseblade-pilot` | Event-driven reasoning loop over MCP using an OpenAI-compatible model endpoint. |
-| `pulseblade` | CLI binary, node loop, config loading. |
+| `pulseblade` | CLI binary, node loop, hub, config loading. |
 
 ## Data model
 
@@ -133,6 +133,14 @@ Measured with `cargo test -p pulseblade-mcp --test token_budget -- --nocapture` 
 | `export_bulk` resources | 16,379 | 16,379 |
 
 The test fails if the summary snapshot exceeds 600 tokens, the unchanged response 20, or the default 1 h series 600.
+
+## Hub
+
+`pulseblade hub` keeps one SQLite database for the fleet. Each enrolled node has a bearer token (`token_env` names the variable; the token is not written in config). Optional mTLS requires a client certificate signed by `client_ca`. Nodes open the connection: they push journal entries and samples after the hub's per-node cursor, then long-poll `/hub/v1/poll` for routed actions. A node that was offline keeps journaling locally and sends every seq after the cursor when it reconnects; a gap is rejected and the cursor stays put.
+
+The hub serves the same MCP tools as a node, plus `fleet_overview` (grouped by `role`, `cluster`, `criticality`, and host; unhealthy resources in full, the rest as counts). `action_plan`, `action_execute`, and `action_status` are forwarded to the node that owns the resource id. The node runs them through its own registry. Approve waits, deny never runs, and auto runs only when that node's tier says so.
+
+Packaging: [deploy/Dockerfile](../deploy/Dockerfile), [deploy/pulseblade-hub.service](../deploy/pulseblade-hub.service), [deploy/pulseblade-node.service](../deploy/pulseblade-node.service).
 
 ## Pilot
 

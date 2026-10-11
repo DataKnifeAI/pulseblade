@@ -16,7 +16,11 @@ pulseblade-act.workspace = true
 pulseblade-mcp.workspace = true
 pulseblade-pilot.workspace = true
 ureq = { version = "2.12", default-features = false, features = ["json", "tls"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
 anyhow.workspace = true
+axum.workspace = true
 chrono.workspace = true
 clap.workspace = true
 serde.workspace = true
@@ -31,6 +35,9 @@ tracing-subscriber.workspace = true
 default = ["docker", "proxmox"]
 docker = ["pulseblade-collect/docker"]
 proxmox = ["pulseblade-collect/proxmox"]
+
+[dev-dependencies]
+rcgen = "0.13"
 
 [[example]]
 name = "seed_demo"

@@ -1,4 +1,5 @@
 mod config;
+mod hub;
 mod node;
 mod status;
 mod webhook;
@@ -239,6 +240,66 @@ fn is_addr_in_use(err: &anyhow::Error) -> bool {
 
 /// Serve the HTTP dashboard until `shutdown`. A busy port is logged and ignored so
 /// stdio MCP keeps running when several `pulseblade mcp` processes start together.
+fn hub_tokens(config: &Config) -> anyhow::Result<Vec<(String, String)>> {
+    if config.hub.nodes.is_empty() {
+        anyhow::bail!("hub needs at least one [[hub.nodes]] entry with id and token_env");
+    }
+    config
+        .hub
+        .nodes
+        .iter()
+        .map(|node| {
+            let token = std::env::var(&node.token_env).with_context(|| {
+                format!("node {} token_env {} is unset", node.id, node.token_env)
+            })?;
+            anyhow::ensure!(!token.is_empty(), "node {} token is empty", node.id);
+            Ok((node.id.clone(), token))
+        })
+        .collect()
+}
+
+fn spawn_upstream(
+    store: Arc<Store>,
+    actions: Arc<pulseblade_act::Registry>,
+    config: &Config,
+    shutdown: CancellationToken,
+) -> Option<std::thread::JoinHandle<()>> {
+    let url = config.upstream.url.trim();
+    if url.is_empty() {
+        return None;
+    }
+    let token = match std::env::var(&config.upstream.token_env) {
+        Ok(t) if !t.is_empty() => t,
+        _ => {
+            tracing::warn!(
+                env = %config.upstream.token_env,
+                "upstream url is set but the token env var is empty; not connecting"
+            );
+            return None;
+        }
+    };
+    let tls = if config.upstream.cert.is_empty() && config.upstream.key.is_empty() {
+        None
+    } else {
+        match hub::client_config(
+            &config.upstream.ca,
+            &config.upstream.cert,
+            &config.upstream.key,
+        ) {
+            Ok(cfg) => Some(cfg),
+            Err(e) => {
+                tracing::warn!(error = %e, "upstream tls config failed; not connecting");
+                return None;
+            }
+        }
+    };
+    let poll = config.upstream.poll_secs;
+    let base = url.to_string();
+    Some(std::thread::spawn(move || {
+        hub::run_upstream(store, actions, base, token, tls, poll, shutdown);
+    }))
+}
+
 fn action_registry(config: &Config) -> anyhow::Result<Arc<pulseblade_act::Registry>> {
     let mut reg = pulseblade_act::Registry::new(
         config.actions.clone(),
@@ -316,11 +377,16 @@ async fn main() -> anyhow::Result<()> {
             });
             let allowed = http_allowed_hosts(&config, addr);
             let actions = action_registry(&config)?;
+            let upstream =
+                spawn_upstream(store.clone(), actions.clone(), &config, shutdown.clone());
             let served =
                 pulseblade_mcp::serve_http(store, addr, allowed, shutdown.clone(), actions).await;
             shutdown.cancel();
             if let Some(c) = collector {
                 let _ = tokio::task::spawn_blocking(move || c.join()).await;
+            }
+            if let Some(u) = upstream {
+                let _ = tokio::task::spawn_blocking(move || u.join()).await;
             }
             served
         }
@@ -379,9 +445,35 @@ async fn main() -> anyhow::Result<()> {
             served
         }
         Command::Hub => {
-            anyhow::bail!(
-                "hub mode is planned for M6: https://github.com/DataKnifeAI/pulseblade/issues/4"
-            )
+            let store = open_store(&db)?;
+            let tokens = hub_tokens(&config)?;
+            let addr: SocketAddr =
+                config.hub.listen.parse().with_context(|| {
+                    format!("invalid hub listen address `{}`", config.hub.listen)
+                })?;
+            let listener = tokio::net::TcpListener::bind(addr)
+                .await
+                .with_context(|| format!("binding {}", config.hub.listen))?;
+            let tls = if config.hub.tls.enabled() {
+                Some(hub::server_config(&config.hub.tls)?)
+            } else {
+                None
+            };
+            let shutdown = CancellationToken::new();
+            let ctrl_c = shutdown.clone();
+            tokio::spawn(async move {
+                let _ = tokio::signal::ctrl_c().await;
+                tracing::info!("shutting down");
+                ctrl_c.cancel();
+            });
+            let allowed = http_allowed_hosts(&config, listener.local_addr()?);
+            let actions = action_registry(&config)?;
+            let inner = hub::new_hub(
+                store.clone(),
+                tokens,
+                std::time::Duration::from_secs(config.hub.action_wait_secs.max(1)),
+            );
+            hub::serve(listener, inner, allowed, shutdown, actions, tls).await
         }
         Command::Pilot { mcp_url, once } => {
             let url = pilot_mcp_url(&config, mcp_url);

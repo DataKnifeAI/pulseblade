@@ -1208,6 +1208,114 @@ pub fn logs(store: &Store, p: LogsParams) -> Result<LogPage> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// fleet_overview
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct FleetParams {
+    /// Limit the overview to one host or node name.
+    #[serde(default)]
+    pub host: Option<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct FleetGroup {
+    pub host: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub criticality: Option<String>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub ok: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub degraded: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub failed: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unknown: usize,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct FleetOverview {
+    pub as_of_seq: i64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub hosts: usize,
+    /// Failed and degraded resources, with attributes. Healthy resources are counts only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unhealthy: Vec<ResourceBrief>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<FleetGroup>,
+}
+
+pub fn fleet_overview(store: &Store, p: FleetParams) -> Result<FleetOverview> {
+    let all = store.resources(&ResourceFilter::default())?;
+    let latest = store.latest_all()?;
+    let mut unhealthy = Vec::new();
+    let mut groups: BTreeMap<(String, String, String, String), [usize; 4]> = BTreeMap::new();
+    let mut hosts = BTreeMap::<String, ()>::new();
+    for stored in all {
+        let res = &stored.resource;
+        let host = res
+            .labels
+            .get("host")
+            .map(String::as_str)
+            .or_else(|| pulseblade_core::host_of_id(&res.id))
+            .unwrap_or("unknown")
+            .to_string();
+        if p.host.as_ref().is_some_and(|want| want != &host) {
+            continue;
+        }
+        hosts.insert(host.clone(), ());
+        let role = res.labels.get("role").cloned().unwrap_or_default();
+        let cluster = res.labels.get("cluster").cloned().unwrap_or_default();
+        let criticality = res.labels.get("criticality").cloned().unwrap_or_default();
+        let slot = match res.health {
+            Health::Ok => 0,
+            Health::Degraded => 1,
+            Health::Failed => 2,
+            Health::Unknown => 3,
+        };
+        *groups
+            .entry((host, role, cluster, criticality))
+            .or_default()
+            .get_mut(slot)
+            .expect("slot") += 1;
+        if res.health.is_unhealthy() {
+            unhealthy.push(brief(stored, &latest, BriefOpts::FULL));
+        }
+    }
+    unhealthy.sort_by(|a, b| a.id.cmp(&b.id));
+    let groups = groups
+        .into_iter()
+        .map(|((host, role, cluster, criticality), counts)| FleetGroup {
+            host,
+            role: nonempty(role),
+            cluster: nonempty(cluster),
+            criticality: nonempty(criticality),
+            ok: counts[0],
+            degraded: counts[1],
+            failed: counts[2],
+            unknown: counts[3],
+        })
+        .collect();
+    Ok(FleetOverview {
+        as_of_seq: store.current_seq()?,
+        hosts: hosts.len(),
+        unhealthy,
+        groups,
+    })
+}
+
+fn nonempty(s: String) -> Option<String> {
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
 /// JSON document for the `pulseblade://state` MCP resource.
 pub fn state_document(store: &Store) -> Result<String> {
     let snap = snapshot(
@@ -1620,5 +1728,61 @@ mod tests {
             .collect();
         assert_eq!(lines.len(), 3 + 3 + 1);
         assert_eq!(lines.last().unwrap()["type"], "meta");
+    }
+
+    #[test]
+    fn fleet_overview_groups_labels_and_lists_unhealthy() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .apply(
+                "host",
+                Utc::now(),
+                &Observation {
+                    resources: vec![
+                        Resource::new("host:web1", ResourceKind::Host, "web1")
+                            .health(Health::Ok)
+                            .label("role", "edge")
+                            .label("cluster", "prod")
+                            .label("criticality", "high"),
+                        Resource::new(
+                            "unit:web1:sshd.service",
+                            ResourceKind::Service,
+                            "sshd.service",
+                        )
+                        .parent("host:web1")
+                        .health(Health::Failed)
+                        .label("role", "edge")
+                        .label("criticality", "high"),
+                        Resource::new("host:db1", ResourceKind::Host, "db1")
+                            .health(Health::Ok)
+                            .label("role", "data")
+                            .label("cluster", "prod"),
+                    ],
+                    samples: vec![],
+                    logs: vec![],
+                },
+            )
+            .unwrap();
+        let overview = fleet_overview(&store, FleetParams::default()).unwrap();
+        assert_eq!(overview.hosts, 2);
+        assert_eq!(overview.unhealthy.len(), 1);
+        assert_eq!(overview.unhealthy[0].id, "unit:web1:sshd.service");
+        assert!(overview.unhealthy[0].attrs.is_some());
+        let edge = overview
+            .groups
+            .iter()
+            .find(|g| g.host == "web1" && g.role.as_deref() == Some("edge") && g.failed == 1)
+            .unwrap();
+        assert_eq!(edge.criticality.as_deref(), Some("high"));
+        assert!(overview.groups.iter().any(|g| g.host == "db1" && g.ok == 1));
+        let one = fleet_overview(
+            &store,
+            FleetParams {
+                host: Some("db1".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(one.hosts, 1);
+        assert!(one.unhealthy.is_empty());
     }
 }
