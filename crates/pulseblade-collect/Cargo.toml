@@ -7,6 +7,11 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[features]
+default = []
+docker = ["dep:bollard", "dep:tokio", "dep:futures-util"]
+proxmox = ["dep:ureq", "dep:native-tls"]
+
 [dependencies]
 pulseblade-core.workspace = true
 chrono.workspace = true
@@ -15,3 +20,8 @@ serde_json.workspace = true
 sysinfo.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+bollard = { version = "0.19", optional = true }
+tokio = { workspace = true, optional = true, features = ["rt", "time", "net", "io-util"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"], optional = true }
+ureq = { version = "2.12", default-features = false, features = ["json", "tls", "native-tls"], optional = true }
+native-tls = { version = "0.2", optional = true }

@@ -1,0 +1,23 @@
+[package]
+name = "pulseblade-pilot"
+description = "Event-driven MCP client that investigates findings with an OpenAI-compatible model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+pulseblade-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ureq = { version = "2.12", default-features = false, features = ["json"] }
+
+[dev-dependencies]
+toml.workspace = true
+pulseblade-act.workspace = true
+pulseblade-mcp.workspace = true
+pulseblade-store.workspace = true
+chrono.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true

@@ -64,16 +64,16 @@ flowchart LR
 |-------|----------------|
 | `pulseblade-core` | Schema types (`Resource`, `Sample`, `Change`, `Checkpoint`, `Finding`, `ActionSpec`, `ActionRun`, `Note`), label matching, duration parsing. Every type derives `JsonSchema`. |
 | `pulseblade-store` | SQLite (`rusqlite`, bundled, WAL). Resource state, append-only change journal, checkpoints, samples with retention and query-time downsampling, logs, notes, findings, action runs, and the hash-chained audit log. |
-| `pulseblade-collect` | `Collector` trait plus host (`sysinfo`), systemd, user systemd and session, journald, and top processes. Docker, Proxmox, and Kubernetes arrive behind Cargo features. |
+| `pulseblade-collect` | `Collector` trait plus host (`sysinfo`), systemd, user systemd and session, journald, and top processes. Docker (`bollard`) and Proxmox (REST) are Cargo features and degrade when the daemon or API is absent. Kubernetes is still later. |
 | `pulseblade-detect` | Threshold rules and EWMA anomaly detection. Findings carry recent changes and error lines for the resource, its parent, and its dependencies. |
 | `pulseblade-act` | Built-in action registry, node-local risk tiers, dry-run plans, approval gate, hash-chained audit. The node enforces its own policy. |
 | `pulseblade-mcp` | Shared query layer (`query.rs`), the `rmcp` tool surface over stdio and streamable HTTP, and the node's read-only HTTP surface: JSON API, Prometheus exposition, embedded dashboard. |
-| `pulseblade-pilot` | (M4) Event-driven reasoning loop over MCP using an OpenAI-compatible model endpoint. |
+| `pulseblade-pilot` | Event-driven reasoning loop over MCP using an OpenAI-compatible model endpoint. |
 | `pulseblade` | CLI binary, node loop, config loading. |
 
 ## Data model
 
-- **Resource** — anything observable. Ids are stable and hierarchical by convention: `host:<hostname>`, `disk:<hostname>:<mount>`, `net:<hostname>:<iface>`, `unit:<hostname>:<unit>`, `unit:<hostname>:user:<unit>`, `proc:<hostname>:<pid>`, `session:<hostname>`. Each carries `kind`, `labels` (semantic, from collectors and config), `attrs` (slow-moving state facts that are change-tracked), and an optional `parent`.
+- **Resource** — anything observable. Ids are stable and hierarchical by convention: `host:<hostname>`, `disk:<hostname>:<mount>`, `net:<hostname>:<iface>`, `unit:<hostname>:<unit>`, `unit:<hostname>:user:<unit>`, `proc:<hostname>:<pid>`, `session:<hostname>`, `ctr:<host>:<name>`, `img:<host>:<name>`, `node:<name>`, `vm:<node>:<vmid>`, `lxc:<node>:<vmid>`, `storage:<node>:<name>`. Each carries `kind`, `labels` (semantic, from collectors and config), `attrs` (slow-moving state facts that are change-tracked), and an optional `parent`. Guests and storage are parented to their Proxmox node; containers and images are parented to the host.
 - **Sample** — `(resource, metric, ts, value)`. Fast-moving numbers live here, not in `attrs`, so they never generate change noise.
 - **Change** — append-only journal entry with a monotonically increasing `seq`: `appeared`, `disappeared`, or `changed` with `before`/`after`.
 - **Checkpoint** — a name bound to a `seq`. `changes_since` accepts a checkpoint name, `seq:<n>`, an RFC 3339 timestamp, or a relative duration like `15m`.
@@ -134,9 +134,9 @@ Measured with `cargo test -p pulseblade-mcp --test token_budget -- --nocapture` 
 
 The test fails if the summary snapshot exceeds 600 tokens, the unchanged response 20, or the default 1 h series 600.
 
-## Pilot (planned, M4)
+## Pilot
 
-The pilot ([#6](https://github.com/DataKnifeAI/pulseblade/issues/6)) is an optional MCP client with a model behind it. Nothing below is implemented yet.
+The pilot ([#6](https://github.com/DataKnifeAI/pulseblade/issues/6)) is an optional MCP client with a model behind it. `pulseblade pilot` polls a node or a hub at `mcp_url` (default `http://<listen>/mcp`). The same binary targets either; only the URL changes.
 
 ### One provider interface
 
@@ -168,7 +168,9 @@ External agent runtimes such as Hermes Agent do not need the pilot at all: they 
 - **Prompt-cache friendly:** a stable system prompt and tool definitions first, variable context last.
 - **Memory over re-derivation:** prior investigation notes on a resource are loaded before re-investigating it.
 
-### Example configuration (planned; not yet parsed)
+### Example configuration
+
+`execute_auto` defaults to false. Approve and deny tiers are never executed by the pilot; the node enforces them even if a model asks. `local_only` drops any `base_url` that is not loopback. Each tier is an ordered fallback list. A spent tool budget on a tier continues on the next tier when one exists; token and wall-clock budgets end the run. Quiet polls do not call the model. Each investigation is stored and listed with `pulseblade ctl runs`.
 
 ```toml
 [pilot]
@@ -176,6 +178,9 @@ enabled = true
 local_only = false
 wake_on = ["findings", "changes"]
 heartbeat_secs = 900
+poll_secs = 30
+execute_auto = false
+mcp_url = ""
 
 [pilot.budget]
 max_tool_calls = 12
@@ -186,19 +191,19 @@ max_wall_secs = 120
 name = "triage"
 [[pilot.tiers.endpoints]]
 kind = "openai_compatible"
-base_url = "http://localhost:11434/v1"   # e.g. Ollama
+base_url = "http://127.0.0.1:11434/v1"   # e.g. Ollama
 model = "qwen3:8b"
 
 [[pilot.tiers]]
 name = "escalate"
 [[pilot.tiers.endpoints]]
 kind = "openai_compatible"
-base_url = "http://gpu1:8000/v1"         # e.g. vLLM serving a Hermes model
-model = "NousResearch/Hermes-4-70B"
-[[pilot.tiers.endpoints]]                 # fallback if gpu1 is down
+base_url = "http://127.0.0.1:8000/v1"    # e.g. vLLM serving a Hermes model
+model = "example-70b"
+[[pilot.tiers.endpoints]]                # fallback when the first endpoint errors
 kind = "openai_compatible"
-base_url = "https://openrouter.ai/api/v1"
-model = "anthropic/claude-sonnet-4.5"
-api_key_env = "OPENROUTER_API_KEY"
+base_url = "https://models.example/v1"
+model = "example-sonnet"
+api_key_env = "EXAMPLE_API_KEY"
 headers = { "X-Title" = "pulseblade" }
 ```

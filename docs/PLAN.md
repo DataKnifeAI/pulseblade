@@ -39,7 +39,7 @@ Cargo workspace, CI (`make vet`, `make test`), Makefile, license, README, archit
 - Built-ins: `systemd.restart`, `docker.restart`, `disk.prune_path` (allow-listed), `script.run` (allow-listed).
 - `resource_explain` gains notes and prior actions.
 
-### M4 — Pilot ([#6](https://github.com/DataKnifeAI/pulseblade/issues/6))
+### M4 — Pilot (done, [#6](https://github.com/DataKnifeAI/pulseblade/issues/6))
 
 - `pulseblade-pilot` crate and `pulseblade pilot` command: an MCP client driven by any OpenAI-compatible endpoint, local (e.g. Ollama, vLLM) or remote (e.g. OpenRouter), with tiered routing and fallback ([design](ARCHITECTURE.md#pilot-planned-m4)).
 - Event-driven: wakes on new findings and a slow heartbeat, never per collection pass.
@@ -47,9 +47,9 @@ Cargo workspace, CI (`make vet`, `make test`), Makefile, license, README, archit
 - Budgets: max tool calls, tokens, and wall time per investigation; every run recorded.
 - Works against a node or a hub without changes.
 
-### M5 — Docker and Proxmox ([#3](https://github.com/DataKnifeAI/pulseblade/issues/3))
+### M5 — Docker and Proxmox (done, [#3](https://github.com/DataKnifeAI/pulseblade/issues/3))
 
-- Collectors behind `docker` (`bollard`) and `proxmox` (REST) features, with matching actions.
+- Collectors behind `docker` (`bollard`) and `proxmox` (REST) features, with matching actions. A missing daemon or API degrades that collector and leaves the node running. Resource ids: `ctr:<host>:<name>`, `img:<host>:<name>`, `node:<name>`, `vm:<node>:<vmid>`, `lxc:<node>:<vmid>`, `storage:<node>:<name>`. `proxmox.start`, `proxmox.stop`, and `proxmox.migrate` default to the approve tier.
 
 ### M6 — Hub ([#4](https://github.com/DataKnifeAI/pulseblade/issues/4))
 

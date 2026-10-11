@@ -61,6 +61,15 @@ enum Command {
     },
     /// Control node: aggregate many nodes into fleet state (M6).
     Hub,
+    /// Investigate findings with an OpenAI-compatible model. Talks to a node or a hub over MCP.
+    Pilot {
+        /// MCP endpoint [default: pilot.mcp_url, else http://<listen>/mcp]
+        #[arg(long)]
+        mcp_url: Option<String>,
+        /// Poll once, then exit. A quiet poll does not call the model.
+        #[arg(long)]
+        once: bool,
+    },
     /// Query and manage the local store from the shell.
     Ctl {
         #[command(subcommand)]
@@ -152,6 +161,8 @@ enum Ctl {
     Actions,
     /// Approve an action that is waiting for a human.
     Approve { run_id: String },
+    /// Recent pilot investigations, newest first.
+    Runs,
 }
 
 fn parse_agg(s: &str) -> Result<Aggregation, String> {
@@ -229,13 +240,13 @@ fn is_addr_in_use(err: &anyhow::Error) -> bool {
 /// Serve the HTTP dashboard until `shutdown`. A busy port is logged and ignored so
 /// stdio MCP keeps running when several `pulseblade mcp` processes start together.
 fn action_registry(config: &Config) -> anyhow::Result<Arc<pulseblade_act::Registry>> {
-    Ok(Arc::new(
-        pulseblade_act::Registry::new(
-            config.actions.clone(),
-            Arc::new(pulseblade_act::SystemRunner),
-        )
-        .map_err(|e| anyhow::anyhow!(e))?,
-    ))
+    let mut reg = pulseblade_act::Registry::new(
+        config.actions.clone(),
+        Arc::new(pulseblade_act::SystemRunner),
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+    reg.set_proxmox(config.proxmox.endpoint());
+    Ok(Arc::new(reg))
 }
 
 async fn serve_mcp_dashboard(
@@ -372,6 +383,25 @@ async fn main() -> anyhow::Result<()> {
                 "hub mode is planned for M6: https://github.com/DataKnifeAI/pulseblade/issues/4"
             )
         }
+        Command::Pilot { mcp_url, once } => {
+            let url = pilot_mcp_url(&config, mcp_url);
+            let store = open_store(&db)?;
+            let pilot_cfg = config.pilot.clone();
+            if once {
+                run_pilot(store, pilot_cfg, url, None)
+            } else {
+                let shutdown = CancellationToken::new();
+                let ctrl = shutdown.clone();
+                tokio::spawn(async move {
+                    let _ = tokio::signal::ctrl_c().await;
+                    ctrl.cancel();
+                });
+                tokio::task::spawn_blocking(move || {
+                    run_pilot(store, pilot_cfg, url, Some(shutdown))
+                })
+                .await?
+            }
+        }
         Command::Ctl { command } => {
             let store = open_store(&db)?;
             run_ctl(&store, &db, &config, command)
@@ -466,7 +496,8 @@ fn run_ctl(store: &Store, db: &Path, config: &Config, command: Ctl) -> anyhow::R
         Ctl::Collect => {
             let _lock = CollectorLock::try_acquire(db)?
                 .context("a node is already collecting into this database")?;
-            let mut collectors = default_collectors();
+            let opts = config.collector_opts();
+            let mut collectors = default_collectors(&opts);
             let n = collect_once(store, &mut collectors, &config.labels, None);
             detect_pass(store, &config.detect);
             print_json(&serde_json::json!({
@@ -509,7 +540,87 @@ fn run_ctl(store: &Store, db: &Path, config: &Config, command: Ctl) -> anyhow::R
             let reg = action_registry(config)?;
             print_json(&reg.approve(store, &run_id)?)
         }
+        Ctl::Runs => print_json(&store.recent_pilot_runs(20)?),
     }
+}
+
+fn pilot_mcp_url(config: &Config, flag: Option<String>) -> String {
+    if let Some(url) = flag.filter(|s| !s.is_empty()) {
+        return url;
+    }
+    if !config.pilot.mcp_url.is_empty() {
+        return config.pilot.mcp_url.clone();
+    }
+    format!("http://{}/mcp", config.listen)
+}
+
+fn run_pilot(
+    store: Arc<Store>,
+    config: pulseblade_pilot::PilotConfig,
+    mcp_url: String,
+    shutdown: Option<CancellationToken>,
+) -> anyhow::Result<()> {
+    let mut session = pulseblade_pilot::Session::new(config.clone(), std::time::Instant::now());
+    let mut chat = pulseblade_pilot::HttpChat;
+    let poll = std::time::Duration::from_secs(config.poll_secs.max(1));
+    loop {
+        if shutdown.as_ref().is_some_and(|s| s.is_cancelled()) {
+            break;
+        }
+        let mut tools = pulseblade_pilot::McpClient::new(&mcp_url);
+        match session.tick(&mut tools, &mut chat, std::time::Instant::now()) {
+            Ok(None) => {
+                if shutdown.is_none() {
+                    println!("{{\"investigated\":false}}");
+                    break;
+                }
+            }
+            Ok(Some(run)) => {
+                let id = store.insert_pilot_run(
+                    &pulseblade_store::NewPilotRun {
+                        trigger: run.trigger.clone(),
+                        tier: run.tier.clone(),
+                        endpoint: run.endpoint.clone(),
+                        tool_calls: run.tool_calls,
+                        tokens: run.tokens,
+                        conclusion: run.conclusion.clone(),
+                        proposed: run.proposed.clone(),
+                        status: run.status.clone(),
+                        detail: run.detail.clone(),
+                    },
+                    chrono::Utc::now(),
+                )?;
+                print_json(&serde_json::json!({
+                    "id": id,
+                    "status": run.status,
+                    "trigger": run.trigger,
+                    "tier": run.tier,
+                    "endpoint": run.endpoint,
+                    "tool_calls": run.tool_calls,
+                    "tokens": run.tokens,
+                    "conclusion": run.conclusion,
+                    "proposed": run.proposed,
+                }))?;
+                if shutdown.is_none() {
+                    break;
+                }
+            }
+            Err(e) => {
+                if shutdown.is_none() {
+                    anyhow::bail!(e);
+                }
+                tracing::warn!(error = %e, "pilot poll failed");
+            }
+        }
+        let Some(shutdown) = shutdown.as_ref() else {
+            break;
+        };
+        let deadline = std::time::Instant::now() + poll;
+        while !shutdown.is_cancelled() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

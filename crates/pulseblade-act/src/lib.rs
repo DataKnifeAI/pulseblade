@@ -4,6 +4,9 @@
 //! execute; `approve` waits until `approve` (CLI or HTTP); `deny` never runs.
 
 mod config;
+mod proxmox;
+
+use proxmox::{HttpClient, ProcessEnv, SecretLookup, UreqClient};
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -16,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 pub use config::{parse_ttl, ActionsConfig, PathAction, TierLimit};
+pub use proxmox::ProxmoxEndpoint;
 
 /// Runs a program without a shell. Tests substitute a fake.
 pub trait CommandRunner: Send + Sync {
@@ -134,6 +138,9 @@ pub struct Registry {
     config: ActionsConfig,
     ttl: chrono::Duration,
     runner: Arc<dyn CommandRunner>,
+    http: Arc<dyn HttpClient>,
+    secrets: Arc<dyn SecretLookup>,
+    proxmox: ProxmoxEndpoint,
 }
 
 impl Registry {
@@ -143,7 +150,27 @@ impl Registry {
             config,
             ttl,
             runner,
+            http: Arc::new(UreqClient { verify_tls: true }),
+            secrets: Arc::new(ProcessEnv),
+            proxmox: ProxmoxEndpoint::default(),
         })
+    }
+
+    /// API used by `proxmox.start`, `proxmox.stop`, and `proxmox.migrate`.
+    pub fn set_proxmox(&mut self, endpoint: ProxmoxEndpoint) {
+        let verify = endpoint.verify_tls;
+        self.proxmox = endpoint;
+        self.http = Arc::new(UreqClient { verify_tls: verify });
+    }
+
+    pub fn with_http(mut self, http: Arc<dyn HttpClient>) -> Self {
+        self.http = http;
+        self
+    }
+
+    pub fn with_secrets(mut self, secrets: Arc<dyn SecretLookup>) -> Self {
+        self.secrets = secrets;
+        self
     }
 
     pub fn builtin() -> Self {
@@ -183,7 +210,7 @@ impl Registry {
             return Err(ActError::Invalid("params must be an object".into()));
         }
         validate_schema(&req.action, &params)?;
-        let derived = check_params(&req.action, &params, &self.config)?;
+        let derived = check_params(&req.action, &params, &self.config, &self.proxmox)?;
         let resource_id = match req.resource_id {
             Some(id) => clean_resource_id(&id)?,
             None => derived,
@@ -317,7 +344,15 @@ impl Registry {
     }
 
     fn invoke_claimed(&self, store: &Store, run: &ActionRun) -> Result<ActionRun, ActError> {
-        match perform(&run.action, &run.params, &self.config, self.runner.as_ref()) {
+        match perform(
+            &run.action,
+            &run.params,
+            &self.config,
+            self.runner.as_ref(),
+            self.http.as_ref(),
+            self.secrets.as_ref(),
+            &self.proxmox,
+        ) {
             Ok(output) => self.finish(
                 store,
                 &run.id,
@@ -370,6 +405,9 @@ impl Registry {
             "docker.restart" => self.config.docker_restart.tier,
             "disk.prune_path" => self.config.disk_prune.tier,
             "script.run" => self.config.script_run.tier,
+            "proxmox.start" => self.config.proxmox_start.tier,
+            "proxmox.stop" => self.config.proxmox_stop.tier,
+            "proxmox.migrate" => self.config.proxmox_migrate.tier,
             _ => None,
         };
         over.unwrap_or(match name {
@@ -384,6 +422,9 @@ impl Registry {
             "docker.restart" => self.config.docker_restart.rate_per_hour,
             "disk.prune_path" => self.config.disk_prune.rate_per_hour,
             "script.run" => self.config.script_run.rate_per_hour,
+            "proxmox.start" => self.config.proxmox_start.rate_per_hour,
+            "proxmox.stop" => self.config.proxmox_stop.rate_per_hour,
+            "proxmox.migrate" => self.config.proxmox_migrate.rate_per_hour,
             _ => 0,
         }
     }
@@ -410,6 +451,9 @@ const NAMES: &[&str] = &[
     "docker.restart",
     "disk.prune_path",
     "script.run",
+    "proxmox.start",
+    "proxmox.stop",
+    "proxmox.migrate",
 ];
 
 fn plan_of(run: &ActionRun) -> PlanResult {
@@ -429,6 +473,7 @@ fn description(name: &str) -> &'static str {
         "docker.restart" => "Restart one container via the docker CLI.",
         "disk.prune_path" => "Delete regular files in an allow-listed directory.",
         "script.run" => "Run an allow-listed program with no shell.",
+        other if proxmox::is_proxmox(other) => proxmox::description(other),
         _ => "",
     }
 }
@@ -438,6 +483,9 @@ fn applies_to(name: &str) -> Vec<ResourceKind> {
         "systemd.restart" => vec![ResourceKind::Service],
         "docker.restart" => vec![ResourceKind::Container],
         "disk.prune_path" => vec![ResourceKind::Disk],
+        "proxmox.start" | "proxmox.stop" | "proxmox.migrate" => {
+            vec![ResourceKind::Vm, ResourceKind::Container]
+        }
         _ => vec![ResourceKind::Host],
     }
 }
@@ -458,6 +506,7 @@ fn preconditions(name: &str) -> &'static [&'static str] {
             "script is an absolute path on the node allow list",
             "arguments are passed without a shell",
         ],
+        other if proxmox::is_proxmox(other) => proxmox::preconditions(other),
         _ => &[],
     }
 }
@@ -502,6 +551,7 @@ fn schema(name: &str) -> Value {
                 }
             }
         }),
+        other if proxmox::is_proxmox(other) => proxmox::schema(other),
         _ => json!({"type": "object"}),
     }
 }
@@ -525,7 +575,12 @@ fn validate_schema(name: &str, params: &Value) -> Result<(), ActError> {
     }
 }
 
-fn check_params(name: &str, params: &Value, config: &ActionsConfig) -> Result<String, ActError> {
+fn check_params(
+    name: &str,
+    params: &Value,
+    config: &ActionsConfig,
+    proxmox_ep: &ProxmoxEndpoint,
+) -> Result<String, ActError> {
     match name {
         "systemd.restart" => {
             let unit = unit_name(params.get("unit").and_then(|v| v.as_str()).unwrap_or(""))?;
@@ -546,7 +601,11 @@ fn check_params(name: &str, params: &Value, config: &ActionsConfig) -> Result<St
                     .and_then(|v| v.as_str())
                     .unwrap_or(""),
             )?;
-            Ok(format!("container:local:{name}"))
+            Ok(format!("ctr:local:{name}"))
+        }
+        other if proxmox::is_proxmox(other) => {
+            proxmox::ensure_configured(proxmox_ep)?;
+            proxmox::resource_id(other, params)
         }
         "disk.prune_path" => {
             let path = params.get("path").and_then(|v| v.as_str()).unwrap_or("");
@@ -580,6 +639,9 @@ fn perform(
     params: &Value,
     config: &ActionsConfig,
     runner: &dyn CommandRunner,
+    http: &dyn HttpClient,
+    secrets: &dyn SecretLookup,
+    proxmox_ep: &ProxmoxEndpoint,
 ) -> Result<String, String> {
     match name {
         "systemd.restart" => {
@@ -627,6 +689,9 @@ fn perform(
                 None => Vec::new(),
             };
             runner.run(&cleaned, &args)
+        }
+        other if proxmox::is_proxmox(other) => {
+            proxmox::perform(other, params, proxmox_ep, http, secrets)
         }
         other => Err(format!("unknown action `{other}`")),
     }
@@ -1056,6 +1121,90 @@ mod tests {
             },
         );
         assert!(outside.is_err());
+    }
+
+    struct RecHttp {
+        urls: Mutex<Vec<String>>,
+    }
+
+    impl HttpClient for RecHttp {
+        fn post_form(
+            &self,
+            url: &str,
+            _authorization: &str,
+            _fields: &[(&str, &str)],
+        ) -> Result<String, String> {
+            self.urls.lock().unwrap().push(url.to_string());
+            Ok("UPID:pve1:1".into())
+        }
+    }
+
+    struct MapSecrets;
+
+    impl SecretLookup for MapSecrets {
+        fn get(&self, name: &str) -> Option<String> {
+            (name == "PVE_TOKEN_SECRET").then(|| "secret-value".into())
+        }
+    }
+
+    #[test]
+    fn proxmox_start_waits_and_posts_only_after_approval() {
+        let http = Arc::new(RecHttp {
+            urls: Mutex::new(Vec::new()),
+        });
+        let mut reg = Registry::new(ActionsConfig::default(), Arc::new(FakeRunner::ok())).unwrap();
+        reg.set_proxmox(ProxmoxEndpoint {
+            api_url: "https://pve.example:8006".into(),
+            token_id: "monitor@pve!pulseblade".into(),
+            token_secret_env: "PVE_TOKEN_SECRET".into(),
+            verify_tls: true,
+        });
+        let reg = reg
+            .with_http(http.clone())
+            .with_secrets(Arc::new(MapSecrets));
+        let store = Store::open_in_memory().unwrap();
+        let planned = reg
+            .plan(
+                &store,
+                PlanParams {
+                    action: "proxmox.start".into(),
+                    params: json!({"node": "pve1", "vmid": 100}),
+                    resource_id: None,
+                    idempotency_key: None,
+                    dry_run: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(planned.tier, RiskTier::Approve);
+        let held = reg.execute(&store, &planned.plan_id).unwrap();
+        assert_eq!(held.status, ActionRunStatus::AwaitingApproval);
+        assert!(http.urls.lock().unwrap().is_empty());
+        let done = reg.approve(&store, &held.id).unwrap();
+        assert_eq!(done.status, ActionRunStatus::Succeeded);
+        let urls = http.urls.lock().unwrap();
+        assert_eq!(
+            urls.as_slice(),
+            ["https://pve.example:8006/api2/json/nodes/pve1/qemu/100/status/start"]
+        );
+    }
+
+    #[test]
+    fn proxmox_without_api_config_does_not_plan() {
+        let reg = Registry::new(ActionsConfig::default(), Arc::new(FakeRunner::ok())).unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let err = reg
+            .plan(
+                &store,
+                PlanParams {
+                    action: "proxmox.stop".into(),
+                    params: json!({"node": "pve1", "vmid": 100, "guest": "lxc"}),
+                    resource_id: None,
+                    idempotency_key: None,
+                    dry_run: false,
+                },
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("not configured"));
     }
 
     #[test]

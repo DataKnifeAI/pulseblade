@@ -7,6 +7,7 @@ members = [
     "crates/pulseblade-detect",
     "crates/pulseblade-act",
     "crates/pulseblade-mcp",
+    "crates/pulseblade-pilot",
     "crates/pulseblade",
 ]
 default-members = [
@@ -16,6 +17,7 @@ default-members = [
     "crates/pulseblade-detect",
     "crates/pulseblade-act",
     "crates/pulseblade-mcp",
+    "crates/pulseblade-pilot",
     "crates/pulseblade",
 ]
 
@@ -33,6 +35,7 @@ pulseblade-collect = { path = "crates/pulseblade-collect" }
 pulseblade-detect = { path = "crates/pulseblade-detect" }
 pulseblade-act = { path = "crates/pulseblade-act" }
 pulseblade-mcp = { path = "crates/pulseblade-mcp" }
+pulseblade-pilot = { path = "crates/pulseblade-pilot" }
 anyhow = "1"
 axum = "0.8"
 chrono = { version = "0.4", features = ["serde"] }

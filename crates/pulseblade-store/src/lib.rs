@@ -11,9 +11,11 @@ use std::sync::{Mutex, MutexGuard};
 use chrono::{DateTime, TimeZone, Utc};
 mod actions;
 mod memory;
+mod pilot;
 
 pub use actions::{ActionTransition, NewAction};
 pub use memory::{FindingDraft, FindingFilter};
+pub use pilot::{NewPilotRun, PilotRunRow};
 
 use pulseblade_core::{
     Aggregation, Change, ChangeKind, Checkpoint, CollectorRun, Health, Observation, Point,
@@ -166,6 +168,20 @@ CREATE TABLE IF NOT EXISTS audit (
     payload   TEXT NOT NULL,
     prev_hash TEXT NOT NULL,
     hash      TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS pilot_runs (
+    id         TEXT PRIMARY KEY,
+    ts         INTEGER NOT NULL,
+    trigger    TEXT NOT NULL,
+    tier       TEXT NOT NULL,
+    endpoint   TEXT NOT NULL,
+    tool_calls INTEGER NOT NULL,
+    tokens     INTEGER NOT NULL,
+    conclusion TEXT NOT NULL,
+    proposed   TEXT NOT NULL,
+    status     TEXT NOT NULL,
+    detail     TEXT NOT NULL
 );
 "#;
 

@@ -18,6 +18,8 @@ pub enum ResourceKind {
     NetIface,
     Service,
     Container,
+    /// A container or VM disk image.
+    Image,
     Vm,
     Node,
     Pod,
@@ -25,20 +27,24 @@ pub enum ResourceKind {
     Process,
     /// The user session this node is collecting for.
     Session,
+    /// A storage volume on a node (Proxmox storage, not a host disk).
+    Storage,
 }
 
 impl ResourceKind {
-    pub const ALL: [ResourceKind; 10] = [
+    pub const ALL: [ResourceKind; 12] = [
         Self::Host,
         Self::Disk,
         Self::NetIface,
         Self::Service,
         Self::Container,
+        Self::Image,
         Self::Vm,
         Self::Node,
         Self::Pod,
         Self::Process,
         Self::Session,
+        Self::Storage,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -48,11 +54,13 @@ impl ResourceKind {
             Self::NetIface => "net_iface",
             Self::Service => "service",
             Self::Container => "container",
+            Self::Image => "image",
             Self::Vm => "vm",
             Self::Node => "node",
             Self::Pod => "pod",
             Self::Process => "process",
             Self::Session => "session",
+            Self::Storage => "storage",
         }
     }
 }

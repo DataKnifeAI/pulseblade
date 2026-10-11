@@ -148,9 +148,10 @@ pub fn spawn_collector(
     let detect = config.detect.clone();
     let sample_retention = chrono::Duration::hours(config.retention_hours as i64);
     let change_retention = chrono::Duration::days(config.change_retention_days as i64);
+    let opts = config.collector_opts();
     std::thread::spawn(move || {
         let _lock = lock;
-        let mut collectors = default_collectors();
+        let mut collectors = default_collectors(&opts);
         tracing::info!(
             collectors = ?collectors.iter().map(|c| c.name()).collect::<Vec<_>>(),
             interval_secs = interval.as_secs(),

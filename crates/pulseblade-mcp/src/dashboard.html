@@ -157,6 +157,11 @@ function summary(r) {
     case "service": return [a.active, a.sub, a.unit_file_state].filter(Boolean).join(" · ");
     case "process": return `cpu ${fmt("proc.cpu_pct", m["proc.cpu_pct"])} · mem ${fmt("proc.mem_pct", m["proc.mem_pct"])}`;
     case "session": return [a.user, a.state, a.linger === "yes" ? "linger" : ""].filter(Boolean).join(" · ");
+    case "container": return [a.state, a.health, a.image].filter(Boolean).join(" · ");
+    case "image": return a.image_id || "";
+    case "vm": return [a.status, a.vmid != null ? "id " + a.vmid : ""].filter(Boolean).join(" · ");
+    case "node": return a.status || "";
+    case "storage": return [a.kind, a.active === false ? "inactive" : ""].filter(Boolean).join(" · ");
     default: return Object.keys(m).slice(0, 2).map((k) => `${k} ${fmt(k, m[k])}`).join(" · ");
   }
 }

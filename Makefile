@@ -11,15 +11,15 @@ help: ## Show this help
 
 .PHONY: build
 build: ## Build workspace
-	$(CARGO) build --workspace
+	$(CARGO) build --workspace --all-features
 
 .PHONY: release
 release: ## Build release binaries
-	$(CARGO) build --workspace --release
+	$(CARGO) build --workspace --all-features --release
 
 .PHONY: test
 test: ## Run tests
-	$(CARGO) test --workspace
+	$(CARGO) test --workspace --all-features
 
 .PHONY: fmt
 fmt: ## Format Rust sources
@@ -31,7 +31,7 @@ fmt-check: ## Check formatting (CI)
 
 .PHONY: lint
 lint: ## Clippy with warnings denied
-	$(CARGO) clippy --workspace --all-targets -- -D warnings
+	$(CARGO) clippy --workspace --all-targets --all-features -- -D warnings
 
 .PHONY: vet
 vet: fmt-check lint ## Static checks (fmt + clippy)

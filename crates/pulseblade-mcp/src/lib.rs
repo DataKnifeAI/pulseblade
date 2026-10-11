@@ -39,6 +39,18 @@ pub async fn serve_http(
     shutdown: CancellationToken,
     actions: Arc<Registry>,
 ) -> anyhow::Result<()> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    serve_listener(listener, store, allowed_hosts, shutdown, actions).await
+}
+
+/// Serve on an already-bound listener so callers can discover port 0.
+pub async fn serve_listener(
+    listener: tokio::net::TcpListener,
+    store: Arc<Store>,
+    allowed_hosts: Vec<String>,
+    shutdown: CancellationToken,
+    actions: Arc<Registry>,
+) -> anyhow::Result<()> {
     let mut config = StreamableHttpServerConfig::default()
         .with_json_response(true)
         .with_cancellation_token(shutdown.child_token());
@@ -64,8 +76,8 @@ pub async fn serve_http(
             Arc::new(allowed_hosts),
             http::check_host,
         ));
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!(%addr, "listening: MCP http://{addr}/mcp, dashboard http://{addr}/");
+    let bound = listener.local_addr()?;
+    tracing::info!(%bound, "listening: MCP http://{bound}/mcp, dashboard http://{bound}/");
     axum::serve(listener, router)
         .with_graceful_shutdown(async move { shutdown.cancelled().await })
         .await?;

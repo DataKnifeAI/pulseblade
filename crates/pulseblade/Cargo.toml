@@ -14,6 +14,7 @@ pulseblade-collect.workspace = true
 pulseblade-detect.workspace = true
 pulseblade-act.workspace = true
 pulseblade-mcp.workspace = true
+pulseblade-pilot.workspace = true
 ureq = { version = "2.12", default-features = false, features = ["json", "tls"] }
 anyhow.workspace = true
 chrono.workspace = true
@@ -25,6 +26,11 @@ tokio-util.workspace = true
 toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[features]
+default = ["docker", "proxmox"]
+docker = ["pulseblade-collect/docker"]
+proxmox = ["pulseblade-collect/proxmox"]
 
 [[example]]
 name = "seed_demo"

@@ -76,6 +76,9 @@ pub struct ActionsConfig {
     pub docker_restart: TierLimit,
     pub disk_prune: PathAction,
     pub script_run: PathAction,
+    pub proxmox_start: TierLimit,
+    pub proxmox_stop: TierLimit,
+    pub proxmox_migrate: TierLimit,
 }
 
 impl Default for ActionsConfig {
@@ -91,6 +94,9 @@ impl Default for ActionsConfig {
                 rate_per_hour: 4,
                 allow: Vec::new(),
             },
+            proxmox_start: TierLimit::default(),
+            proxmox_stop: TierLimit::default(),
+            proxmox_migrate: TierLimit::default(),
         }
     }
 }

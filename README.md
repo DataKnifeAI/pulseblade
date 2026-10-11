@@ -20,21 +20,22 @@ Existing tools are either human-first monitoring stacks with an agent bolted on,
 - **Semantic labels and causal context** baked into telemetry.
 - **Token-efficient** — a summary snapshot of a ~150-resource host is ~150 tokens; cursors and `if_changed_since` make polling nearly free; series are compact arrays; bulk JSONL export when you really want everything.
 - **Useful without an LLM** — dashboard, REST API, Prometheus exposition, and a terminal status view, all from the same queries the agents use.
-- **Remediation as first-class tools** (planned) — idempotent, audited, and gated by risk tier.
-- **Memory** (planned) — notes and prior actions attached to resources.
+- **Remediation as first-class tools** — idempotent, audited, and gated by risk tier.
+- **Memory** — notes and prior actions attached to resources.
 - **No per-seat anything** — one binary, embedded SQLite, runs anywhere.
 
 ## Status
 
-Milestones **M1** (single-host node) and **M1.1** (dashboard and HTTP API) — see [docs/PLAN.md](docs/PLAN.md).
+Milestones **M1** through **M5** are done — see [docs/PLAN.md](docs/PLAN.md).
 
 | Works today | Planned |
 |-------------|---------|
-| Host, CPU, memory, disk, network, systemd service collectors | Logs, processes, user units; findings and memory (M2) |
-| Change journal, checkpoints, `changes_since` | Gated remediation and audit chain (M3) |
-| Metrics with query-time downsampling | Pilot: LLM reasoning loop, local or remote model (M4) |
-| MCP over stdio and streamable HTTP | Docker, Proxmox (M5), hub (M6), Kubernetes (M7) |
+| Host, CPU, memory, disk, network, systemd, journald, processes, user session | Hub for multi-node fleets (M6) |
+| Change journal, checkpoints, findings, notes, gated actions | Kubernetes collector and actions (M7) |
+| Pilot over any OpenAI-compatible endpoint | |
+| Docker and Proxmox collectors and actions | |
 | Dashboard, REST API, Prometheus `/metrics`, `ctl status` | |
+| MCP over stdio and streamable HTTP | |
 
 ## Quick start
 
@@ -89,6 +90,8 @@ pulseblade ctl changes --since before-deploy
 pulseblade ctl export --since 1h > dump.jsonl
 pulseblade ctl findings --detail
 pulseblade ctl approve <run_id>
+pulseblade ctl runs
+pulseblade pilot --once
 ```
 
 ## MCP tools (M1)
@@ -283,18 +286,64 @@ allow = []
 [actions.script_run]        # default tier: deny; only these absolute paths can run
 tier = "deny"
 allow = []
+
+[actions.proxmox_start]     # default tier: approve
+tier = "approve"
+
+[actions.proxmox_stop]
+tier = "approve"
+
+[actions.proxmox_migrate]
+tier = "approve"
+
+[collect]
+docker = true             # false skips the docker collector even when the daemon is up
+
+# Proxmox collector and actions. An empty api_url leaves both off.
+# token_secret_env is the name of an environment variable, never the secret.
+[proxmox]
+api_url = ""
+token_id = ""
+token_secret_env = "PVE_TOKEN_SECRET"
+verify_tls = true
+
+# Pilot. Missing keys keep the defaults (disabled, no model calls).
+# `pulseblade pilot` talks to MCP at mcp_url, or http://<listen>/mcp.
+[pilot]
+enabled = false
+local_only = false        # when true, only loopback base_url values are called
+wake_on = ["findings", "changes"]
+heartbeat_secs = 900
+poll_secs = 30            # MCP poll interval; this is not a model call
+execute_auto = false      # auto-tier plans run only when this is true; approve and deny never do
+mcp_url = ""
+
+[pilot.budget]
+max_tool_calls = 12
+max_tokens = 20000
+max_wall_secs = 120
+
+[[pilot.tiers]]
+name = "triage"
+[[pilot.tiers.endpoints]]
+kind = "openai_compatible"
+base_url = "http://127.0.0.1:11434/v1"
+model = "local"
 ```
 
-`systemd.restart` takes `unit` (a bare name gets `.service`) and optional `user: true` for `systemctl --user`. `docker.restart` takes `container` and shells out to `docker`. `disk.prune_path` deletes regular files in an allow-listed directory and refuses `/`, `/home`, `/etc`, `/usr`, `/var`, `/boot`, and the other system roots. `script.run` runs an allow-listed program with an `args` array and no shell. `action_plan` with `dry_run: true` records the run without invoking the command. Approve a waiting run with `pulseblade ctl approve <run_id>` or `POST /api/v1/actions/{id}/approve`.
+`systemd.restart` takes `unit` (a bare name gets `.service`) and optional `user: true` for `systemctl --user`. `docker.restart` takes `container` and shells out to `docker`. `disk.prune_path` deletes regular files in an allow-listed directory and refuses `/`, `/home`, `/etc`, `/usr`, `/var`, `/boot`, and the other system roots. `script.run` runs an allow-listed program with an `args` array and no shell. `proxmox.start` and `proxmox.stop` take `node`, `vmid`, and optional `guest` (`qemu` or `lxc`). `proxmox.migrate` takes `node`, `vmid`, and `target`. Those three wait for approval unless the tier is changed. `action_plan` with `dry_run: true` records the run without invoking the command. Approve a waiting run with `pulseblade ctl approve <run_id>` or `POST /api/v1/actions/{id}/approve`.
+
+`pulseblade pilot` polls the MCP server and calls the model only when a new finding, a journal change, or the heartbeat says so. A quiet `--once` prints `{"investigated": false}` and does not call the model. Conclusions are `memory_note`s; proposed remediations are `action_plan`s. The node still applies its own tier. `pulseblade ctl runs` lists recorded investigations.
 
 State lives in `~/.local/state/pulseblade/pulseblade.db` by default (`--db` to override).
 
 ## Integrates with
 
 - Any MCP client: Cursor, Claude, agent runtimes such as Hermes Agent, local agents on Ollama, HolmesGPT, custom scripts
-- Any OpenAI-compatible endpoint as the pilot's model, local or remote: Ollama, vLLM, OpenRouter, Hermes models (planned, [#6](https://github.com/DataKnifeAI/pulseblade/issues/6))
+- Any OpenAI-compatible endpoint as the pilot's model, local or remote: Ollama (`http://127.0.0.1:11434/v1`), vLLM, OpenRouter, Hermes models served the same way
+- External agent runtimes such as Hermes Agent, over MCP, without the pilot
 - Prometheus and Grafana (scrape `/metrics`), Homepage and other dashboards (JSON API)
-- systemd (today); Docker, Proxmox VE, Kubernetes (planned)
+- systemd, journald, Docker (when the daemon is reachable), Proxmox VE (when `[proxmox]` has an API URL); Kubernetes is planned
 
 ## Development
 

@@ -2,8 +2,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use pulseblade_act::ActionsConfig;
+use pulseblade_collect::{CollectorOpts, ProxmoxTarget};
 use pulseblade_core::LabelRule;
 use pulseblade_detect::DetectConfig;
+use pulseblade_pilot::PilotConfig;
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -30,6 +32,73 @@ pub struct Config {
     /// Node-local action policy. Missing keys keep the built-in tiers and allow lists.
     #[serde(default)]
     pub actions: ActionsConfig,
+    /// Optional collectors. Docker is attempted when enabled; Proxmox stays off
+    /// until `[proxmox]` has an API URL.
+    #[serde(default)]
+    pub collect: CollectConfig,
+    /// Proxmox API used by the collector and by proxmox actions. The token secret
+    /// is an environment variable name, never the secret itself.
+    #[serde(default)]
+    pub proxmox: ProxmoxFile,
+    /// Optional event-driven investigator. The node does not start it.
+    #[serde(default)]
+    pub pilot: PilotConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CollectConfig {
+    pub docker: bool,
+}
+
+impl Default for CollectConfig {
+    fn default() -> Self {
+        Self { docker: true }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProxmoxFile {
+    pub api_url: String,
+    pub token_id: String,
+    pub token_secret_env: String,
+    pub verify_tls: bool,
+}
+
+impl Default for ProxmoxFile {
+    fn default() -> Self {
+        Self {
+            api_url: String::new(),
+            token_id: String::new(),
+            token_secret_env: String::new(),
+            verify_tls: true,
+        }
+    }
+}
+
+impl ProxmoxFile {
+    pub fn endpoint(&self) -> pulseblade_act::ProxmoxEndpoint {
+        pulseblade_act::ProxmoxEndpoint {
+            api_url: self.api_url.clone(),
+            token_id: self.token_id.clone(),
+            token_secret_env: self.token_secret_env.clone(),
+            verify_tls: self.verify_tls,
+        }
+    }
+
+    pub fn target(&self) -> Option<ProxmoxTarget> {
+        if self.api_url.trim().is_empty() {
+            None
+        } else {
+            Some(ProxmoxTarget {
+                api_url: self.api_url.clone(),
+                token_id: self.token_id.clone(),
+                token_secret_env: self.token_secret_env.clone(),
+                verify_tls: self.verify_tls,
+            })
+        }
+    }
 }
 
 impl Default for Config {
@@ -44,11 +113,21 @@ impl Default for Config {
             labels: Vec::new(),
             detect: DetectConfig::default(),
             actions: ActionsConfig::default(),
+            collect: CollectConfig::default(),
+            proxmox: ProxmoxFile::default(),
+            pilot: PilotConfig::default(),
         }
     }
 }
 
 impl Config {
+    pub fn collector_opts(&self) -> CollectorOpts {
+        CollectorOpts {
+            docker: self.collect.docker,
+            proxmox: self.proxmox.target(),
+        }
+    }
+
     /// Load `path`, or the default location if it exists, or built-in defaults.
     pub fn load(path: Option<&Path>) -> anyhow::Result<Self> {
         let (path, required) = match path {
@@ -139,6 +218,45 @@ mod tests {
             [actions.script_run]
             tier = "deny"
             allow = []
+
+            [actions.proxmox_start]
+            tier = "approve"
+
+            [actions.proxmox_stop]
+            tier = "approve"
+
+            [actions.proxmox_migrate]
+            tier = "approve"
+
+            [collect]
+            docker = true
+
+            [proxmox]
+            api_url = ""
+            token_id = ""
+            token_secret_env = "PVE_TOKEN_SECRET"
+            verify_tls = true
+
+            [pilot]
+            enabled = false
+            local_only = false
+            wake_on = ["findings", "changes"]
+            heartbeat_secs = 900
+            poll_secs = 30
+            execute_auto = false
+            mcp_url = ""
+
+            [pilot.budget]
+            max_tool_calls = 12
+            max_tokens = 20000
+            max_wall_secs = 120
+
+            [[pilot.tiers]]
+            name = "triage"
+            [[pilot.tiers.endpoints]]
+            kind = "openai_compatible"
+            base_url = "http://127.0.0.1:11434/v1"
+            model = "local"
             "#,
         )
         .unwrap();
@@ -150,6 +268,11 @@ mod tests {
         assert_eq!(cfg.actions.approval_ttl, "1h");
         assert!(cfg.actions.disk_prune.allow.is_empty());
         assert_eq!(cfg.actions.script_run.rate_per_hour, 4);
+        assert!(cfg.collect.docker);
+        assert!(cfg.proxmox.api_url.is_empty());
+        assert!(!cfg.pilot.execute_auto);
+        assert_eq!(cfg.pilot.tiers.len(), 1);
+        assert_eq!(cfg.pilot.budget.max_tool_calls, 12);
     }
 
     #[test]
