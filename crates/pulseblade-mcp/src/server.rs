@@ -69,7 +69,9 @@ export_bulk returns everything as JSONL and is large.
 Collectors with `ok: false` or `stale: true` mean data is failing or going stale.
 Resource ids: host:<host>, disk:<host>:<mount>, net:<host>:<iface>, unit:<host>:<unit>, \
 unit:<host>:user:<unit>, proc:<host>:<pid>, session:<host>, ctr:<host>:<name>, \
-img:<host>:<name>, node:<name>, vm:<node>:<vmid>, lxc:<node>:<vmid>, storage:<node>:<name>.
+img:<host>:<name>, node:<name>, vm:<node>:<vmid>, lxc:<node>:<vmid>, storage:<node>:<name>, \
+knode:<cluster>:<name>, workload:<cluster>:<ns>:<kind>:<name>, pod:<cluster>:<ns>:<name>, \
+prom:<host>:<job>.
 MCP resources pulseblade://state and pulseblade://findings notify on change.";
 
 /// MCP handler exposing Pulseblade's read tools.
@@ -912,7 +914,7 @@ mod tests {
         policy.script_run.allow = vec!["/usr/local/lib/pulseblade/hook".into()];
         let reg = pulseblade_act::Registry::new(policy, Arc::new(Nop)).unwrap();
         let catalog = reg.list();
-        assert_eq!(catalog.actions.len(), 7);
+        assert_eq!(catalog.actions.len(), 9);
         assert_matches_output_schema(&server, "actions_list", &catalog);
         let planned = reg
             .plan(

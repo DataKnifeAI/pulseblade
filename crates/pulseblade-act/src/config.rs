@@ -79,6 +79,8 @@ pub struct ActionsConfig {
     pub proxmox_start: TierLimit,
     pub proxmox_stop: TierLimit,
     pub proxmox_migrate: TierLimit,
+    pub k8s_rollout_restart: TierLimit,
+    pub k8s_scale: TierLimit,
 }
 
 impl Default for ActionsConfig {
@@ -97,6 +99,8 @@ impl Default for ActionsConfig {
             proxmox_start: TierLimit::default(),
             proxmox_stop: TierLimit::default(),
             proxmox_migrate: TierLimit::default(),
+            k8s_rollout_restart: TierLimit::default(),
+            k8s_scale: TierLimit::default(),
         }
     }
 }

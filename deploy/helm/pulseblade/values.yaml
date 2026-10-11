@@ -1,0 +1,6 @@
+image: pulseblade:local
+listen: 0.0.0.0:7171
+cluster: demo
+# PEM path inside the pod. The chart default is the ServiceAccount CA.
+ca: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+apiUrl: https://kubernetes.default.svc

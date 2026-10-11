@@ -1,0 +1,50 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ .Release.Name }}
+spec:
+  selector:
+    matchLabels:
+      app: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Release.Name }}
+    spec:
+      serviceAccountName: {{ .Release.Name }}
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        - name: pulseblade
+          image: {{ .Values.image }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              if [ -z "$K8S_TOKEN" ] && [ -f /var/run/secrets/kubernetes.io/serviceaccount/token ]; then
+                export K8S_TOKEN="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)"
+              fi
+              exec pulseblade node --config /etc/pulseblade/pulseblade.toml
+          env:
+            - name: K8S_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-k8s
+                  key: token
+                  optional: true
+            - name: XDG_STATE_HOME
+              value: /var/lib/pulseblade
+          ports:
+            - name: http
+              containerPort: 7171
+          volumeMounts:
+            - name: config
+              mountPath: /etc/pulseblade
+              readOnly: true
+            - name: state
+              mountPath: /var/lib/pulseblade
+      volumes:
+        - name: config
+          configMap:
+            name: {{ .Release.Name }}
+        - name: state
+          emptyDir: {}

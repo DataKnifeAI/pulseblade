@@ -58,11 +58,11 @@ Cargo workspace, CI (`make vet`, `make test`), Makefile, license, README, archit
 - Action routing via node long-poll (no inbound ports on nodes); nodes enforce their own policy.
 - Token or mTLS auth; Dockerfile and systemd unit.
 
-### M7 — Kubernetes ([#5](https://github.com/DataKnifeAI/pulseblade/issues/5))
+### M7 — Kubernetes (done, [#5](https://github.com/DataKnifeAI/pulseblade/issues/5))
 
-- Collector and actions (rollout restart, scale) behind a `k8s` feature (`kube`).
-- DaemonSet / Helm chart.
-- Prometheus interop: scrape `/metrics` targets (exposing `/metrics` shipped in M1.1).
+- Collector and actions (`k8s.rollout_restart`, `k8s.scale`) behind a `k8s` feature (`kube`). Ids: `knode:<cluster>:<name>`, `workload:<cluster>:<ns>:<kind>:<name>`, `pod:<cluster>:<ns>:<name>`. Warning events are log lines on the involved object. An empty API URL leaves the collector off.
+- DaemonSet and Helm chart under `deploy/k8s` and `deploy/helm/pulseblade`.
+- Prometheus interop: `[[prometheus]]` scrapes text `/metrics` targets into `prom:<host>:<name>` samples (exposing `/metrics` shipped in M1.1).
 
 ### Later
 

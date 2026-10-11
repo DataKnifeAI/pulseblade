@@ -4,6 +4,7 @@
 //! execute; `approve` waits until `approve` (CLI or HTTP); `deny` never runs.
 
 mod config;
+mod k8s;
 mod proxmox;
 
 use proxmox::{HttpClient, ProcessEnv, SecretLookup, UreqClient};
@@ -19,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 pub use config::{parse_ttl, ActionsConfig, PathAction, TierLimit};
+pub use k8s::{IdleK8s, K8sApi, K8sEndpoint};
 pub use proxmox::ProxmoxEndpoint;
 
 /// Runs a program without a shell. Tests substitute a fake.
@@ -141,6 +143,8 @@ pub struct Registry {
     http: Arc<dyn HttpClient>,
     secrets: Arc<dyn SecretLookup>,
     proxmox: ProxmoxEndpoint,
+    k8s: K8sEndpoint,
+    k8s_api: Arc<dyn K8sApi>,
 }
 
 impl Registry {
@@ -153,7 +157,49 @@ impl Registry {
             http: Arc::new(UreqClient { verify_tls: true }),
             secrets: Arc::new(ProcessEnv),
             proxmox: ProxmoxEndpoint::default(),
+            k8s: K8sEndpoint::default(),
+            k8s_api: Arc::new(IdleK8s {
+                message: "kubernetes API client is not connected".into(),
+            }),
         })
+    }
+
+    /// API used by `k8s.rollout_restart` and `k8s.scale`.
+    /// An empty URL leaves the actions unconfigured. A connect failure is returned
+    /// and later performs fail with the same message.
+    pub fn set_k8s(&mut self, endpoint: K8sEndpoint) -> Result<(), String> {
+        self.k8s = endpoint.clone();
+        if endpoint.api_url.trim().is_empty() {
+            return Ok(());
+        }
+        #[cfg(feature = "k8s")]
+        {
+            match k8s::KubeApi::connect(&endpoint) {
+                Ok(api) => {
+                    self.k8s_api = Arc::new(api);
+                    Ok(())
+                }
+                Err(e) => {
+                    self.k8s_api = Arc::new(IdleK8s { message: e.clone() });
+                    Err(e)
+                }
+            }
+        }
+        #[cfg(not(feature = "k8s"))]
+        {
+            let message = "k8s actions are not compiled in".to_string();
+            self.k8s_api = Arc::new(IdleK8s {
+                message: message.clone(),
+            });
+            Err(message)
+        }
+    }
+
+    /// Install a client without dialing. Tests use this to prove the approve gate.
+    pub fn with_k8s(mut self, endpoint: K8sEndpoint, api: Arc<dyn K8sApi>) -> Self {
+        self.k8s = endpoint;
+        self.k8s_api = api;
+        self
     }
 
     /// API used by `proxmox.start`, `proxmox.stop`, and `proxmox.migrate`.
@@ -210,7 +256,7 @@ impl Registry {
             return Err(ActError::Invalid("params must be an object".into()));
         }
         validate_schema(&req.action, &params)?;
-        let derived = check_params(&req.action, &params, &self.config, &self.proxmox)?;
+        let derived = check_params(&req.action, &params, &self.config, &self.proxmox, &self.k8s)?;
         let resource_id = match req.resource_id {
             Some(id) => clean_resource_id(&id)?,
             None => derived,
@@ -349,9 +395,12 @@ impl Registry {
             &run.params,
             &self.config,
             self.runner.as_ref(),
-            self.http.as_ref(),
-            self.secrets.as_ref(),
-            &self.proxmox,
+            ExecEnv {
+                http: self.http.as_ref(),
+                secrets: self.secrets.as_ref(),
+                proxmox: &self.proxmox,
+                k8s: self.k8s_api.as_ref(),
+            },
         ) {
             Ok(output) => self.finish(
                 store,
@@ -408,6 +457,8 @@ impl Registry {
             "proxmox.start" => self.config.proxmox_start.tier,
             "proxmox.stop" => self.config.proxmox_stop.tier,
             "proxmox.migrate" => self.config.proxmox_migrate.tier,
+            "k8s.rollout_restart" => self.config.k8s_rollout_restart.tier,
+            "k8s.scale" => self.config.k8s_scale.tier,
             _ => None,
         };
         over.unwrap_or(match name {
@@ -425,6 +476,8 @@ impl Registry {
             "proxmox.start" => self.config.proxmox_start.rate_per_hour,
             "proxmox.stop" => self.config.proxmox_stop.rate_per_hour,
             "proxmox.migrate" => self.config.proxmox_migrate.rate_per_hour,
+            "k8s.rollout_restart" => self.config.k8s_rollout_restart.rate_per_hour,
+            "k8s.scale" => self.config.k8s_scale.rate_per_hour,
             _ => 0,
         }
     }
@@ -454,6 +507,8 @@ const NAMES: &[&str] = &[
     "proxmox.start",
     "proxmox.stop",
     "proxmox.migrate",
+    "k8s.rollout_restart",
+    "k8s.scale",
 ];
 
 fn plan_of(run: &ActionRun) -> PlanResult {
@@ -474,6 +529,7 @@ fn description(name: &str) -> &'static str {
         "disk.prune_path" => "Delete regular files in an allow-listed directory.",
         "script.run" => "Run an allow-listed program with no shell.",
         other if proxmox::is_proxmox(other) => proxmox::description(other),
+        other if k8s::is_k8s(other) => k8s::description(other),
         _ => "",
     }
 }
@@ -486,6 +542,7 @@ fn applies_to(name: &str) -> Vec<ResourceKind> {
         "proxmox.start" | "proxmox.stop" | "proxmox.migrate" => {
             vec![ResourceKind::Vm, ResourceKind::Container]
         }
+        "k8s.rollout_restart" | "k8s.scale" => vec![ResourceKind::Workload],
         _ => vec![ResourceKind::Host],
     }
 }
@@ -507,6 +564,7 @@ fn preconditions(name: &str) -> &'static [&'static str] {
             "arguments are passed without a shell",
         ],
         other if proxmox::is_proxmox(other) => proxmox::preconditions(other),
+        other if k8s::is_k8s(other) => k8s::preconditions(other),
         _ => &[],
     }
 }
@@ -552,6 +610,7 @@ fn schema(name: &str) -> Value {
             }
         }),
         other if proxmox::is_proxmox(other) => proxmox::schema(other),
+        other if k8s::is_k8s(other) => k8s::schema(other),
         _ => json!({"type": "object"}),
     }
 }
@@ -580,6 +639,7 @@ fn check_params(
     params: &Value,
     config: &ActionsConfig,
     proxmox_ep: &ProxmoxEndpoint,
+    k8s_ep: &K8sEndpoint,
 ) -> Result<String, ActError> {
     match name {
         "systemd.restart" => {
@@ -606,6 +666,10 @@ fn check_params(
         other if proxmox::is_proxmox(other) => {
             proxmox::ensure_configured(proxmox_ep)?;
             proxmox::resource_id(other, params)
+        }
+        other if k8s::is_k8s(other) => {
+            k8s::ensure_configured(k8s_ep)?;
+            k8s::resource_id(other, params, &k8s_ep.cluster)
         }
         "disk.prune_path" => {
             let path = params.get("path").and_then(|v| v.as_str()).unwrap_or("");
@@ -634,14 +698,19 @@ fn check_params(
     }
 }
 
+struct ExecEnv<'a> {
+    http: &'a dyn HttpClient,
+    secrets: &'a dyn SecretLookup,
+    proxmox: &'a ProxmoxEndpoint,
+    k8s: &'a dyn K8sApi,
+}
+
 fn perform(
     name: &str,
     params: &Value,
     config: &ActionsConfig,
     runner: &dyn CommandRunner,
-    http: &dyn HttpClient,
-    secrets: &dyn SecretLookup,
-    proxmox_ep: &ProxmoxEndpoint,
+    env: ExecEnv<'_>,
 ) -> Result<String, String> {
     match name {
         "systemd.restart" => {
@@ -691,8 +760,9 @@ fn perform(
             runner.run(&cleaned, &args)
         }
         other if proxmox::is_proxmox(other) => {
-            proxmox::perform(other, params, proxmox_ep, http, secrets)
+            proxmox::perform(other, params, env.proxmox, env.http, env.secrets)
         }
+        other if k8s::is_k8s(other) => k8s::perform(other, params, env.k8s),
         other => Err(format!("unknown action `{other}`")),
     }
 }
@@ -1205,6 +1275,136 @@ mod tests {
             )
             .unwrap_err();
         assert!(err.to_string().contains("not configured"));
+    }
+
+    struct RecK8s {
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl K8sApi for RecK8s {
+        fn rollout_restart(&self, kind: &str, namespace: &str, name: &str) -> Result<(), String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("restart {kind}/{namespace}/{name}"));
+            Ok(())
+        }
+
+        fn scale(
+            &self,
+            kind: &str,
+            namespace: &str,
+            name: &str,
+            replicas: u32,
+        ) -> Result<(), String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("scale {kind}/{namespace}/{name} {replicas}"));
+            Ok(())
+        }
+    }
+
+    fn k8s_endpoint() -> K8sEndpoint {
+        K8sEndpoint {
+            api_url: "https://k8s.example".into(),
+            token_env: "K8S_TOKEN".into(),
+            cluster: "demo".into(),
+            verify_tls: true,
+            ca: String::new(),
+        }
+    }
+
+    #[test]
+    fn k8s_rollout_waits_and_patches_only_after_approval() {
+        let api = Arc::new(RecK8s {
+            calls: Mutex::new(Vec::new()),
+        });
+        let reg = Registry::new(ActionsConfig::default(), Arc::new(FakeRunner::ok()))
+            .unwrap()
+            .with_k8s(k8s_endpoint(), api.clone());
+        let store = Store::open_in_memory().unwrap();
+        let planned = reg
+            .plan(
+                &store,
+                PlanParams {
+                    action: "k8s.rollout_restart".into(),
+                    params: json!({"namespace": "demo", "name": "api", "kind": "deployment"}),
+                    resource_id: None,
+                    idempotency_key: None,
+                    dry_run: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(planned.tier, RiskTier::Approve);
+        let held = reg.execute(&store, &planned.plan_id).unwrap();
+        assert_eq!(held.status, ActionRunStatus::AwaitingApproval);
+        assert!(api.calls.lock().unwrap().is_empty());
+        let done = reg.approve(&store, &held.id).unwrap();
+        assert_eq!(done.status, ActionRunStatus::Succeeded);
+        assert_eq!(
+            api.calls.lock().unwrap().as_slice(),
+            ["restart deployment/demo/api"]
+        );
+        assert_eq!(done.resource_id, "workload:demo:demo:deployment:api");
+    }
+
+    #[test]
+    fn k8s_without_api_config_does_not_plan() {
+        let reg = Registry::new(ActionsConfig::default(), Arc::new(FakeRunner::ok())).unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let err = reg
+            .plan(
+                &store,
+                PlanParams {
+                    action: "k8s.scale".into(),
+                    params: json!({"namespace": "demo", "name": "api", "replicas": 2}),
+                    resource_id: None,
+                    idempotency_key: None,
+                    dry_run: false,
+                },
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("not configured"));
+    }
+
+    #[cfg(feature = "k8s")]
+    #[test]
+    fn k8s_scale_patches_the_fixture_api_after_approval() {
+        let hits = Arc::new(Mutex::new(Vec::new()));
+        let url = k8s::serve_patch(hits.clone());
+        std::env::set_var("PULSEBLADE_TEST_K8S_ACT", "fixture-token");
+        let mut reg = Registry::new(ActionsConfig::default(), Arc::new(FakeRunner::ok())).unwrap();
+        reg.set_k8s(K8sEndpoint {
+            api_url: url,
+            token_env: "PULSEBLADE_TEST_K8S_ACT".into(),
+            cluster: "demo".into(),
+            verify_tls: true,
+            ca: String::new(),
+        })
+        .unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let planned = reg
+            .plan(
+                &store,
+                PlanParams {
+                    action: "k8s.scale".into(),
+                    params: json!({"namespace": "demo", "name": "api", "replicas": 3}),
+                    resource_id: None,
+                    idempotency_key: None,
+                    dry_run: false,
+                },
+            )
+            .unwrap();
+        let held = reg.execute(&store, &planned.plan_id).unwrap();
+        assert_eq!(held.status, ActionRunStatus::AwaitingApproval);
+        assert!(hits.lock().unwrap().is_empty());
+        let done = reg.approve(&store, &held.id).unwrap();
+        assert_eq!(done.status, ActionRunStatus::Succeeded);
+        assert_eq!(
+            hits.lock().unwrap().as_slice(),
+            ["/apis/apps/v1/namespaces/demo/deployments/api"]
+        );
     }
 
     #[test]

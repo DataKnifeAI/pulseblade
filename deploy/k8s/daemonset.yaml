@@ -1,0 +1,106 @@
+# Per-host Pulseblade node. The ServiceAccount token is the Kubernetes API
+# credential; [k8s].ca points at the in-cluster CA. No inbound ports are required
+# for a hub: set [upstream] in the ConfigMap when this node should push.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pulseblade
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pulseblade
+  namespace: pulseblade
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: pulseblade
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "pods", "events"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets", "daemonsets"]
+    verbs: ["get", "list", "watch", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: pulseblade
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: pulseblade
+subjects:
+  - kind: ServiceAccount
+    name: pulseblade
+    namespace: pulseblade
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pulseblade
+  namespace: pulseblade
+data:
+  pulseblade.toml: |
+    listen = "0.0.0.0:7171"
+    dashboard = true
+    [k8s]
+    api_url = "https://kubernetes.default.svc"
+    token_env = "K8S_TOKEN"
+    cluster = "demo"
+    verify_tls = true
+    ca = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: pulseblade
+  namespace: pulseblade
+spec:
+  selector:
+    matchLabels:
+      app: pulseblade
+  template:
+    metadata:
+      labels:
+        app: pulseblade
+    spec:
+      serviceAccountName: pulseblade
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        - name: pulseblade
+          image: pulseblade:local
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              if [ -z "$K8S_TOKEN" ] && [ -f /var/run/secrets/kubernetes.io/serviceaccount/token ]; then
+                export K8S_TOKEN="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)"
+              fi
+              exec pulseblade node --config /etc/pulseblade/pulseblade.toml
+          env:
+            - name: K8S_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: pulseblade-k8s
+                  key: token
+                  optional: true
+            - name: XDG_STATE_HOME
+              value: /var/lib/pulseblade
+          ports:
+            - name: http
+              containerPort: 7171
+          volumeMounts:
+            - name: config
+              mountPath: /etc/pulseblade
+              readOnly: true
+            - name: state
+              mountPath: /var/lib/pulseblade
+      volumes:
+        - name: config
+          configMap:
+            name: pulseblade
+        - name: state
+          emptyDir: {}

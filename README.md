@@ -26,16 +26,17 @@ Existing tools are either human-first monitoring stacks with an agent bolted on,
 
 ## Status
 
-Milestones **M1** through **M6** are done — see [docs/PLAN.md](docs/PLAN.md).
+Milestones **M1** through **M7** are done — see [docs/PLAN.md](docs/PLAN.md).
 
-| Works today | Planned |
-|-------------|---------|
-| Host, CPU, memory, disk, network, systemd, journald, processes, user session | Kubernetes collector and actions (M7) |
-| Change journal, checkpoints, findings, notes, gated actions | |
+| Works today | Later |
+|-------------|-------|
+| Host, CPU, memory, disk, network, systemd, journald, processes, user session | Cloud collectors (AWS, Azure, GCP) |
+| Change journal, checkpoints, findings, notes, gated actions | Hub-of-hubs |
 | Pilot over any OpenAI-compatible endpoint | |
-| Docker and Proxmox collectors and actions | |
+| Docker, Proxmox, and Kubernetes collectors and actions | |
+| Prometheus scrape targets and `/metrics` exposition | |
 | Hub: per-node cursors, `fleet_overview`, routed actions | |
-| Dashboard, REST API, Prometheus `/metrics`, `ctl status` | |
+| Dashboard, REST API, `ctl status` | |
 | MCP over stdio and streamable HTTP | |
 
 ## Quick start
@@ -300,6 +301,12 @@ tier = "approve"
 [actions.proxmox_migrate]
 tier = "approve"
 
+[actions.k8s_rollout_restart]   # default tier: approve
+tier = "approve"
+
+[actions.k8s_scale]
+tier = "approve"
+
 [collect]
 docker = true             # false skips the docker collector even when the daemon is up
 
@@ -358,13 +365,27 @@ poll_secs = 15
 ca = ""
 cert = ""
 key = ""
+
+# Kubernetes collector and actions. An empty api_url leaves both off.
+# token_env is the name of an environment variable, never the secret.
+[k8s]
+api_url = ""
+token_env = "K8S_TOKEN"
+cluster = "demo"
+verify_tls = true
+ca = ""
+
+# Prometheus text endpoints. An empty url is skipped.
+[[prometheus]]
+name = "app"
+url = ""
 ```
 
-`systemd.restart` takes `unit` (a bare name gets `.service`) and optional `user: true` for `systemctl --user`. `docker.restart` takes `container` and shells out to `docker`. `disk.prune_path` deletes regular files in an allow-listed directory and refuses `/`, `/home`, `/etc`, `/usr`, `/var`, `/boot`, and the other system roots. `script.run` runs an allow-listed program with an `args` array and no shell. `proxmox.start` and `proxmox.stop` take `node`, `vmid`, and optional `guest` (`qemu` or `lxc`). `proxmox.migrate` takes `node`, `vmid`, and `target`. Those three wait for approval unless the tier is changed. `action_plan` with `dry_run: true` records the run without invoking the command. Approve a waiting run with `pulseblade ctl approve <run_id>` or `POST /api/v1/actions/{id}/approve`.
+`systemd.restart` takes `unit` (a bare name gets `.service`) and optional `user: true` for `systemctl --user`. `docker.restart` takes `container` and shells out to `docker`. `disk.prune_path` deletes regular files in an allow-listed directory and refuses `/`, `/home`, `/etc`, `/usr`, `/var`, `/boot`, and the other system roots. `script.run` runs an allow-listed program with an `args` array and no shell. `proxmox.start` and `proxmox.stop` take `node`, `vmid`, and optional `guest` (`qemu` or `lxc`). `proxmox.migrate` takes `node`, `vmid`, and `target`. `k8s.rollout_restart` takes `namespace`, `name`, and optional `kind` (`deployment`, `statefulset`, or `daemonset`). `k8s.scale` takes `namespace`, `name`, `replicas`, and optional `kind` (`deployment` or `statefulset`). Those wait for approval unless the tier is changed. `action_plan` with `dry_run: true` records the run without invoking the command. Approve a waiting run with `pulseblade ctl approve <run_id>` or `POST /api/v1/actions/{id}/approve`.
 
 `pulseblade pilot` polls the MCP server and calls the model only when a new finding, a journal change, or the heartbeat says so. A quiet `--once` prints `{"investigated": false}` and does not call the model. Conclusions are `memory_note`s; proposed remediations are `action_plan`s. The node still applies its own tier. `pulseblade ctl runs` lists recorded investigations.
 
-`pulseblade hub` serves the same MCP tools for every node that pushes to it, plus `fleet_overview`. Point the pilot at the hub with `mcp_url`; the pilot does not change. An action the hub routes still runs only when the target node's own tier allows it. Image and unit files: `deploy/Dockerfile`, `deploy/pulseblade-hub.service`, `deploy/pulseblade-node.service`.
+`pulseblade hub` serves the same MCP tools for every node that pushes to it, plus `fleet_overview`. Point the pilot at the hub with `mcp_url`; the pilot does not change. An action the hub routes still runs only when the target node's own tier allows it. Image and unit files: `deploy/Dockerfile`, `deploy/pulseblade-hub.service`, `deploy/pulseblade-node.service`. A per-host DaemonSet and Helm chart: `deploy/k8s/daemonset.yaml`, `deploy/helm/pulseblade`.
 
 State lives in `~/.local/state/pulseblade/pulseblade.db` by default (`--db` to override).
 
@@ -374,7 +395,7 @@ State lives in `~/.local/state/pulseblade/pulseblade.db` by default (`--db` to o
 - Any OpenAI-compatible endpoint as the pilot's model, local or remote: Ollama (`http://127.0.0.1:11434/v1`), vLLM, OpenRouter, Hermes models served the same way
 - External agent runtimes such as Hermes Agent, over MCP, without the pilot
 - Prometheus and Grafana (scrape `/metrics`), Homepage and other dashboards (JSON API)
-- systemd, journald, Docker (when the daemon is reachable), Proxmox VE (when `[proxmox]` has an API URL); Kubernetes is planned
+- systemd, journald, Docker (when the daemon is reachable), Proxmox VE (when `[proxmox]` has an API URL), Kubernetes (when `[k8s]` has an API URL), and Prometheus scrape targets (`[[prometheus]]`)
 
 ## Development
 

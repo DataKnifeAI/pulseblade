@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use pulseblade_act::ActionsConfig;
-use pulseblade_collect::{CollectorOpts, ProxmoxTarget};
+use pulseblade_collect::{CollectorOpts, K8sTarget, PromTarget, ProxmoxTarget};
 use pulseblade_core::LabelRule;
 use pulseblade_detect::DetectConfig;
 use pulseblade_pilot::PilotConfig;
@@ -49,6 +49,13 @@ pub struct Config {
     /// When `url` is set, this node pushes its journal to a hub and long-polls for actions.
     #[serde(default)]
     pub upstream: UpstreamConfig,
+    /// Kubernetes API used by the collector and by k8s actions. The token is an
+    /// environment variable name, never the secret itself.
+    #[serde(default)]
+    pub k8s: K8sFile,
+    /// Prometheus text endpoints to scrape into samples. An empty URL is skipped.
+    #[serde(default)]
+    pub prometheus: Vec<PromFile>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -178,6 +185,75 @@ impl Default for UpstreamConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct K8sFile {
+    pub api_url: String,
+    pub token_env: String,
+    pub cluster: String,
+    pub verify_tls: bool,
+    /// PEM file for the API server CA. Empty uses the default trust store.
+    pub ca: String,
+}
+
+impl Default for K8sFile {
+    fn default() -> Self {
+        Self {
+            api_url: String::new(),
+            token_env: "K8S_TOKEN".into(),
+            cluster: "cluster".into(),
+            verify_tls: true,
+            ca: String::new(),
+        }
+    }
+}
+
+impl K8sFile {
+    pub fn endpoint(&self) -> pulseblade_act::K8sEndpoint {
+        pulseblade_act::K8sEndpoint {
+            api_url: self.api_url.clone(),
+            token_env: self.token_env.clone(),
+            cluster: self.cluster.clone(),
+            verify_tls: self.verify_tls,
+            ca: self.ca.clone(),
+        }
+    }
+
+    pub fn target(&self) -> Option<K8sTarget> {
+        if self.api_url.trim().is_empty() {
+            None
+        } else {
+            Some(K8sTarget {
+                api_url: self.api_url.clone(),
+                token_env: self.token_env.clone(),
+                cluster: self.cluster.clone(),
+                verify_tls: self.verify_tls,
+                ca: self.ca.clone(),
+            })
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PromFile {
+    pub name: String,
+    pub url: String,
+}
+
+impl PromFile {
+    pub fn target(&self) -> Option<PromTarget> {
+        if self.url.trim().is_empty() || self.name.trim().is_empty() {
+            None
+        } else {
+            Some(PromTarget {
+                name: self.name.clone(),
+                url: self.url.clone(),
+            })
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -195,6 +271,8 @@ impl Default for Config {
             pilot: PilotConfig::default(),
             hub: HubConfig::default(),
             upstream: UpstreamConfig::default(),
+            k8s: K8sFile::default(),
+            prometheus: Vec::new(),
         }
     }
 }
@@ -204,6 +282,8 @@ impl Config {
         CollectorOpts {
             docker: self.collect.docker,
             proxmox: self.proxmox.target(),
+            k8s: self.k8s.target(),
+            prometheus: self.prometheus.iter().filter_map(|p| p.target()).collect(),
         }
     }
 
@@ -307,6 +387,12 @@ mod tests {
             [actions.proxmox_migrate]
             tier = "approve"
 
+            [actions.k8s_rollout_restart]
+            tier = "approve"
+
+            [actions.k8s_scale]
+            tier = "approve"
+
             [collect]
             docker = true
 
@@ -358,6 +444,17 @@ mod tests {
             ca = ""
             cert = ""
             key = ""
+
+            [k8s]
+            api_url = ""
+            token_env = "K8S_TOKEN"
+            cluster = "demo"
+            verify_tls = true
+            ca = ""
+
+            [[prometheus]]
+            name = "app"
+            url = ""
             "#,
         )
         .unwrap();
@@ -377,6 +474,10 @@ mod tests {
         assert_eq!(cfg.hub.listen, "127.0.0.1:7170");
         assert_eq!(cfg.hub.nodes[0].id, "web1");
         assert!(cfg.upstream.url.is_empty());
+        assert!(cfg.k8s.api_url.is_empty());
+        assert_eq!(cfg.k8s.cluster, "demo");
+        assert_eq!(cfg.prometheus.len(), 1);
+        assert!(cfg.prometheus[0].url.is_empty());
     }
 
     #[test]

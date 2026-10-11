@@ -29,10 +29,12 @@ pub enum ResourceKind {
     Session,
     /// A storage volume on a node (Proxmox storage, not a host disk).
     Storage,
+    /// A Kubernetes workload (Deployment, StatefulSet, or DaemonSet).
+    Workload,
 }
 
 impl ResourceKind {
-    pub const ALL: [ResourceKind; 12] = [
+    pub const ALL: [ResourceKind; 13] = [
         Self::Host,
         Self::Disk,
         Self::NetIface,
@@ -45,6 +47,7 @@ impl ResourceKind {
         Self::Process,
         Self::Session,
         Self::Storage,
+        Self::Workload,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -61,6 +64,7 @@ impl ResourceKind {
             Self::Process => "process",
             Self::Session => "session",
             Self::Storage => "storage",
+            Self::Workload => "workload",
         }
     }
 }

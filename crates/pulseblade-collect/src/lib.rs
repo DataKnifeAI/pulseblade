@@ -6,12 +6,16 @@
 mod docker;
 mod host;
 mod journal;
+mod k8s;
 mod processes;
+mod prometheus;
 mod proxmox;
 mod systemd;
 mod user;
 
 pub use docker::{observe_docker, DockerCollector, DockerSource, DockerView};
+pub use k8s::{observe_k8s, K8sCollector, K8sSource, K8sTarget, K8sView};
+pub use prometheus::{observe_prom, PromCollector, PromSource, PromTarget};
 pub use proxmox::{observe_proxmox, ProxmoxCollector, ProxmoxSource, ProxmoxTarget, PveView};
 
 pub use host::HostCollector;
@@ -68,6 +72,8 @@ pub fn hostname() -> String {
 pub struct CollectorOpts {
     pub docker: bool,
     pub proxmox: Option<ProxmoxTarget>,
+    pub k8s: Option<K8sTarget>,
+    pub prometheus: Vec<PromTarget>,
 }
 
 impl Default for CollectorOpts {
@@ -75,6 +81,8 @@ impl Default for CollectorOpts {
         Self {
             docker: true,
             proxmox: None,
+            k8s: None,
+            prometheus: Vec::new(),
         }
     }
 }
@@ -101,6 +109,8 @@ pub fn default_collectors(opts: &CollectorOpts) -> Vec<Box<dyn Collector>> {
     out.push(Box::new(ProcessCollector::new(host.clone())));
     push_docker(&mut out, &host, opts.docker);
     push_proxmox(&mut out, opts.proxmox.as_ref());
+    push_k8s(&mut out, opts.k8s.as_ref());
+    push_prometheus(&mut out, &host, &opts.prometheus);
     out
 }
 
@@ -141,6 +151,56 @@ fn push_proxmox(out: &mut Vec<Box<dyn Collector>>, target: Option<&ProxmoxTarget
     {
         let _ = out;
         tracing::info!("proxmox collector not compiled");
+    }
+}
+
+fn push_k8s(out: &mut Vec<Box<dyn Collector>>, target: Option<&K8sTarget>) {
+    let Some(target) = target else {
+        return;
+    };
+    if target.api_url.trim().is_empty() {
+        return;
+    }
+    #[cfg(feature = "k8s")]
+    {
+        match k8s::LiveK8s::connect(target) {
+            Ok(src) => {
+                let cluster = src.cluster().to_string();
+                out.push(Box::new(K8sCollector::new(cluster, src)));
+            }
+            Err(e) => {
+                tracing::info!(error = %e, "kubernetes API unavailable; k8s collector disabled")
+            }
+        }
+    }
+    #[cfg(not(feature = "k8s"))]
+    {
+        let _ = out;
+        tracing::info!("k8s collector not compiled");
+    }
+}
+
+fn push_prometheus(out: &mut Vec<Box<dyn Collector>>, host: &str, targets: &[PromTarget]) {
+    let targets: Vec<PromTarget> = targets
+        .iter()
+        .filter(|t| !t.url.trim().is_empty() && !t.name.trim().is_empty())
+        .cloned()
+        .collect();
+    if targets.is_empty() {
+        return;
+    }
+    #[cfg(any(feature = "k8s", feature = "proxmox"))]
+    {
+        out.push(Box::new(PromCollector::new(
+            host,
+            targets,
+            prometheus::LiveProm::new(),
+        )));
+    }
+    #[cfg(not(any(feature = "k8s", feature = "proxmox")))]
+    {
+        let _ = (out, host, targets);
+        tracing::info!("prometheus scrape not compiled");
     }
 }
 
