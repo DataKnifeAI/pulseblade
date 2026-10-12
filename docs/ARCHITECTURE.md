@@ -142,6 +142,10 @@ The test fails if the summary snapshot exceeds 600 tokens, the unchanged respons
 
 The hub serves the same MCP tools as a node, plus `fleet_overview` (grouped by `role`, `cluster`, `criticality`, and host; unhealthy resources in full, the rest as counts). `action_plan`, `action_execute`, and `action_status` are forwarded to the node that owns the resource id. The node runs them through its own registry. Approve waits, deny never runs, and auto runs only when that node's tier says so.
 
+A node that stops pushing leaves its resources as last reported. The hub does not mark them disappeared. After three missed push intervals (`nodes` on `/api/v1/status`, and stale nodes on the snapshot) the fleet tile shows the host stale and one `host offline` finding stays open, with last health, recent changes, and error lines already stored for that host. The next push resolves it. On SIGTERM the node sends one last push with `shutting_down` when an upstream hub is configured; a crash does not, so it shows up as silence.
+
+Raw samples are kept about two days (a node's own `retention_hours` still bounds its local raw window). Each sample also updates a 5-minute min/max/avg bucket, and those buckets plus failures, restarts, and error lines are kept 90 days (`history_days`). The node rolls closed buckets before it pushes them. `history` returns a short downsampled series; `search` returns resource id, time, severity, a short excerpt, and a cursor. Info logs are not shipped.
+
 Packaging: [deploy/Dockerfile](../deploy/Dockerfile), [deploy/pulseblade-hub.service](../deploy/pulseblade-hub.service), [deploy/pulseblade-node.service](../deploy/pulseblade-node.service).
 
 ## Pilot

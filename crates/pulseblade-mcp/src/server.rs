@@ -14,10 +14,10 @@ use rmcp::{
 };
 
 use crate::query::{
-    self, AckParams, AckResult, ChangeSet, ChangesParams, CheckpointParams, ExplainParams,
-    Explanation, ExportParams, FindingPage, FindingsParams, FleetOverview, FleetParams, LogPage,
-    LogsParams, MetricsParams, NotePage, NoteParams, SearchParams, Series, Snapshot,
-    SnapshotParams,
+    self, AckParams, AckResult, ChangeSet, ChangesParams, CheckpointParams, EventPage,
+    EventSearchParams, ExplainParams, Explanation, ExportParams, FindingPage, FindingsParams,
+    FleetOverview, FleetParams, HistoryParams, HistorySeries, LogPage, LogsParams, MetricsParams,
+    NotePage, NoteParams, SearchParams, Series, Snapshot, SnapshotParams,
 };
 
 /// Hub action calls. The node still plans and executes against its own policy.
@@ -53,7 +53,9 @@ unhealthy resources only). Remember `as_of_seq`, or name the moment with checkpo
 changed. Continue from `next_cursor`.
 3. Drill down only on what changed or is unhealthy: resource_explain for one resource \
 (attributes, children, latest metrics, recent changes, notes, and open findings), \
-metrics_query for one metric's history (compact `values` array).
+metrics_query or history for one metric (compact `values` array). history reads raw \
+samples when they cover `since`, otherwise 5-minute buckets. search finds failures, \
+restarts, and error lines (not info logs).
 4. findings_list for open problems (detail=true adds the causal context and error lines). \
 finding_ack to acknowledge one. logs_query for recent error lines. memory_note and \
 memory_search for notes on a resource.
@@ -155,6 +157,32 @@ impl PulsebladeServer {
         params: Parameters<MetricsParams>,
     ) -> Result<Json<Series>, String> {
         self.run(move |s| query::metrics(s, params.0))
+            .await
+            .map(Json)
+    }
+
+    #[tool(
+        description = "Downsampled history for one metric of one resource since a duration (`1h`, `7d`, `90d`) or an RFC 3339 timestamp. Raw samples when that window is still stored, otherwise 5-minute buckets. `values[i]` is the bucket at `start + i * step_secs` (null where empty), at most a few hundred points.",
+        annotations(title = "Metric history", read_only_hint = true)
+    )]
+    async fn history(
+        &self,
+        params: Parameters<HistoryParams>,
+    ) -> Result<Json<HistorySeries>, String> {
+        self.run(move |s| query::history(s, params.0))
+            .await
+            .map(Json)
+    }
+
+    #[tool(
+        description = "Search failures, restarts, and error lines. Returns resource id, time, severity, and a short excerpt, newest first. Pass `cursor` from the previous page for older hits. Does not search info logs.",
+        annotations(title = "Search events", read_only_hint = true)
+    )]
+    async fn search(
+        &self,
+        params: Parameters<EventSearchParams>,
+    ) -> Result<Json<EventPage>, String> {
+        self.run(move |s| query::search(s, params.0))
             .await
             .map(Json)
     }
@@ -877,6 +905,94 @@ mod tests {
         .unwrap();
         assert!(quiet.lines.is_empty());
         assert_matches_output_schema(&server, "logs_query", quiet);
+
+        let hist = query::history(
+            &store,
+            query::HistoryParams {
+                resource: "host:h".into(),
+                metric: "cpu.used_pct".into(),
+                since: "1h".into(),
+            },
+        )
+        .unwrap();
+        assert!(hist.stats.is_some());
+        assert_matches_output_schema(&server, "history", &hist);
+        let quiet_hist = query::history(
+            &store,
+            query::HistoryParams {
+                resource: "host:h".into(),
+                metric: "cpu.used_pct".into(),
+                since: "1s".into(),
+            },
+        )
+        .unwrap();
+        assert!(quiet_hist.stats.is_none());
+        assert!(quiet_hist.start.is_none());
+        assert_matches_output_schema(&server, "history", &quiet_hist);
+
+        let found = query::search(
+            &store,
+            query::EventSearchParams {
+                text: "failed".into(),
+                since: Some("7d".into()),
+                resource: None,
+                limit: Some(1),
+                cursor: None,
+            },
+        )
+        .unwrap();
+        assert!(!found.hits.is_empty());
+        assert_matches_output_schema(&server, "search", &found);
+        let none = query::search(
+            &store,
+            query::EventSearchParams {
+                text: "zzzz-no-such-event".into(),
+                since: None,
+                resource: Some("host:h".into()),
+                limit: None,
+                cursor: None,
+            },
+        )
+        .unwrap();
+        assert!(none.hits.is_empty());
+        assert!(none.cursor.is_none());
+        assert_matches_output_schema(&server, "search", &none);
+        let bare = query::EventPage {
+            as_of_seq: store.current_seq().unwrap(),
+            hits: vec![query::EventHit {
+                resource: "host:h".into(),
+                ts: Utc::now(),
+                severity: "warning".into(),
+                excerpt: "health degraded".into(),
+                kind: None,
+            }],
+            cursor: None,
+        };
+        assert_matches_output_schema(&server, "search", &bare);
+
+        store
+            .ingest_node(
+                "h",
+                &pulseblade_store::NodeBatch {
+                    interval_secs: 15,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(store
+            .set_node_last_push("h", (Utc::now() - Duration::seconds(90)).timestamp_millis(),)
+            .unwrap());
+        let stale_snap = query::snapshot(
+            &store,
+            SnapshotParams {
+                detail: Some(query::Detail::Summary),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(stale_snap.nodes.iter().any(|n| n.node == "h" && n.stale));
+        assert!(stale_snap.nodes.iter().all(|n| !n.shutting_down));
+        assert_matches_output_schema(&server, "state_snapshot", &stale_snap);
 
         let explained = query::explain(
             &store,

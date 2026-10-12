@@ -5,12 +5,21 @@
 //! remembers the highest contiguous node seq, and never executes actions.
 
 use chrono::{DateTime, Utc};
-use pulseblade_core::{Change, ChangeKind, Resource};
+use pulseblade_core::{Change, ChangeKind, Health, LogLine, Resource, Severity};
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::history::{self, MetricBucket, StoredEvent};
+use crate::memory::FindingDraft;
 use crate::{from_ms, Store, StoreError};
+
+/// Pushes are expected about this often when a node does not say.
+pub const DEFAULT_PUSH_INTERVAL_SECS: i64 = 15;
+/// A node is stale after this many missed push intervals.
+pub const STALE_MISSED_PUSHES: i64 = 3;
+/// Finding rule for a node that stopped pushing. One open finding per host.
+pub const OFFLINE_RULE: &str = "host offline";
 
 /// One numeric sample with the timestamp the node observed it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -30,6 +39,18 @@ pub struct NodeBatch {
     pub resources: Vec<Resource>,
     #[serde(default)]
     pub samples: Vec<StampedSample>,
+    /// Closed 5-minute buckets. Raw samples in the open window stay in `samples`.
+    #[serde(default)]
+    pub buckets: Vec<MetricBucket>,
+    /// Failures, restarts, and error lines. Not a journal dump.
+    #[serde(default)]
+    pub events: Vec<StoredEvent>,
+    /// Seconds between pushes. Zero means [`DEFAULT_PUSH_INTERVAL_SECS`].
+    #[serde(default)]
+    pub interval_secs: u64,
+    /// Set on the last push before a requested shutdown. A crash leaves this false.
+    #[serde(default)]
+    pub shutting_down: bool,
 }
 
 /// Highest node journal seq and sample timestamp the hub has applied.
@@ -37,6 +58,12 @@ pub struct NodeBatch {
 pub struct NodeCursor {
     pub seq: i64,
     pub sample_ms: i64,
+    /// Highest closed bucket start the hub has stored for this node.
+    #[serde(default)]
+    pub bucket_ms: i64,
+    /// Highest node event id the hub has stored.
+    #[serde(default)]
+    pub event_id: i64,
 }
 
 /// One row of `node_cursors`: how far the hub has applied this node, and when
@@ -47,6 +74,29 @@ pub struct NodePush {
     pub node: String,
     pub seq: i64,
     pub last_push_ms: i64,
+    /// Push interval the node reported, or the default when it did not.
+    pub interval_secs: i64,
+    /// The last accepted push was marked `shutting_down`.
+    pub shutting_down: bool,
+}
+
+impl NodePush {
+    /// `(age_secs, stale)`. Stale after [`STALE_MISSED_PUSHES`] intervals, or when
+    /// the hub has never recorded a push time.
+    pub fn freshness(&self, now: DateTime<Utc>) -> (i64, bool) {
+        let interval = if self.interval_secs > 0 {
+            self.interval_secs
+        } else {
+            DEFAULT_PUSH_INTERVAL_SECS
+        };
+        if self.last_push_ms <= 0 {
+            return (STALE_MISSED_PUSHES * interval + 1, true);
+        }
+        let age = (now.timestamp_millis() - self.last_push_ms)
+            .div_euclid(1000)
+            .max(0);
+        (age, age > STALE_MISSED_PUSHES * interval)
+    }
 }
 
 /// How far the hub got after one push.
@@ -70,25 +120,41 @@ impl Store {
         let conn = self.conn();
         let row = conn
             .query_row(
-                "SELECT seq, sample_ms FROM node_cursors WHERE node_id = ?1",
+                "SELECT seq, sample_ms, bucket_ms, event_id FROM node_cursors WHERE node_id = ?1",
                 [node_id],
-                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, i64>(3)?,
+                    ))
+                },
             )
             .optional_cursor()?;
-        let (seq, sample_ms) = row.unwrap_or((0, 0));
-        Ok(NodeCursor { seq, sample_ms })
+        let (seq, sample_ms, bucket_ms, event_id) = row.unwrap_or((0, 0, 0, 0));
+        Ok(NodeCursor {
+            seq,
+            sample_ms,
+            bucket_ms,
+            event_id,
+        })
     }
 
     /// Every node that has pushed to this hub, by node id. Empty on a node.
     pub fn node_pushes(&self) -> crate::Result<Vec<NodePush>> {
         let conn = self.conn();
-        let mut stmt =
-            conn.prepare("SELECT node_id, seq, last_push_ms FROM node_cursors ORDER BY node_id")?;
+        let mut stmt = conn.prepare(
+            "SELECT node_id, seq, last_push_ms, interval_secs, shutting_down
+             FROM node_cursors ORDER BY node_id",
+        )?;
         let rows = stmt.query_map([], |r| {
             Ok(NodePush {
                 node: r.get(0)?,
                 seq: r.get(1)?,
                 last_push_ms: r.get(2)?,
+                interval_secs: r.get(3)?,
+                shutting_down: r.get::<_, i64>(4)? != 0,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -106,14 +172,21 @@ impl Store {
         changes.sort_by_key(|c| c.seq);
         let mut conn = self.conn();
         let tx = conn.transaction()?;
-        let (mut cursor, mut sample_ms) = tx
+        let (mut cursor, mut sample_ms, mut bucket_ms, mut event_id) = tx
             .query_row(
-                "SELECT seq, sample_ms FROM node_cursors WHERE node_id = ?1",
+                "SELECT seq, sample_ms, bucket_ms, event_id FROM node_cursors WHERE node_id = ?1",
                 [node_id],
-                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, i64>(3)?,
+                    ))
+                },
             )
             .optional_cursor()?
-            .unwrap_or((0, 0));
+            .unwrap_or((0, 0, 0, 0));
         let have = cursor;
         let mut applied = 0usize;
         for change in &changes {
@@ -175,6 +248,7 @@ impl Store {
         }
         for sample in batch.samples.iter().filter(|s| s.value.is_finite()) {
             let ms = sample.ts.timestamp_millis();
+            history::observe_sample(&tx, &sample.resource_id, &sample.metric, ms, sample.value)?;
             tx.execute(
                 "INSERT INTO samples (resource_id, metric, ts, value) VALUES (?1, ?2, ?3, ?4)",
                 params![sample.resource_id, sample.metric, ms, sample.value],
@@ -190,12 +264,72 @@ impl Store {
                 sample_ms = ms;
             }
         }
+        history::note_changes(&tx, &changes)?;
+        for bucket in &batch.buckets {
+            if bucket.bucket_ms > bucket_ms {
+                bucket_ms = bucket.bucket_ms;
+            }
+        }
+        // Raw samples already updated these buckets. A node bucket replaces the
+        // row only when it has at least as many samples, so the two paths do not add.
+        {
+            let mut upsert = tx.prepare(
+                "INSERT INTO sample_buckets (resource_id, metric, bucket_ms, n, vmin, vmax, vsum)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(resource_id, metric, bucket_ms) DO UPDATE SET
+                    n = excluded.n, vmin = excluded.vmin, vmax = excluded.vmax, vsum = excluded.vsum
+                 WHERE excluded.n >= sample_buckets.n",
+            )?;
+            for bucket in batch
+                .buckets
+                .iter()
+                .filter(|b| b.n > 0 && b.sum.is_finite())
+            {
+                upsert.execute(params![
+                    bucket.resource_id,
+                    bucket.metric,
+                    bucket.bucket_ms,
+                    bucket.n as i64,
+                    bucket.min,
+                    bucket.max,
+                    bucket.sum
+                ])?;
+            }
+        }
+        for event in &batch.events {
+            if event.id > event_id {
+                event_id = event.id;
+            }
+            history::store_pushed(&tx, event)?;
+        }
+        let interval = if batch.interval_secs == 0 {
+            DEFAULT_PUSH_INTERVAL_SECS
+        } else {
+            batch.interval_secs as i64
+        };
         let pushed_ms = Utc::now().timestamp_millis();
         tx.execute(
-            "INSERT INTO node_cursors (node_id, seq, sample_ms, last_push_ms) VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO node_cursors
+                (node_id, seq, sample_ms, last_push_ms, interval_secs, shutting_down, bucket_ms, event_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(node_id) DO UPDATE SET
-                seq = excluded.seq, sample_ms = excluded.sample_ms, last_push_ms = excluded.last_push_ms",
-            params![node_id, cursor, sample_ms, pushed_ms],
+                seq = excluded.seq,
+                sample_ms = excluded.sample_ms,
+                last_push_ms = excluded.last_push_ms,
+                interval_secs = excluded.interval_secs,
+                shutting_down = excluded.shutting_down,
+                bucket_ms = excluded.bucket_ms,
+                event_id = excluded.event_id",
+            params![
+                node_id,
+                cursor,
+                sample_ms,
+                pushed_ms,
+                interval,
+                i64::from(batch.shutting_down),
+                bucket_ms,
+                event_id
+            ],
         )?;
         tx.commit()?;
         Ok(IngestResult {
@@ -222,6 +356,90 @@ impl Store {
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Move the recorded push time. Silence is `now` minus several intervals.
+    pub fn set_node_last_push(&self, node_id: &str, last_push_ms: i64) -> crate::Result<bool> {
+        let n = self.conn().execute(
+            "UPDATE node_cursors SET last_push_ms = ?2 WHERE node_id = ?1",
+            params![node_id, last_push_ms],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// One open `host offline` finding per stale node. A push that is fresh again
+    /// resolves that host's finding and leaves every other finding alone.
+    /// Resources are not marked disappeared.
+    pub fn sync_offline_hosts(
+        &self,
+        now: DateTime<Utc>,
+    ) -> crate::Result<Vec<pulseblade_core::Finding>> {
+        let mut drafts = Vec::new();
+        for push in self.node_pushes()? {
+            let (age, stale) = push.freshness(now);
+            if !stale {
+                continue;
+            }
+            let host_id = format!("host:{}", push.node);
+            let health = self
+                .resource(&host_id)?
+                .map(|row| row.resource.health)
+                .unwrap_or(Health::Unknown);
+            let ids = self.host_scope(&host_id)?;
+            let context = self.recent_changes(&ids, 8)?;
+            let logs = self.host_error_lines(&ids, 5)?;
+            let summary = if push.shutting_down {
+                format!("{} shut down (last health {})", push.node, health.as_str())
+            } else {
+                format!(
+                    "{} offline (last health {}); no push for {age}s",
+                    push.node,
+                    health.as_str()
+                )
+            };
+            drafts.push(FindingDraft {
+                dedupe_key: format!("{OFFLINE_RULE}\u{0}{host_id}"),
+                resource_id: host_id,
+                rule: OFFLINE_RULE.to_string(),
+                severity: if push.shutting_down {
+                    Severity::Warning
+                } else {
+                    Severity::Critical
+                },
+                summary,
+                context,
+                logs,
+            });
+        }
+        self.reconcile_rule(OFFLINE_RULE, &drafts, now)
+    }
+
+    fn host_scope(&self, host_id: &str) -> crate::Result<Vec<String>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id FROM resources
+             WHERE present = 1 AND (id = ?1 OR parent = ?1)
+             ORDER BY id LIMIT 32",
+        )?;
+        let rows = stmt.query_map([host_id], |r| r.get::<_, String>(0))?;
+        let mut ids: Vec<String> = rows.collect::<rusqlite::Result<_>>()?;
+        if !ids.iter().any(|id| id == host_id) {
+            ids.insert(0, host_id.to_string());
+        }
+        Ok(ids)
+    }
+
+    fn host_error_lines(&self, ids: &[String], limit: usize) -> crate::Result<Vec<LogLine>> {
+        let mut logs = self.recent_logs(ids, limit)?;
+        if logs.len() < limit {
+            let more = self.error_events(ids, limit - logs.len())?;
+            for line in more {
+                if !logs.iter().any(|have| have.message == line.message) {
+                    logs.push(line);
+                }
+            }
+        }
+        Ok(logs)
     }
 
     pub fn enqueue_route(
@@ -367,6 +585,7 @@ mod tests {
                 ts: Utc::now(),
                 value: 10.0,
             }],
+            ..NodeBatch::default()
         };
         let got = store.ingest_node("web1", &first).unwrap();
         assert_eq!(got.applied, 1);
@@ -405,7 +624,7 @@ mod tests {
                 .parent("host:web1")
                 .health(Health::Failed),
             ],
-            samples: vec![],
+            ..NodeBatch::default()
         };
         let got = store.ingest_node("web1", &rest).unwrap();
         assert_eq!(got.applied, 2);
@@ -447,11 +666,148 @@ mod tests {
         assert_eq!(pushes[0].node, "web1");
         assert_eq!(pushes[0].seq, 4);
         assert_eq!(pushes[0].last_push_ms, 0);
+        assert_eq!(pushes[0].interval_secs, 15);
+        assert!(!pushes[0].shutting_down);
         drop(store);
         for suffix in ["", "-wal", "-shm"] {
             let mut sidecar = path.clone().into_os_string();
             sidecar.push(suffix);
             let _ = std::fs::remove_file(sidecar);
         }
+    }
+
+    #[test]
+    fn silence_keeps_the_host_and_one_offline_finding() {
+        use pulseblade_core::{FindingStatus, LogLine, Observation};
+
+        let store = Store::open_in_memory().unwrap();
+        let now = Utc::now();
+        store
+            .ingest_node(
+                "web1",
+                &NodeBatch {
+                    changes: vec![change(1, "host:web1", ChangeKind::Appeared)],
+                    resources: vec![Resource::new("host:web1", ResourceKind::Host, "web1")
+                        .health(Health::Degraded)],
+                    interval_secs: 15,
+                    ..NodeBatch::default()
+                },
+            )
+            .unwrap();
+        store
+            .apply(
+                "journald",
+                now,
+                &Observation {
+                    resources: vec![],
+                    samples: vec![],
+                    logs: vec![LogLine {
+                        ts: now,
+                        resource_id: "host:web1".into(),
+                        message: "link down on eth0".into(),
+                    }],
+                },
+            )
+            .unwrap();
+        store
+            .reconcile_findings(
+                &[FindingDraft {
+                    dedupe_key: "health\u{0}unit:web1:sshd".into(),
+                    resource_id: "unit:web1:sshd".into(),
+                    rule: "health".into(),
+                    severity: pulseblade_core::Severity::Warning,
+                    summary: "sshd degraded".into(),
+                    context: vec![],
+                    logs: vec![],
+                }],
+                now,
+            )
+            .unwrap();
+
+        let (age, stale) = store.node_pushes().unwrap()[0].freshness(now);
+        assert!(age < 5, "{age}");
+        assert!(!stale);
+        assert!(store.sync_offline_hosts(now).unwrap().is_empty());
+
+        let silent_at = now.timestamp_millis() - 46_000;
+        assert!(store.set_node_last_push("web1", silent_at).unwrap());
+        let opened = store.sync_offline_hosts(now).unwrap();
+        assert_eq!(opened.len(), 1);
+        assert_eq!(opened[0].rule, OFFLINE_RULE);
+        assert!(opened[0].summary.contains("last health degraded"));
+        assert!(opened[0].summary.contains("offline"));
+        assert!(opened[0].logs.iter().any(|l| l.message.contains("eth0")));
+        assert!(store.sync_offline_hosts(now).unwrap().is_empty());
+        let (open, total) = store
+            .findings(
+                &crate::FindingFilter {
+                    status: Some(FindingStatus::Open),
+                    ..Default::default()
+                },
+                10,
+            )
+            .unwrap();
+        assert_eq!(total, 2, "the health finding stays open");
+        assert_eq!(open.iter().filter(|f| f.rule == OFFLINE_RULE).count(), 1);
+        assert!(store.resource("host:web1").unwrap().unwrap().present);
+
+        store
+            .ingest_node(
+                "web1",
+                &NodeBatch {
+                    interval_secs: 15,
+                    shutting_down: false,
+                    ..NodeBatch::default()
+                },
+            )
+            .unwrap();
+        store.sync_offline_hosts(Utc::now()).unwrap();
+        let (still, _) = store
+            .findings(
+                &crate::FindingFilter {
+                    status: Some(FindingStatus::Open),
+                    resource_id: Some("host:web1".into()),
+                    ..Default::default()
+                },
+                10,
+            )
+            .unwrap();
+        assert!(still.is_empty(), "{still:?}");
+        assert!(store.resource("host:web1").unwrap().unwrap().present);
+    }
+
+    #[test]
+    fn shutting_down_is_not_a_disappearance() {
+        let store = Store::open_in_memory().unwrap();
+        let now = Utc::now();
+        store
+            .ingest_node(
+                "web1",
+                &NodeBatch {
+                    changes: vec![change(1, "host:web1", ChangeKind::Appeared)],
+                    resources: vec![
+                        Resource::new("host:web1", ResourceKind::Host, "web1").health(Health::Ok)
+                    ],
+                    interval_secs: 10,
+                    shutting_down: true,
+                    ..NodeBatch::default()
+                },
+            )
+            .unwrap();
+        let push = &store.node_pushes().unwrap()[0];
+        assert!(push.shutting_down);
+        assert!(!push.freshness(now).1);
+        store
+            .set_node_last_push("web1", now.timestamp_millis() - 31_000)
+            .unwrap();
+        let opened = store.sync_offline_hosts(now).unwrap();
+        assert_eq!(opened.len(), 1);
+        assert!(opened[0].summary.contains("shut down"));
+        assert_eq!(opened[0].severity, pulseblade_core::Severity::Warning);
+        assert!(store.resource("host:web1").unwrap().unwrap().present);
+        let (changes, _) = store
+            .changes_after(0, &crate::ChangeFilter::default(), 20)
+            .unwrap();
+        assert!(!changes.iter().any(|c| c.kind == ChangeKind::Disappeared));
     }
 }

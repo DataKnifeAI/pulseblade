@@ -30,9 +30,7 @@ const MAX_EXPORT_LINES: usize = 10_000;
 const DEFAULT_INTERVAL_SECS: u64 = 15;
 /// A collector is stale after three intervals without a pass, but never sooner than this.
 const MIN_STALE_SECS: i64 = 60;
-/// A hub node is stale when the hub has not accepted a push in this long.
-/// Nodes push about every 15s, so this is several missed pushes.
-const NODE_PUSH_STALE_SECS: i64 = 90;
+/// A hub node is stale after three missed push intervals.
 /// Host metrics included in the summary snapshot.
 const KEY_HOST_METRICS: &[&str] = &["cpu.used_pct", "mem.used_pct", "load.1m", "swap.used_pct"];
 
@@ -190,12 +188,15 @@ pub struct Status {
 }
 
 /// One node's cursor on the hub, plus whether it has stopped pushing.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct NodePushStatus {
     pub node: String,
     pub seq: i64,
     pub last_push_age_secs: i64,
     pub stale: bool,
+    /// The last push was a shutdown. Absent when the node was still running.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub shutting_down: bool,
 }
 
 /// Self-health. `process_started` is the serving process's start time, if any.
@@ -239,19 +240,21 @@ fn node_push_statuses(store: &Store, now: DateTime<Utc>) -> Result<Vec<NodePushS
 }
 
 fn node_push_status(now: DateTime<Utc>, row: &NodePush) -> NodePushStatus {
-    let age_secs = if row.last_push_ms > 0 {
-        (now.timestamp_millis() - row.last_push_ms)
-            .div_euclid(1000)
-            .max(0)
-    } else {
-        NODE_PUSH_STALE_SECS + 1
-    };
+    let (age_secs, stale) = row.freshness(now);
     NodePushStatus {
         node: row.node.clone(),
         seq: row.seq,
         last_push_age_secs: age_secs,
-        stale: age_secs > NODE_PUSH_STALE_SECS,
+        stale,
+        shutting_down: row.shutting_down,
     }
+}
+
+fn stale_nodes(store: &Store) -> Result<Vec<NodePushStatus>> {
+    Ok(node_push_statuses(store, Utc::now())?
+        .into_iter()
+        .filter(|n| n.stale)
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -359,16 +362,21 @@ pub struct Snapshot {
     pub total: Option<usize>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub truncated: bool,
+    /// Hub nodes that have missed three push intervals. Empty on a node.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nodes: Vec<NodePushStatus>,
 }
 
 pub fn snapshot(store: &Store, p: SnapshotParams) -> Result<Snapshot> {
     let as_of_seq = store.current_seq()?;
     let collectors: Vec<CollectorHealth> = collectors(store)?.iter().map(|c| c.health()).collect();
+    let nodes = stale_nodes(store)?;
     if p.if_changed_since == Some(as_of_seq) {
         return Ok(Snapshot {
             as_of_seq,
             unchanged: true,
             collectors: collectors.into_iter().filter(|c| !c.ok).collect(),
+            nodes,
             ..Default::default()
         });
     }
@@ -437,6 +445,7 @@ pub fn snapshot(store: &Store, p: SnapshotParams) -> Result<Snapshot> {
         resources,
         total: Some(total),
         truncated: total > limit,
+        nodes,
     })
 }
 
@@ -784,6 +793,203 @@ pub fn metrics(store: &Store, p: MetricsParams) -> Result<Series> {
         stats,
         values,
     })
+}
+
+// ---------------------------------------------------------------------------
+// history and search
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct HistoryParams {
+    /// Resource id, e.g. `host:web1`.
+    pub resource: String,
+    /// Metric name, e.g. `cpu.used_pct`.
+    pub metric: String,
+    /// Look-back such as `1h` or `7d`, or an RFC 3339 timestamp.
+    pub since: String,
+}
+
+/// Downsampled points. `values[i]` is the bucket at `start + i * step_secs`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct HistorySeries {
+    pub resource: String,
+    pub metric: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<DateTime<Utc>>,
+    pub step_secs: i64,
+    /// Null where a bucket in the span had no samples.
+    pub values: Vec<Option<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stats: Option<SeriesStats>,
+}
+
+pub fn history(store: &Store, p: HistoryParams) -> Result<HistorySeries> {
+    let now = Utc::now();
+    let from = match Since::parse(&p.since, now) {
+        Since::Time(t) => t,
+        Since::Seq(_) | Since::Checkpoint(_) => {
+            return Err(QueryError::Invalid(
+                "since must be a duration like 1h or 7d, or an RFC 3339 timestamp".into(),
+            ));
+        }
+    };
+    if from >= now {
+        return Err(QueryError::Invalid("since must be in the past".into()));
+    }
+    let known = store.latest(&p.resource)?;
+    if !known.contains_key(&p.metric) {
+        if store.resource(&p.resource)?.is_none() {
+            return Err(not_found_with_suggestions(store, &p.resource)?);
+        }
+        let names: Vec<_> = known.keys().cloned().collect();
+        return Err(QueryError::NotFound(format!(
+            "resource `{}` has no metric `{}`; available: {}",
+            p.resource,
+            p.metric,
+            if names.is_empty() {
+                "(none)".into()
+            } else {
+                names.join(", ")
+            }
+        )));
+    }
+    let range_ms = (now - from).num_milliseconds().max(1);
+    let min_step_ms = (range_ms / MAX_POINTS).max(1000);
+    let step_ms = (range_ms / DEFAULT_POINTS)
+        .max(sample_interval_ms(store)?)
+        .max(min_step_ms);
+    let step_ms = (step_ms + 999) / 1000 * 1000;
+    let (step_ms, buckets) = store.history_points(&p.resource, &p.metric, from, now, step_ms)?;
+    let (start, values) = match (buckets.first(), buckets.last()) {
+        (Some(first), Some(last)) => {
+            let first_ms = first.ts.timestamp_millis();
+            let n = ((last.ts.timestamp_millis() - first_ms) / step_ms + 1).max(1);
+            let mut values = vec![None; n as usize];
+            for b in &buckets {
+                let idx = ((b.ts.timestamp_millis() - first_ms) / step_ms) as usize;
+                if idx < values.len() {
+                    values[idx] = Some(round2(b.value));
+                }
+            }
+            (Some(first.ts), values)
+        }
+        _ => (None, Vec::new()),
+    };
+    let present: Vec<f64> = values.iter().flatten().copied().collect();
+    let stats = (!present.is_empty()).then(|| SeriesStats {
+        min: present.iter().copied().fold(f64::INFINITY, f64::min),
+        max: present.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        avg: round2(present.iter().sum::<f64>() / present.len() as f64),
+        last: present[present.len() - 1],
+    });
+    Ok(HistorySeries {
+        resource: p.resource,
+        metric: p.metric,
+        start,
+        step_secs: step_ms / 1000,
+        values,
+        stats,
+    })
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct EventSearchParams {
+    /// Words matched against failures, restarts, and error lines.
+    pub text: String,
+    /// Look-back such as `7d` or an RFC 3339 timestamp. Default `7d`.
+    #[serde(default)]
+    pub since: Option<String>,
+    /// Only this resource id.
+    #[serde(default)]
+    pub resource: Option<String>,
+    /// Maximum hits, newest first (default 20, max 50).
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Older page: the `cursor` from the previous response.
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct EventHit {
+    pub resource: String,
+    pub ts: DateTime<Utc>,
+    pub severity: String,
+    pub excerpt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct EventPage {
+    pub as_of_seq: i64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hits: Vec<EventHit>,
+    /// Set when more hits exist. Pass it back as `cursor`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
+const DEFAULT_SEARCH: usize = 20;
+const MAX_SEARCH: usize = 50;
+const EXCERPT_CHARS: usize = 160;
+
+pub fn search(store: &Store, p: EventSearchParams) -> Result<EventPage> {
+    let text = p.text.trim();
+    if text.is_empty() {
+        return Err(QueryError::Invalid("text is empty".into()));
+    }
+    let now = Utc::now();
+    let since = match Since::parse(p.since.as_deref().unwrap_or("7d"), now) {
+        Since::Time(t) => t,
+        Since::Seq(_) | Since::Checkpoint(_) => {
+            return Err(QueryError::Invalid(
+                "since must be a duration like 7d or an RFC 3339 timestamp".into(),
+            ));
+        }
+    };
+    let before = match p.cursor.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        None => 0,
+        Some(raw) => raw.parse::<i64>().map_err(|_| {
+            QueryError::Invalid("cursor must be the cursor from a previous search".into())
+        })?,
+    };
+    let limit = p.limit.unwrap_or(DEFAULT_SEARCH).clamp(1, MAX_SEARCH);
+    let resource = p
+        .resource
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let mut rows =
+        store.search_events(text, since.timestamp_millis(), resource, before, limit + 1)?;
+    let more = rows.len() > limit;
+    rows.truncate(limit);
+    let cursor = more
+        .then(|| rows.last().map(|row| row.id.to_string()))
+        .flatten();
+    let hits = rows
+        .into_iter()
+        .map(|row| EventHit {
+            resource: row.resource_id,
+            ts: row.ts,
+            severity: row.severity,
+            excerpt: excerpt(&row.message),
+            kind: Some(row.kind),
+        })
+        .collect();
+    Ok(EventPage {
+        as_of_seq: store.current_seq()?,
+        hits,
+        cursor,
+    })
+}
+
+fn excerpt(message: &str) -> String {
+    if message.chars().count() <= EXCERPT_CHARS {
+        return message.to_string();
+    }
+    let mut out: String = message.chars().take(EXCERPT_CHARS - 1).collect();
+    out.push('…');
+    out
 }
 
 /// Widest collection interval among collectors, so default buckets are rarely empty.
@@ -1572,6 +1778,8 @@ mod tests {
                 node: "web1".into(),
                 seq: 3,
                 last_push_ms: now.timestamp_millis(),
+                interval_secs: 15,
+                shutting_down: false,
             },
         );
         assert_eq!(fresh.node, "web1");
@@ -1585,6 +1793,8 @@ mod tests {
                 node: "web2".into(),
                 seq: 1,
                 last_push_ms: (now - Duration::seconds(120)).timestamp_millis(),
+                interval_secs: 15,
+                shutting_down: false,
             },
         );
         assert!(silent.stale);
@@ -1596,9 +1806,35 @@ mod tests {
                 node: "old".into(),
                 seq: 1,
                 last_push_ms: 0,
+                interval_secs: 15,
+                shutting_down: false,
             },
         );
         assert!(unknown.stale);
+
+        let recent = node_push_status(
+            now,
+            &NodePush {
+                node: "web3".into(),
+                seq: 2,
+                last_push_ms: (now - Duration::seconds(40)).timestamp_millis(),
+                interval_secs: 15,
+                shutting_down: false,
+            },
+        );
+        assert!(!recent.stale, "three 15s intervals have not elapsed");
+        let missed = node_push_status(
+            now,
+            &NodePush {
+                node: "web3".into(),
+                seq: 2,
+                last_push_ms: (now - Duration::seconds(46)).timestamp_millis(),
+                interval_secs: 15,
+                shutting_down: true,
+            },
+        );
+        assert!(missed.stale);
+        assert!(missed.shutting_down);
     }
 
     #[test]

@@ -53,6 +53,8 @@ pub fn router_with(
         .route("/snapshot", get(snapshot))
         .route("/resources/{*id}", get(resource))
         .route("/metrics", get(metrics))
+        .route("/history", get(history))
+        .route("/search", get(search_events))
         .route("/changes", get(changes))
         .route("/checkpoints", get(checkpoints))
         .route("/findings", get(findings))
@@ -196,6 +198,22 @@ async fn metrics(
 ) -> ApiResult {
     let Query(params) = q?;
     ok(blocking(&st, move |s| query::metrics(s, params)).await?)
+}
+
+async fn history(
+    State(st): State<AppState>,
+    q: Result<Query<query::HistoryParams>, QueryRejection>,
+) -> ApiResult {
+    let Query(params) = q?;
+    ok(blocking(&st, move |s| query::history(s, params)).await?)
+}
+
+async fn search_events(
+    State(st): State<AppState>,
+    q: Result<Query<query::EventSearchParams>, QueryRejection>,
+) -> ApiResult {
+    let Query(params) = q?;
+    ok(blocking(&st, move |s| query::search(s, params)).await?)
 }
 
 #[derive(Debug, Deserialize)]
@@ -496,7 +514,7 @@ mod tests {
                     resources: vec![
                         Resource::new("host:web1", ResourceKind::Host, "web1").health(Health::Ok)
                     ],
-                    samples: vec![],
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -602,7 +620,11 @@ mod tests {
         assert_eq!(code, StatusCode::OK);
         assert!(ctype.unwrap().starts_with("text/html"));
         assert!(html.contains("/api/v1/status"));
+        assert!(html.contains("/api/v1/history"));
+        assert!(html.contains("/api/v1/search"));
         assert!(html.contains("Overview"));
+        assert!(html.contains("Fleet"));
+        assert!(html.contains("data-theme-choice=\"light\""));
         assert!(html.contains("rel=\"icon\""));
 
         let res = app

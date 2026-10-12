@@ -10,11 +10,13 @@ use std::sync::{Mutex, MutexGuard};
 
 use chrono::{DateTime, TimeZone, Utc};
 mod actions;
+mod history;
 mod hub;
 mod memory;
 mod pilot;
 
 pub use actions::{ActionTransition, NewAction};
+pub use history::{MetricBucket, StoredEvent, BUCKET_MS, DEFAULT_HISTORY_DAYS, HUB_RAW_HOURS};
 pub use hub::{IngestResult, NodeBatch, NodeCursor, NodePush, RouteJob, StampedSample};
 pub use memory::{FindingDraft, FindingFilter};
 pub use pilot::{NewPilotRun, PilotRunRow};
@@ -190,10 +192,14 @@ CREATE TABLE IF NOT EXISTS pilot_runs (
 );
 
 CREATE TABLE IF NOT EXISTS node_cursors (
-    node_id      TEXT PRIMARY KEY,
-    seq          INTEGER NOT NULL,
-    sample_ms    INTEGER NOT NULL,
-    last_push_ms INTEGER NOT NULL DEFAULT 0
+    node_id       TEXT PRIMARY KEY,
+    seq           INTEGER NOT NULL,
+    sample_ms     INTEGER NOT NULL,
+    last_push_ms  INTEGER NOT NULL DEFAULT 0,
+    interval_secs INTEGER NOT NULL DEFAULT 15,
+    shutting_down INTEGER NOT NULL DEFAULT 0,
+    bucket_ms     INTEGER NOT NULL DEFAULT 0,
+    event_id      INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS route_rpc (
@@ -311,7 +317,8 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(SCHEMA)?;
-        ensure_last_push_column(&conn)?;
+        history::ensure_history(&conn)?;
+        ensure_cursor_columns(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
             path,
@@ -319,17 +326,25 @@ impl Store {
     }
 }
 
-/// Databases created before `last_push_ms` still have the old cursor table.
-fn ensure_last_push_column(conn: &Connection) -> Result<()> {
+/// Databases created before later cursor columns still have the old table.
+fn ensure_cursor_columns(conn: &Connection) -> Result<()> {
     let mut stmt = conn.prepare("PRAGMA table_info(node_cursors)")?;
     let names: Vec<String> = stmt
         .query_map([], |r| r.get::<_, String>(1))?
         .collect::<std::result::Result<_, _>>()?;
-    if !names.iter().any(|name| name == "last_push_ms") {
-        conn.execute(
-            "ALTER TABLE node_cursors ADD COLUMN last_push_ms INTEGER NOT NULL DEFAULT 0",
-            [],
-        )?;
+    for (name, ddl) in [
+        ("last_push_ms", "INTEGER NOT NULL DEFAULT 0"),
+        ("interval_secs", "INTEGER NOT NULL DEFAULT 15"),
+        ("shutting_down", "INTEGER NOT NULL DEFAULT 0"),
+        ("bucket_ms", "INTEGER NOT NULL DEFAULT 0"),
+        ("event_id", "INTEGER NOT NULL DEFAULT 0"),
+    ] {
+        if !names.iter().any(|have| have == name) {
+            conn.execute(
+                &format!("ALTER TABLE node_cursors ADD COLUMN {name} {ddl}"),
+                [],
+            )?;
+        }
     }
     Ok(())
 }
@@ -526,6 +541,7 @@ impl Store {
             )?;
             c.seq = tx.last_insert_rowid();
         }
+        history::note_changes(&tx, &changes)?;
 
         {
             let mut ins = tx.prepare_cached(
@@ -536,6 +552,7 @@ impl Store {
                  ON CONFLICT(resource_id, metric) DO UPDATE SET ts = excluded.ts, value = excluded.value",
             )?;
             for s in obs.samples.iter().filter(|s| s.value.is_finite()) {
+                history::observe_sample(&tx, &s.resource_id, &s.metric, ms, s.value)?;
                 ins.execute(params![s.resource_id, s.metric, ms, s.value])?;
                 latest.execute(params![s.resource_id, s.metric, ms, s.value])?;
             }
@@ -550,11 +567,9 @@ impl Store {
                 if line.resource_id.is_empty() || message.is_empty() {
                     continue;
                 }
-                ins.execute(params![
-                    line.ts.timestamp_millis(),
-                    line.resource_id,
-                    message
-                ])?;
+                let line_ms = line.ts.timestamp_millis();
+                ins.execute(params![line_ms, line.resource_id, message])?;
+                history::note_error_log(&tx, line_ms, &line.resource_id, &message)?;
             }
         }
 
@@ -770,20 +785,28 @@ impl Store {
         rows.map(|r| r?).collect()
     }
 
-    /// Drop samples older than `samples_before` and changes older than `changes_before`.
+    /// Drop raw samples older than `samples_before`, journal rows older than
+    /// `changes_before`, and buckets plus events older than `history_before`.
+    /// Buckets are not deleted with the raw samples they summarize.
     pub fn prune(
         &self,
         samples_before: DateTime<Utc>,
         changes_before: DateTime<Utc>,
+        history_before: DateTime<Utc>,
     ) -> Result<(usize, usize)> {
         let conn = self.conn();
-        let s = conn.execute(
-            "DELETE FROM samples WHERE ts < ?1",
-            [samples_before.timestamp_millis()],
-        )?;
+        let sample_ms = samples_before.timestamp_millis();
+        let history_ms = history_before.timestamp_millis();
+        let s = conn.execute("DELETE FROM samples WHERE ts < ?1", [sample_ms])?;
+        conn.execute("DELETE FROM logs WHERE ts < ?1", [sample_ms])?;
         conn.execute(
-            "DELETE FROM logs WHERE ts < ?1",
-            [samples_before.timestamp_millis()],
+            "DELETE FROM events_fts WHERE rowid IN (SELECT id FROM events WHERE ts < ?1)",
+            [history_ms],
+        )?;
+        conn.execute("DELETE FROM events WHERE ts < ?1", [history_ms])?;
+        conn.execute(
+            "DELETE FROM sample_buckets WHERE bucket_ms < ?1",
+            [history_ms],
         )?;
         let c = conn.execute(
             "DELETE FROM changes WHERE ts < ?1",

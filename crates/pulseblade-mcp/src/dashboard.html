@@ -323,7 +323,7 @@ const params = new URLSearchParams(location.search);
 const state = {
   tab: "overview", fleet: "all", win: "1h", sel: null, filter: null, churn: false, metric: params.get("metric"),
   paused: false, timer: null, interval: 15, open: {}, showOk: {}, attnAll: false,
-  changesKey: "", spark: null, sparkLoading: null, detailRecent: {}, detailFindings: {}, detailActions: {}, missing: {},
+  changesKey: "", spark: null, sparkLoading: null, searchHits: [], detailRecent: {}, detailFindings: {}, detailActions: {}, missing: {},
 };
 let D = { status: null, all: [], findings: { total: 0, findings: [] }, actions: { runs: [] }, changes: [], counts: {} };
 let byId = new Map();
@@ -460,6 +460,7 @@ function buildModel() {
       failed: own.filter((r) => r.health === "failed").length,
       degraded: own.filter((r) => r.health === "degraded").length,
       stale: !!(push && push.stale), age: push && push.last_push_age_secs,
+      shuttingDown: !!(push && push.shutting_down),
     });
     const key = m.type === "k8s" ? "k8s:" + m.cluster : m.type === "pve" ? "pve:" + m.name : "host:" + m.name;
     const g = groups.get(key) || groups.set(key, { key, type: m.type, name: m.type === "k8s" ? m.cluster : m.name, machines: [], rs: [] }).get(key);
@@ -528,7 +529,7 @@ const isChurn = (c) => (String(c.resource_id).startsWith("proc:") && c.kind !== 
 const unhealthy = () => D.all.filter(bad);
 const pending = () => ((D.actions && D.actions.runs) || []).filter((a) => a.status === "awaiting_approval");
 function staleSources() {
-  const nodes = ((D.status && D.status.nodes) || []).filter((n) => n.stale).map((n) => ({ name: n.node, id: "host:" + n.node, age: n.last_push_age_secs, what: "no push from node agent" }));
+  const nodes = ((D.status && D.status.nodes) || []).filter((n) => n.stale).map((n) => ({ name: n.node, id: "host:" + n.node, age: n.last_push_age_secs, what: n.shutting_down ? "node shut down" : "no push from node agent" }));
   const cols = ((D.status && D.status.collectors) || []).filter((c) => c.stale || !c.ok).map((c) => ({ name: c.source + " collector", id: null, age: c.age_secs, what: c.stale ? "no pass" : (c.error || "failing") }));
   return nodes.concat(cols);
 }
@@ -669,7 +670,7 @@ function machineTile(m) {
     : `<span class="num">${a.cpu_count || "?"} cpu</span>`;
   const glyph = m.type === "k8s" ? "" : ic(machineIcon(m), "", a.os ? String(a.os).replace(/^Linux \((.*)\)$/, "$1") : (m.pnode ? "Proxmox VE" : ""));
   const guests = m.type === "pve" ? `${plural(m.rs.filter((r) => r.kind === "vm").length, "VM")} · ${m.rs.filter((r) => r.id.startsWith("lxc:")).length} LXC` : "";
-  const foot = m.stale ? `<div class="tfoot">stale · last push ${ago(m.age)} ago</div>`
+  const foot = m.stale ? `<div class="tfoot">${m.shuttingDown ? "shut down" : "stale"} · last push ${ago(m.age)} ago</div>`
     : m.failed || m.degraded ? `<div class="tfoot">${[guests, issues(m)].filter(Boolean).join(" · ")}</div>`
     : `<div class="tfoot">${guests || plural(m.own.length, "resource") + " ok"}</div>`;
   return `<button type="button" class="tile ${m.stale ? "stale" : ""} ${sel ? "sel" : ""}" data-machine="${esc(m.name)}" title="${esc(a.os || "")}">
@@ -786,7 +787,7 @@ function actionsView() {
 function sparkKey(id, metric) { return id + "|" + metric + "|1h"; }
 function chartMetric(r) {
   const keys = Object.keys(r.metrics || {}).filter((k) => r.metrics[k] != null && !QUIET_METRICS.test(k));
-  if (state.metric && keys.includes(state.metric)) return state.metric.endsWith("_pct") ? state.metric : null;
+  if (state.metric && keys.includes(state.metric)) return state.metric;
   return keys.find((k) => k.endsWith("_pct")) || null;
 }
 function spark(series, metric) {
@@ -956,10 +957,12 @@ function matcher(q) {
 function searchView(q) {
   const hits = q ? D.all.filter(matcher(q)).sort((a, b) => (RANK[a.health] ?? 9) - (RANK[b.health] ?? 9) || a.id.localeCompare(b.id)) : [];
   const word = plural(hits.length, "match").replace("matchs", "matches");
+  const events = (state.searchHits || []).map((h) => `<div class="rrow" data-res="${esc(h.resource)}">${dot(h.severity === "critical" ? "failed" : "degraded")}<span class="nm">${esc(h.excerpt)}</span><span class="sm">${esc(h.severity)} · ${agoTs(h.ts)}</span></div>`).join("");
   return `${crumbs(`<span>${q ? `“${esc(q)}” · ${word}` : "Find or filter"}</span>`)}
     <div class="chips">${PRESETS.map((p) => `<button type="button" class="chip ${p === q ? "on" : ""}" data-preset="${esc(p)}">${esc(p)}</button>`).join("")}</div>
+    ${events ? `<h3>History</h3>${events}` : ""}
     ${hits.slice(0, 60).map((r) => `<div class="rrow ${bad(r) ? "u" : ""}" data-res="${esc(r.id)}">${dot(r.health)}<span class="nm">${esc(r.name)} <span class="faint">${esc(scopeText(scopeOf(r)))}</span></span><span class="sm">${esc(reason(r))}</span></div>`).join("")}
-    ${hits.length > 60 ? `<div class="faint small">+${hits.length - 60} more, keep typing</div>` : q && !hits.length ? `<div class="empty">Nothing matches.</div>` : ""}
+    ${hits.length > 60 ? `<div class="faint small">+${hits.length - 60} more, keep typing</div>` : q && !hits.length && !events ? `<div class="empty">Nothing matches.</div>` : ""}
     ${q ? "" : `<div class="faint small">Words match names and ids. Also <span class="mono">kind:disk</span>, <span class="mono">is:degraded</span>, <span class="mono">used&gt;90</span>, “over 90%”.</div>`}`;
 }
 
@@ -1086,7 +1089,14 @@ async function loadScope(key) {
   }
 }
 async function loadSearch(q) {
+  state.searchHits = [];
   if (!q) return;
+  try {
+    const page = await api("/api/v1/search?text=" + encodeURIComponent(q) + "&since=90d&limit=20");
+    state.searchHits = page.hits || [];
+  } catch (e) {
+    state.searchHits = [];
+  }
   const jobs = [];
   const explicit = q.match(/\bkind:(\w+)/);
   if (explicit) {
@@ -1135,7 +1145,7 @@ async function ensureSpark() {
   if ((state.spark && state.spark.key === key) || state.sparkLoading === key) return;
   state.sparkLoading = key;
   try {
-    const series = await api(`/api/v1/metrics?id=${encodeURIComponent(r.id)}&metric=${encodeURIComponent(metric)}&range=1h`);
+    const series = await api(`/api/v1/history?resource=${encodeURIComponent(r.id)}&metric=${encodeURIComponent(metric)}&since=1h`);
     if (state.sparkLoading !== key) return;
     state.spark = { key, series };
     if (M) renderPanel();

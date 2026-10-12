@@ -148,6 +148,7 @@ pub fn spawn_collector(
     let detect = config.detect.clone();
     let sample_retention = chrono::Duration::hours(config.retention_hours as i64);
     let change_retention = chrono::Duration::days(config.change_retention_days as i64);
+    let history_retention = chrono::Duration::days(config.history_days.max(1) as i64);
     let opts = config.collector_opts();
     std::thread::spawn(move || {
         let _lock = lock;
@@ -173,7 +174,11 @@ pub fn spawn_collector(
 
             if last_prune.elapsed() >= PRUNE_EVERY {
                 let now = Utc::now();
-                match store.prune(now - sample_retention, now - change_retention) {
+                match store.prune(
+                    now - sample_retention,
+                    now - change_retention,
+                    now - history_retention,
+                ) {
                     Ok((s, c)) => tracing::info!(samples = s, changes = c, "pruned"),
                     Err(e) => tracing::warn!(error = %e, "prune failed"),
                 }

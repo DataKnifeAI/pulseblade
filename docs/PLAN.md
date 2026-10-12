@@ -66,5 +66,12 @@ Cargo workspace, CI (`make vet`, `make test`), Makefile, license, README, archit
 
 ### Later
 
-- Cloud collectors (AWS, Azure, GCP).
-- Hub-of-hubs (a hub presenting itself as a node upstream).
+Shipped on the hub: a node that stops pushing keeps its last resources. After three missed push intervals it is stale on `/api/v1/status`, the snapshot, and the fleet tile, and one open `host offline` finding records last health, recent changes, and stored error lines. SIGTERM sends a final `shutting_down` push; a crash is silence. History keeps raw samples for about two days and 5-minute min/max/avg buckets plus an FTS index of failures, restarts, and error lines for 90 days (`history`, `search`). Info logs stay on the node.
+
+Not built, until access is sorted:
+
+- TrueNAS at <https://tn.dataknife.net/>
+- PDU at <https://192.168.8.100/>
+- iDRAC hosts `idrac01`, `idrac02`, and `idrac05`
+
+Also still later: cloud collectors (AWS, Azure, GCP) and hub-of-hubs.

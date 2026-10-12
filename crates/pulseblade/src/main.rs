@@ -230,6 +230,39 @@ fn mcp_dashboard_addr(
     }))
 }
 
+fn watch_shutdown(shutdown: CancellationToken) {
+    tokio::spawn(async move {
+        wait_for_shutdown().await;
+        tracing::info!("shutting down");
+        shutdown.cancel();
+    });
+}
+
+async fn wait_for_shutdown() {
+    let ctrl_c = tokio::signal::ctrl_c();
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+        tokio::select! {
+            result = ctrl_c => {
+                let _ = result;
+            }
+            _ = async {
+                if let Some(sig) = terminate.as_mut() {
+                    sig.recv().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = ctrl_c.await;
+    }
+}
+
 fn is_addr_in_use(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
         cause
@@ -372,12 +405,7 @@ async fn main() -> anyhow::Result<()> {
             let shutdown = CancellationToken::new();
             let collector =
                 lock.map(|lock| spawn_collector(store.clone(), &config, lock, shutdown.clone()));
-            let ctrl_c = shutdown.clone();
-            tokio::spawn(async move {
-                let _ = tokio::signal::ctrl_c().await;
-                tracing::info!("shutting down");
-                ctrl_c.cancel();
-            });
+            watch_shutdown(shutdown.clone());
             let allowed = http_allowed_hosts(&config, addr);
             let actions = action_registry(&config)?;
             let upstream =
@@ -441,12 +469,7 @@ async fn main() -> anyhow::Result<()> {
                 let http_store = store.clone();
                 let http_actions = actions.clone();
                 let http_shutdown = shutdown.clone();
-                let ctrl_c = shutdown.clone();
-                tokio::spawn(async move {
-                    let _ = tokio::signal::ctrl_c().await;
-                    tracing::info!("shutting down");
-                    ctrl_c.cancel();
-                });
+                watch_shutdown(shutdown.clone());
                 Some(tokio::spawn(async move {
                     serve_mcp_dashboard(http_store, addr, allowed, http_shutdown, http_actions)
                         .await;
@@ -490,11 +513,13 @@ async fn main() -> anyhow::Result<()> {
                 None
             };
             let shutdown = CancellationToken::new();
-            let ctrl_c = shutdown.clone();
+            watch_shutdown(shutdown.clone());
+            let maintained = shutdown.clone();
+            let maintain_store = store.clone();
+            let history_days = config.history_days;
+            let change_days = config.change_retention_days;
             tokio::spawn(async move {
-                let _ = tokio::signal::ctrl_c().await;
-                tracing::info!("shutting down");
-                ctrl_c.cancel();
+                hub::maintain(maintain_store, maintained, history_days, change_days).await;
             });
             let allowed = http_allowed_hosts(&config, listener.local_addr()?);
             let actions = action_registry(&config)?;
@@ -513,11 +538,7 @@ async fn main() -> anyhow::Result<()> {
                 run_pilot(store, pilot_cfg, url, None)
             } else {
                 let shutdown = CancellationToken::new();
-                let ctrl = shutdown.clone();
-                tokio::spawn(async move {
-                    let _ = tokio::signal::ctrl_c().await;
-                    ctrl.cancel();
-                });
+                watch_shutdown(shutdown.clone());
                 tokio::task::spawn_blocking(move || {
                     run_pilot(store, pilot_cfg, url, Some(shutdown))
                 })

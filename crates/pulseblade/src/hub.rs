@@ -195,10 +195,19 @@ pub fn batch_since(store: &Store, cursor: NodeCursor) -> Result<NodeBatch, Store
         }
     }
     let samples = store.samples_since(cursor.sample_ms, 2_000)?;
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let open = (now_ms / pulseblade_store::BUCKET_MS) * pulseblade_store::BUCKET_MS;
+    // Closed buckets only. The open window is still arriving as raw samples.
+    let buckets = store.closed_buckets_since(cursor.bucket_ms, open, 2_000)?;
+    // Error lines, failures, and restarts. Info logs stay on the node.
+    let events = store.events_after(cursor.event_id, 2_000)?;
     Ok(NodeBatch {
         changes,
         resources,
         samples,
+        buckets,
+        events,
+        ..NodeBatch::default()
     })
 }
 
@@ -288,6 +297,63 @@ pub async fn serve(
             .await?;
     }
     Ok(())
+}
+
+/// Open a `host offline` finding after three missed pushes, and keep raw samples
+/// for two days. Five-minute buckets and the event index stay for `history_days`.
+pub async fn maintain(
+    store: Arc<Store>,
+    shutdown: CancellationToken,
+    history_days: u64,
+    change_days: u64,
+) {
+    let mut tick = tokio::time::interval(Duration::from_secs(15));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut next_prune = tokio::time::Instant::now();
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            _ = tick.tick() => {
+                let checked = store.clone();
+                match tokio::task::spawn_blocking(move || checked.sync_offline_hosts(chrono::Utc::now())).await {
+                    Ok(Ok(opened)) => {
+                        for finding in opened {
+                            tracing::info!(
+                                id = %finding.id,
+                                resource = %finding.resource_id,
+                                summary = %finding.summary,
+                                "finding"
+                            );
+                        }
+                    }
+                    Ok(Err(e)) => tracing::warn!(error = %e, "offline check failed"),
+                    Err(e) => tracing::warn!(error = %e, "offline check failed"),
+                }
+                if tokio::time::Instant::now() >= next_prune {
+                    let pruned = store.clone();
+                    let history_days = history_days.max(1);
+                    let change_days = change_days.max(1);
+                    match tokio::task::spawn_blocking(move || {
+                        let now = chrono::Utc::now();
+                        pruned.prune(
+                            now - chrono::Duration::hours(pulseblade_store::HUB_RAW_HOURS),
+                            now - chrono::Duration::days(change_days as i64),
+                            now - chrono::Duration::days(history_days as i64),
+                        )
+                    })
+                    .await
+                    {
+                        Ok(Ok((samples, changes))) => {
+                            tracing::info!(samples, changes, "pruned");
+                        }
+                        Ok(Err(e)) => tracing::warn!(error = %e, "hub prune failed"),
+                        Err(e) => tracing::warn!(error = %e, "hub prune failed"),
+                    }
+                    next_prune = tokio::time::Instant::now() + Duration::from_secs(3600);
+                }
+            }
+        }
+    }
 }
 
 struct TlsListen {
@@ -381,17 +447,23 @@ async fn push(
     Json(batch): Json<NodeBatch>,
 ) -> Result<Json<IngestResult>, (StatusCode, String)> {
     let node = authorize(&hub, &headers).map_err(|s| (s, "unauthorized".into()))?;
-    let result = tokio::task::spawn_blocking(move || hub.store.ingest_node(&node, &batch))
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .map_err(|e| {
-            let code = if matches!(e, StoreError::Gap { .. }) {
-                StatusCode::CONFLICT
-            } else {
-                StatusCode::BAD_REQUEST
-            };
-            (code, e.to_string())
-        })?;
+    let result = tokio::task::spawn_blocking(move || {
+        let ingested = hub.store.ingest_node(&node, &batch)?;
+        if let Err(e) = hub.store.sync_offline_hosts(chrono::Utc::now()) {
+            tracing::warn!(error = %e, "offline finding update failed");
+        }
+        Ok(ingested)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(|e| {
+        let code = if matches!(e, StoreError::Gap { .. }) {
+            StatusCode::CONFLICT
+        } else {
+            StatusCode::BAD_REQUEST
+        };
+        (code, e.to_string())
+    })?;
     Ok(Json(result))
 }
 
@@ -503,6 +575,7 @@ pub struct HubClient {
     token: String,
     agent: ureq::Agent,
     tls: Option<Arc<rustls::ClientConfig>>,
+    interval_secs: u64,
 }
 
 impl HubClient {
@@ -515,6 +588,7 @@ impl HubClient {
                 .timeout(Duration::from_secs(40))
                 .build(),
             tls: None,
+            interval_secs: 15,
         }
     }
 
@@ -530,14 +604,28 @@ impl HubClient {
 
     pub fn push_store(&self, store: &Store) -> anyhow::Result<IngestResult> {
         let cursor = self.cursor()?;
-        let batch = batch_since(store, cursor)?;
-        if batch.changes.is_empty() && batch.samples.is_empty() {
+        let mut batch = batch_since(store, cursor)?;
+        batch.interval_secs = self.interval_secs;
+        if batch.changes.is_empty()
+            && batch.samples.is_empty()
+            && batch.buckets.is_empty()
+            && batch.events.is_empty()
+        {
             return Ok(IngestResult {
                 cursor: cursor.seq,
                 sample_ms: cursor.sample_ms,
                 applied: 0,
             });
         }
+        self.push(&batch)
+    }
+
+    /// One last push before exit. A crash never calls this, so the hub sees silence.
+    pub fn push_shutdown(&self, store: &Store) -> anyhow::Result<IngestResult> {
+        let cursor = self.cursor()?;
+        let mut batch = batch_since(store, cursor)?;
+        batch.interval_secs = self.interval_secs;
+        batch.shutting_down = true;
         self.push(&batch)
     }
 
@@ -637,6 +725,7 @@ pub fn run_upstream(
             .timeout(Duration::from_secs(poll_secs.clamp(1, 30) + 5))
             .build(),
         tls,
+        interval_secs: poll_secs.clamp(1, 60),
     };
     tracing::info!(url = %client.base, mtls = client.tls.is_some(), "pushing to hub");
     let pause = Duration::from_secs(poll_secs.clamp(1, 60));
@@ -669,6 +758,9 @@ pub fn run_upstream(
                 }
             }
         }
+    }
+    if let Err(e) = client.push_shutdown(&store) {
+        tracing::warn!(error = %e, "shutdown push failed");
     }
 }
 
@@ -1116,6 +1208,7 @@ mod tests {
             base: base.clone(),
             token: "token-web1".into(),
             agent: ureq::AgentBuilder::new().build(),
+            interval_secs: 15,
             tls: Some(
                 client_config(
                     &ca_path.display().to_string(),
@@ -1212,6 +1305,7 @@ mod tests {
             token: "token-web1".into(),
             agent,
             tls: None,
+            interval_secs: 15,
         };
         assert_eq!(authed.cursor().unwrap().seq, 0);
         let err = HubClient {

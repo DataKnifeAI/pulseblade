@@ -17,6 +17,9 @@ pub struct Config {
     pub retention_hours: u64,
     /// How long change journal entries are kept.
     pub change_retention_days: u64,
+    /// Days to keep 5-minute metric buckets and the failure/restart/error index.
+    #[serde(default = "default_history_days")]
+    pub history_days: u64,
     /// Address for the node's HTTP MCP endpoint.
     pub listen: String,
     /// When true, `pulseblade mcp` also serves the HTTP dashboard and API.
@@ -261,6 +264,7 @@ impl Default for Config {
             interval_secs: 15,
             retention_hours: 24,
             change_retention_days: 30,
+            history_days: default_history_days(),
             listen: "127.0.0.1:7171".to_string(),
             dashboard: false,
             allowed_hosts: Vec::new(),
@@ -319,6 +323,10 @@ fn xdg(var: &str, fallback: &str) -> PathBuf {
 
 pub fn default_config_path() -> PathBuf {
     xdg("XDG_CONFIG_HOME", ".config").join("pulseblade/pulseblade.toml")
+}
+
+fn default_history_days() -> u64 {
+    90
 }
 
 pub fn default_db_path() -> PathBuf {
@@ -486,6 +494,7 @@ mod tests {
         assert!(!Config::default().dashboard);
         let omitted: Config = toml::from_str("interval_secs = 30").unwrap();
         assert!(!omitted.dashboard);
+        assert_eq!(omitted.history_days, 90);
         let enabled: Config = toml::from_str("dashboard = true").unwrap();
         assert!(enabled.dashboard);
     }

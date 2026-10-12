@@ -184,6 +184,26 @@ impl Store {
         drafts: &[FindingDraft],
         now: DateTime<Utc>,
     ) -> crate::Result<Vec<Finding>> {
+        self.reconcile_filtered(drafts, now, None)
+    }
+
+    /// Same as [`reconcile_findings`](Self::reconcile_findings) for one rule.
+    /// Findings with any other rule stay as they are.
+    pub fn reconcile_rule(
+        &self,
+        rule: &str,
+        drafts: &[FindingDraft],
+        now: DateTime<Utc>,
+    ) -> crate::Result<Vec<Finding>> {
+        self.reconcile_filtered(drafts, now, Some(rule))
+    }
+
+    fn reconcile_filtered(
+        &self,
+        drafts: &[FindingDraft],
+        now: DateTime<Utc>,
+        rule: Option<&str>,
+    ) -> crate::Result<Vec<Finding>> {
         let ms = now.timestamp_millis();
         let mut conn = self.conn();
         let tx = conn.transaction()?;
@@ -191,9 +211,10 @@ impl Store {
             let mut stmt = tx.prepare(
                 "SELECT id, dedupe_key, resource_id, rule, severity, status, summary,
                         opened_at, context, logs
-                 FROM findings WHERE status IN ('open', 'acked')",
+                 FROM findings WHERE status IN ('open', 'acked')
+                   AND (?1 IS NULL OR rule = ?1)",
             )?;
-            let rows = stmt.query_map([], row_to_finding)?;
+            let rows = stmt.query_map(params![rule], row_to_finding)?;
             let mut out = Vec::new();
             for row in rows {
                 out.push(row??);
@@ -202,6 +223,9 @@ impl Store {
         };
         let mut created = Vec::new();
         for draft in drafts {
+            if rule.is_some_and(|rule| draft.rule != rule) {
+                continue;
+            }
             let context = serde_json::to_string(&draft.context)?;
             let logs = serde_json::to_string(&draft.logs)?;
             if let Some(idx) = open.iter().position(|r| r.dedupe_key == draft.dedupe_key) {
