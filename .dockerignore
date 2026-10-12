@@ -1,2 +1,8 @@
 target
 .git
+.env
+.env.*
+.buildkit-cache
+.buildkit-cache-new
+image-metadata.json
+image-digest.txt
