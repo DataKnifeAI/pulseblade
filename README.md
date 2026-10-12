@@ -130,7 +130,7 @@ The node serves a read-only, LLM-free view of the same data on its HTTP port, ne
 |------|------|
 | `/` | Built-in dashboard (one self-contained HTML page, no external assets) |
 | `/metrics` | Prometheus text exposition |
-| `/api/v1/status` | Pulseblade self-health: version, `as_of_seq`, database path and size, per-collector last run (age, duration, ok/error, consecutive failures), resource and sample counts, uptime |
+| `/api/v1/status` | Pulseblade self-health: version, `as_of_seq`, database path and size, per-collector last run (age, duration, ok/error, consecutive failures), resource and sample counts, uptime. On a hub, `nodes` lists each node's cursor, `last_push_age_secs`, and `stale` |
 | `/api/v1/snapshot` | `state_snapshot`: `detail`, `if_changed_since`, `kind`, `query`, `labels=k=v,k2=v2`, `unhealthy_only`, `limit` |
 | `/api/v1/resources/{id}` | `resource_explain` (`changes_limit`); ids may be percent-encoded or raw, e.g. `/api/v1/resources/disk:web1:/home` |
 | `/api/v1/metrics` | `metrics_query`: `id`, `metric`, `range`, `step`, `agg` |
@@ -144,20 +144,20 @@ The node serves a read-only, LLM-free view of the same data on its HTTP port, ne
 
 Errors are JSON `{"error": "..."}` with 400 for invalid input and 404 for unknown resources, metrics, checkpoints, or endpoints.
 
-![Pulseblade dashboard showing synthetic demo data for a fictional host demo-01: collector status, host CPU and memory, counts by kind, a failed backup service, a degraded disk and service, a filterable resource table, host details with a CPU sparkline, and recent changes](docs/assets/dashboard.png)
+![Overview, dark: attention strip, top problems, and one line each for Kubernetes, Proxmox, and Hosts](docs/assets/dashboard/mock4-overview-dark.png)
 
-*Synthetic demo data, not a real machine.*
+*Design reference for the page at `/`. Sample fleet, not a live machine.*
 
-The dashboard shows collector status, host key metrics, counts by kind, unhealthy resources first, open findings, recent actions, a filterable resource table, recent changes over a selectable window, and per-resource details (metrics, notes, findings, prior actions) with a sparkline of any metric. It refreshes every 15 seconds (pausable). Deep links work: `/?kind=service&q=ssh&select=unit:web1:sshd.service&metric=...`. The proposed next layout is in [docs/DASHBOARD.md](docs/DASHBOARD.md).
+The dashboard is four tabs — Overview, Fleet, Changes, and Actions — with detail in a side panel and at most one sparkline, fetched when that panel opens. It polls a summary snapshot, status, findings, and actions (not a full resource dump) and refreshes every 15 seconds (pausable). Deep links: `/?tab=overview&kind=service&q=ssh&select=unit:web1:sshd.service&metric=cpu.used_pct&theme=dark`. Layout and screenshots: [docs/DASHBOARD.md](docs/DASHBOARD.md). Kubernetes, Proxmox, Linux, and Docker marks in the page are [Simple Icons](https://simpleicons.org) paths (CC0), inlined; trademarks stay with their owners.
 
-To reproduce the screenshot, seed two hours of deterministic demo data (written through the normal store API, ending now) and serve it within a minute, before the collectors read as stale:
+Seed two hours of deterministic demo data (written through the normal store API, ending now) and serve it within a minute, before the collectors read as stale:
 
 ```bash
 cargo run -p pulseblade --example seed_demo -- /tmp/pb-demo/pb.db
 cargo run -p pulseblade -- --db /tmp/pb-demo/pb.db node --no-collect --listen 127.0.0.1:7188
-chromium --headless --hide-scrollbars --virtual-time-budget=5000 --window-size=1440,1250 \
-  --screenshot=docs/assets/dashboard.png 'http://127.0.0.1:7188/?select=host:demo-01&metric=cpu.used_pct'
 ```
+
+Open `http://127.0.0.1:7188/`.
 
 ### Remote access
 

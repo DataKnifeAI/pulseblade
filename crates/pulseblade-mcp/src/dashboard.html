@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Pulseblade</title>
+<link rel="icon" href="/favicon.ico" type="image/png">
 <script>
 (function () {
   var theme = "dark";
@@ -11,6 +12,8 @@
     var stored = localStorage.getItem("pulseblade-theme");
     if (stored === "light" || stored === "dark") theme = stored;
   } catch (e) {}
+  var q = new URLSearchParams(location.search).get("theme");
+  if (q === "light" || q === "dark") theme = q;
   document.documentElement.setAttribute("data-theme", theme);
   document.documentElement.style.colorScheme = theme;
   document.documentElement.style.backgroundColor = theme === "light" ? "#f4efe6" : "#0b1020";
@@ -19,549 +22,1263 @@
 <style>
   :root {
     color-scheme: dark;
-    --bg: #0b1020;
-    --glow-amber: rgba(240, 164, 41, .10);
-    --glow-navy: #1a2744;
-    --panel: #141c2f;
-    --panel-end: #10182a;
-    --panel2: #1c2740;
-    --line: #2c3d5c;
-    --line-soft: #24344f;
-    --text: #e8eef8;
-    --muted: #93a0b8;
-    --amber: #f0a429;
-    --amber-ink: #f6b84a;
-    --amber-dim: rgba(240, 164, 41, .16);
-    --ok: #2fcea8;
-    --ok-ink: #49e0b8;
-    --warn: #e8a317;
-    --warn-ink: #f0b429;
-    --bad: #e5484d;
-    --bad-ink: #ff7070;
-    --unknown: #7d8ba3;
-    --header: rgba(11, 16, 32, .88);
-    --hover: #1c2944;
-    --sel: #2a334c;
-    --spark: #0c1424;
-    --err-bg: #3c1820;
-    --err-fg: #ffd4d4;
-    --row-line: #1c2942;
-    --shadow: 0 1px 0 rgba(255, 255, 255, .04) inset;
-    --lane: linear-gradient(90deg, transparent, var(--amber) 20%, var(--amber) 80%, transparent);
+    --bg: #0b1020; --panel: #111a2b; --tint: #162036; --line: #24344d; --line-soft: #1a2639;
+    --text: #e6ecf6; --muted: #8995ab; --faint: #7a869e;
+    --amber: #f0a429; --amber-ink: #f6b84a; --amber-dim: rgba(240, 164, 41, .13);
+    --ok: #2fcea8; --ok-ink: #49e0b8;
+    --warn: #e8a317; --warn-ink: #f0b429; --warn-bg: rgba(232, 163, 23, .12);
+    --bad: #e5484d; --bad-ink: #ff7070; --bad-bg: rgba(229, 72, 77, .13);
+    --unknown: #6b7890; --meter: #3b4b6a; --track: #1d283f;
+    --header: rgba(11, 16, 32, .92); --hover: #172238; --sel: #1f2a42;
     --sans: "IBM Plex Sans", "Source Sans 3", ui-sans-serif, system-ui, sans-serif;
     --mono: ui-monospace, "DejaVu Sans Mono", "Noto Sans Mono", "Liberation Mono", SFMono-Regular, Menlo, Consolas, monospace;
   }
   html[data-theme="light"] {
     color-scheme: light;
-    --bg: #f4efe6;
-    --glow-amber: rgba(176, 106, 12, .14);
-    --glow-navy: #efe2cc;
-    --panel: #fffdf9;
-    --panel-end: #f7f2e8;
-    --panel2: #f0e6d6;
-    --line: #e2d5c3;
-    --line-soft: #eadfce;
-    --text: #221c16;
-    --muted: #6d645b;
-    --amber: #c47f0a;
-    --amber-ink: #8a5600;
-    --amber-dim: rgba(176, 106, 12, .16);
-    --ok: #0e7c6b;
-    --ok-ink: #0b6b5c;
-    --warn: #b86a08;
-    --warn-ink: #8a4f04;
-    --bad: #d3272d;
-    --bad-ink: #a61b22;
-    --unknown: #8a8178;
-    --header: rgba(255, 252, 247, .92);
-    --hover: #f6efe3;
-    --sel: #f8e6c6;
-    --spark: #fffaf3;
-    --err-bg: #fdeceb;
-    --err-fg: #8c1d22;
-    --row-line: #efe4d4;
-    --shadow: 0 1px 0 rgba(255, 255, 255, .7) inset, 0 1px 2px rgba(70, 48, 16, .04);
-    --lane: linear-gradient(90deg, transparent, #e0a02a 18%, #c47f0a 50%, #e0a02a 82%, transparent);
+    --bg: #f4efe6; --panel: #fffdf9; --tint: #f6efe3; --line: #e2d5c3; --line-soft: #ece2d3;
+    --text: #221c16; --muted: #5f574f; --faint: #786d61;
+    --amber: #c47f0a; --amber-ink: #8a5600; --amber-dim: rgba(176, 106, 12, .12);
+    --ok: #0e7c6b; --ok-ink: #0b6b5c;
+    --warn: #b86a08; --warn-ink: #8a4f04; --warn-bg: rgba(184, 106, 8, .10);
+    --bad: #d3272d; --bad-ink: #a61b22; --bad-bg: rgba(211, 39, 45, .08);
+    --unknown: #9a9087; --meter: #c9b99f; --track: #ece2d2;
+    --header: rgba(250, 246, 239, .94); --hover: #f7f0e4; --sel: #f8e9cf;
   }
-  html { background: var(--bg); }
+  /* three sizes: 20px numbers, 14px primary, 12px secondary */
   * { box-sizing: border-box; }
-  body {
-    margin: 0;
-    min-height: 100vh;
-    background:
-      radial-gradient(880px 380px at 88% -140px, var(--glow-amber), transparent 62%),
-      radial-gradient(1100px 480px at 8% -200px, var(--glow-navy), transparent 58%),
-      var(--bg);
-    color: var(--text);
-    font: 14px/1.4 var(--sans);
-  }
-  body::before {
-    content: "";
-    position: fixed;
-    top: 0; left: 0; right: 0;
-    height: 2px;
-    background: var(--lane);
-    z-index: 6;
-    pointer-events: none;
-  }
-  ::selection { background: var(--amber-dim); color: var(--text); }
-  header {
-    display: flex; align-items: center; gap: 10px 14px; flex-wrap: wrap;
-    padding: 10px 18px; border-bottom: 1px solid var(--line);
-    background: var(--header); position: sticky; top: 0; z-index: 4;
-    backdrop-filter: blur(10px);
-  }
-  .brand { font-weight: 700; font-size: 16px; letter-spacing: .01em; display: flex; align-items: center; gap: 8px; }
-  .brand .mark { color: var(--amber-ink); }
-  .pulse {
-    width: 9px; height: 9px; border-radius: 50%; background: var(--amber);
-    box-shadow: 0 0 8px var(--amber);
-    animation: pulse 2.2s ease-out infinite;
-  }
-  .paused .pulse { animation: none; opacity: .35; box-shadow: none; }
-  @keyframes pulse {
-    0% { box-shadow: 0 0 0 0 rgba(240, 164, 41, .55); }
-    70% { box-shadow: 0 0 0 9px rgba(240, 164, 41, 0); }
-    100% { box-shadow: 0 0 0 0 rgba(240, 164, 41, 0); }
-  }
-  @media (prefers-reduced-motion: reduce) { .pulse { animation: none; } }
-  .spacer { flex: 1; }
-  .meta { color: var(--muted); font-size: 13px; white-space: nowrap; }
-  .controls { display: flex; align-items: center; gap: 8px; }
-  button, select, input {
-    background: var(--panel2); color: var(--text); border: 1px solid var(--line);
-    border-radius: 8px; padding: 4px 10px; font: inherit; font-size: 13px;
-  }
-  button { cursor: pointer; font-weight: 600; }
-  button:hover, select:hover, input:hover { border-color: var(--amber); }
-  button:focus-visible, select:focus-visible, input:focus-visible {
-    outline: 2px solid var(--amber); outline-offset: 1px;
-  }
-  input::placeholder { color: var(--muted); }
-  .theme-switch {
-    display: inline-flex; padding: 2px; gap: 2px;
-    background: var(--panel2); border: 1px solid var(--line); border-radius: 999px;
-  }
-  .theme-switch button {
-    border: 0; background: transparent; color: var(--muted);
-    border-radius: 999px; padding: 3px 11px; line-height: 1.3;
-  }
-  .theme-switch button:hover { border-color: transparent; color: var(--text); }
-  html[data-theme="dark"] .theme-switch [data-theme-choice="dark"],
-  html[data-theme="light"] .theme-switch [data-theme-choice="light"] {
-    background: var(--amber-dim); color: var(--amber-ink);
-    box-shadow: inset 0 0 0 1px var(--amber);
-  }
-  main { padding: 14px 18px 28px; display: grid; gap: 12px; grid-template-columns: repeat(12, 1fr); }
-  section {
-    background: linear-gradient(180deg, var(--panel), var(--panel-end));
-    border: 1px solid var(--line); border-radius: 12px;
-    padding: 11px 13px; min-width: 0; box-shadow: var(--shadow);
-  }
-  section.attention { box-shadow: inset 3px 0 0 var(--warn), var(--shadow); }
-  #detail-panel.has-sel { box-shadow: inset 3px 0 0 var(--amber), var(--shadow); border-color: color-mix(in srgb, var(--amber) 55%, var(--line)); }
-  .c7, #detail-panel { align-self: start; }
-  h2 {
-    margin: 0 0 8px; font-size: 11px; text-transform: uppercase; letter-spacing: .12em;
-    color: var(--muted); font-weight: 600; display: flex; align-items: center; gap: 8px;
-  }
-  h2 .right { margin-left: auto; text-transform: none; letter-spacing: 0; font-weight: 500; font-size: 12px; }
-  .c3 { grid-column: span 3; } .c4 { grid-column: span 4; } .c5 { grid-column: span 5; } .c6 { grid-column: span 6; }
-  .c7 { grid-column: span 7; } .c8 { grid-column: span 8; } .c12 { grid-column: span 12; }
-  @media (max-width: 1100px) { .c3, .c4, .c5, .c6, .c7, .c8 { grid-column: span 12; } }
-  .kv { display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; margin: 0; }
-  .kv dt { color: var(--muted); } .kv dd { margin: 0; text-align: right; font-family: var(--mono); font-size: 12px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
-  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; vertical-align: middle; flex: none; }
-  .ok { background: var(--ok); } .degraded { background: var(--warn); } .failed { background: var(--bad); } .unknown { background: var(--unknown); }
+  [hidden] { display: none !important; }
+  html { background: var(--bg); }
+  body { margin: 0; min-height: 100vh; background: var(--bg); color: var(--text); font: 14px/1.45 var(--sans); }
+  button, select, input { background: var(--tint); color: var(--text); border: 1px solid transparent; border-radius: 8px; padding: 4px 10px; font: inherit; font-size: 12px; }
+  button { cursor: pointer; }
+  button:hover, select:hover, input:hover { border-color: var(--line); }
+  :focus-visible { outline: 2px solid var(--amber); outline-offset: 1px; }
+  input::placeholder { color: var(--faint); }
+  .mono, .num { font-family: var(--mono); font-size: 12px; font-variant-numeric: tabular-nums; }
+  .mono { overflow-wrap: anywhere; }
+  .muted { color: var(--muted); } .faint { color: var(--faint); } .small { font-size: 12px; }
   .t-ok { color: var(--ok-ink); } .t-degraded { color: var(--warn-ink); } .t-failed { color: var(--bad-ink); } .t-unknown { color: var(--muted); }
-  .row { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 8px; padding: 5px 2px; border-bottom: 1px dashed var(--line-soft); min-width: 0; }
-  .row:last-child { border-bottom: 0; }
-  .row.click:hover { background: var(--hover); border-radius: 6px; }
-  #unhealthy .row {
-    display: grid;
-    grid-template-columns: auto 4.75rem minmax(0, 22rem) minmax(0, 1fr);
-    align-items: center;
-    justify-items: start;
-    column-gap: 12px;
-  }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--unknown); }
+  .dot.ok { background: var(--ok); opacity: .65; } .dot.degraded { background: var(--warn); } .dot.failed { background: var(--bad); }
+  .linkish { background: none; border: 0; padding: 0; color: var(--amber-ink); font-size: 12px; }
+  .linkish:hover { text-decoration: underline; border: 0; }
+
+  header { position: sticky; top: 0; z-index: 5; background: var(--header); backdrop-filter: blur(10px); border-bottom: 1px solid var(--line-soft); }
+  .bar { display: flex; align-items: center; gap: 10px 14px; flex-wrap: wrap; padding: 10px 24px 0; max-width: 1480px; margin: 0 auto; }
+  .brand { font-weight: 700; display: flex; align-items: center; gap: 8px; }
+  .brand .mark { color: var(--amber-ink); }
+  .live { width: 18px; height: 18px; padding: 0; border: 0; background: none; display: grid; place-items: center; }
+  .mockbadge { font: 600 10px var(--mono); letter-spacing: .08em; color: var(--amber-ink); border: 1px dashed var(--amber); border-radius: 6px; padding: 1px 5px; }
+  .spacer { flex: 1; }
+  #q { width: 260px; }
+  .seg { display: inline-flex; padding: 2px; gap: 2px; background: var(--tint); border-radius: 999px; }
+  .seg button { border: 0; background: transparent; color: var(--muted); border-radius: 999px; padding: 3px 10px; }
+  .seg button[aria-pressed="true"] { background: var(--amber-dim); color: var(--amber-ink); }
+  .tabs { display: flex; gap: 22px; padding: 4px 24px 0; max-width: 1480px; margin: 0 auto; overflow-x: auto; scrollbar-width: none; }
+  .tab { display: inline-flex; align-items: center; gap: 7px; background: none; border: 0; border-bottom: 2px solid transparent; border-radius: 0;
+    padding: 9px 0 8px; font-size: 14px; color: var(--muted); white-space: nowrap; }
+  .tab:hover { color: var(--text); border-color: transparent; border-bottom-color: var(--line); }
+  .tab[aria-selected="true"] { color: var(--text); border-bottom-color: var(--amber); }
+  .badge { font: 600 12px/1 var(--mono); padding: 3px 7px; border-radius: 999px; background: var(--tint); color: var(--faint); }
+  .badge.bad { background: var(--bad-bg); color: var(--bad-ink); } .badge.warn { background: var(--warn-bg); color: var(--warn-ink); }
   @media (max-width: 720px) {
-    #unhealthy .row { grid-template-columns: auto 4.75rem minmax(0, 1fr); }
-    #unhealthy .muted { grid-column: 1 / -1; padding-left: 1.4rem; }
+    .bar { padding: 8px 14px 0; gap: 8px; }
+    #q { order: 9; width: 100%; }
+    .tabs { padding: 2px 14px 0; gap: 14px; }
+    .tab { font-size: 13px; gap: 5px; }
   }
-  #unhealthy .spacer { display: none; }
-  .row.health-failed, .row.health-degraded { border-bottom-style: solid; border-radius: 6px; padding-left: 8px; margin: 2px 0; }
-  .row.health-failed { background: rgba(229, 72, 77, .10); border-color: rgba(229, 72, 77, .28); }
-  .row.health-degraded { background: rgba(232, 163, 23, .10); border-color: rgba(232, 163, 23, .28); }
-  html[data-theme="light"] .row.health-failed { background: rgba(211, 39, 45, .08); border-color: rgba(166, 27, 34, .22); }
-  html[data-theme="light"] .row.health-degraded { background: rgba(184, 106, 8, .10); border-color: rgba(138, 79, 4, .22); }
-  .num { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 12px; }
-  .bar { height: 6px; background: var(--panel2); border-radius: 99px; overflow: hidden; margin-top: 3px; }
-  .bar > i { display: block; height: 100%; background: var(--ok); border-radius: inherit; }
-  .metric { margin-bottom: 7px; }
-  .lbl { display: flex; justify-content: space-between; gap: 8px; color: var(--muted); }
-  .lbl b { color: var(--text); font-weight: 600; font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 12px; }
-  table { width: 100%; border-collapse: collapse; }
-  th { text-align: left; color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: .08em;
-    padding: 4px 8px 6px; border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--panel); }
-  td { padding: 5px 8px; border-bottom: 1px solid var(--row-line); vertical-align: top; }
-  tbody tr.click { cursor: pointer; } tbody tr.click:hover { background: var(--hover); }
-  tr.sel { background: var(--sel) !important; box-shadow: inset 3px 0 0 var(--amber); }
-  .scroll { max-height: 420px; overflow: auto; scrollbar-color: var(--line) transparent; }
-  .mono { font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; }
-  .muted { color: var(--muted); }
-  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
-  .chip { background: var(--panel2); border: 1px solid var(--line); border-radius: 999px; padding: 2px 9px; cursor: pointer; font-size: 12px; }
-  .chip:hover { border-color: var(--amber); }
-  .chip.on { border-color: var(--amber); color: var(--amber-ink); background: var(--amber-dim); }
-  .chip b { font-family: var(--mono); font-weight: 600; }
-  .counts td.num { text-align: right; }
-  .err { background: var(--err-bg); border: 1px solid var(--bad); color: var(--err-fg); padding: 8px 12px; border-radius: 8px; grid-column: span 12; }
-  .empty { color: var(--muted); padding: 6px 0; }
-  .filters { display: flex; gap: 8px; margin-bottom: 8px; } .filters input { flex: 1; min-width: 0; }
-  svg.spark { width: 100%; height: 120px; display: block; background: var(--spark); border: 1px solid var(--line); border-radius: 8px; }
-  .chg-changed { color: var(--amber-ink); } .chg-appeared { color: var(--ok-ink); } .chg-disappeared { color: var(--bad-ink); }
-  #detail .row b.mono { font-size: 13px; }
-  #detail .kv { grid-template-columns: auto auto; justify-content: start; column-gap: 18px; }
-  #detail .kv dd { text-align: left; }
+
+  .layout { max-width: 980px; margin: 0 auto; padding: 22px 24px 28px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 22px; align-items: start; }
+  .layout.open { max-width: 1480px; grid-template-columns: minmax(0, 1fr) 430px; }
+  .view { display: grid; gap: 18px; min-width: 0; align-content: start; }
+  .card { background: var(--panel); border-radius: 14px; padding: 16px 18px; min-width: 0; }
+  h2 { margin: 0 0 10px; font-size: 12px; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); display: flex; align-items: center; gap: 10px; }
+  h2 .right { margin-left: auto; text-transform: none; letter-spacing: 0; font-weight: 500; display: flex; gap: 8px; align-items: center; }
+  h3 { margin: 18px 0 6px; font-size: 12px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+  .empty { color: var(--muted); padding: 2px 0; }
+
+  .stats { display: flex; flex-wrap: wrap; gap: 8px 30px; padding: 0 2px; }
+  .stat { display: flex; align-items: baseline; gap: 8px; background: none; border: 0; border-radius: 0; padding: 2px 0; color: var(--muted); border-bottom: 2px solid transparent; }
+  .stat b { font: 600 20px/1 var(--mono); color: var(--faint); }
+  .stat.bad b { color: var(--bad-ink); } .stat.warn b { color: var(--warn-ink); }
+  .stat.bad, .stat.warn { color: var(--text); }
+  .stat:disabled { cursor: default; }
+  .stat.on { border-bottom-color: var(--amber); }
+  .stat:not(:disabled):hover { border-color: transparent; border-bottom-color: var(--line); }
+
+  .item { display: grid; grid-template-columns: 10px minmax(0, 1.3fr) minmax(0, 1fr) minmax(0, 9rem) 3rem; gap: 2px 14px; align-items: center;
+    padding: 9px 8px; margin: 0 -8px; border-radius: 10px; cursor: pointer; }
+  .item:hover { background: var(--hover); }
+  .item.sel { background: var(--sel); }
+  .item .what b { font-weight: 600; }
+  .item .what .sub { display: block; font-size: 12px; color: var(--muted); }
+  .item .what .sub em { font-style: normal; color: var(--amber-ink); }
+  .item .why { font-family: var(--mono); font-size: 12px; }
+  .item .where { font-size: 12px; color: var(--muted); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .item .since { text-align: right; font-size: 12px; color: var(--faint); }
+  @media (max-width: 720px) {
+    .item { grid-template-columns: 10px minmax(0, 1fr) auto; }
+    .item .why, .item .where { grid-column: 2 / 4; }
+    .item .since { grid-row: 1; grid-column: 3; }
+  }
+  .sline { width: 100%; display: flex; align-items: center; gap: 10px; background: none; border: 0; border-radius: 10px; padding: 10px 8px; margin: 0 -8px; width: calc(100% + 16px); text-align: left; font-size: 14px; color: var(--text); }
+  .sline:hover { background: var(--hover); border-color: transparent; }
+  .sline .muted { font-size: 12px; }
+  .sline .right { margin-left: auto; font-size: 12px; }
+  .sline .go { color: var(--faint); }
+
+  .subnav { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .group { padding: 4px 0; }
+  .group + .group { margin-top: 6px; }
+  .ghead { display: flex; align-items: center; gap: 8px; }
+  .gline { flex: 1; min-width: 0; display: flex; align-items: center; gap: 4px 10px; flex-wrap: wrap; background: none; border: 0; border-radius: 8px; padding: 6px 4px; text-align: left; font-size: 14px; color: var(--text); }
+  .gline:hover { background: var(--hover); border-color: transparent; }
+  .gline .caret { width: 10px; color: var(--faint); font-size: 10px; }
+  .gline b { font-family: var(--mono); font-weight: 600; }
+  .gline .gsum { color: var(--muted); font-size: 12px; }
+  .gline .giss { margin-left: auto; font-size: 12px; white-space: nowrap; }
+  .gbody { padding: 8px 0 6px 22px; display: grid; gap: 10px; }
+  .gnote { font-size: 12px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 4px 16px; }
+  .gnote b { font-family: var(--mono); color: var(--text); font-weight: 600; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(196px, 1fr)); gap: 10px; }
+  .tile { text-align: left; display: grid; gap: 5px; padding: 10px 12px; border-radius: 10px; background: var(--tint); border: 1px solid transparent; color: var(--text); }
+  .tile:hover { border-color: var(--line); }
+  .tile.sel { border-color: var(--amber); }
+  .tile.stale { opacity: .6; }
+  .tname { display: flex; align-items: center; gap: 8px; min-width: 0; }
+  .tname b { font-family: var(--mono); font-size: 12px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tname .num { margin-left: auto; color: var(--faint); white-space: nowrap; }
+  .meter { display: grid; grid-template-columns: 2.4rem 1fr 2.6rem; align-items: center; gap: 6px; font-size: 12px; color: var(--faint); }
+  .meter .num { text-align: right; color: var(--muted); }
+  .meter .num.hot { color: var(--text); font-weight: 600; }
+  .track { height: 3px; background: var(--track); border-radius: 9px; overflow: hidden; }
+  .track > i { display: block; height: 100%; background: var(--meter); border-radius: inherit; }
+  .track > i.warn { background: var(--warn); } .track > i.bad { background: var(--bad); }
+  .tfoot { font-size: 12px; color: var(--faint); }
+  @media (max-width: 720px) {
+    .gbody { padding-left: 0; }
+    .tiles { grid-template-columns: minmax(0, 1fr); gap: 6px; }
+    .tile { grid-template-columns: repeat(3, minmax(0, 1fr)); column-gap: 10px; }
+    .tile .tname, .tile .tfoot { grid-column: 1 / -1; }
+    .meter { grid-template-columns: auto minmax(0, 1fr) auto; gap: 4px; }
+  }
+
+  .feed .ch { display: grid; grid-template-columns: 3rem 10px minmax(0, 1fr) minmax(0, 9rem); gap: 2px 12px; align-items: baseline; padding: 7px 8px; margin: 0 -8px; border-radius: 8px; cursor: pointer; }
+  .feed .ch:hover { background: var(--hover); }
+  .feed .ch .dot { align-self: center; }
+  .feed .ch .where { font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .feed .ch .what .small { color: var(--muted); }
+  .feed .day { font-size: 12px; color: var(--faint); padding: 10px 0 2px; }
+  @media (max-width: 720px) { .feed .ch { grid-template-columns: 3rem 10px minmax(0, 1fr); } .feed .ch .where { grid-column: 3; } }
+  .note { font-size: 12px; color: var(--muted); padding-top: 8px; }
+
+  .appr { display: grid; gap: 6px; padding: 14px 16px; border-radius: 12px; background: var(--tint); }
+  .appr + .appr { margin-top: 10px; }
+  .appr .top { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+  .appr .top b { font-family: var(--mono); }
+  .appr .top .right { margin-left: auto; font-size: 12px; color: var(--amber-ink); }
+  .run { display: grid; grid-template-columns: 10px 6.5rem minmax(0, 1fr) minmax(0, 1fr) 3rem; gap: 2px 12px; align-items: baseline; padding: 7px 8px; margin: 0 -8px; border-radius: 8px; cursor: pointer; font-size: 14px; }
+  .run:hover { background: var(--hover); }
+  .run .dot { align-self: center; }
+  .run .st { font-size: 12px; color: var(--muted); }
+  @media (max-width: 720px) { .run { grid-template-columns: 10px minmax(0, 1fr) auto; } .run .st { grid-column: 2; grid-row: 2; } .run .tgt { grid-column: 2 / 4; } }
+
+  #panel { position: sticky; top: 104px; max-height: calc(100vh - 118px); overflow: auto; scrollbar-color: var(--line) transparent; }
+  @media (max-width: 700px) {
+    .layout.open { grid-template-columns: minmax(0, 1fr); }
+    #panel:not([hidden]) { position: fixed; inset: 0; z-index: 8; max-height: none; border-radius: 0; }
+  }
+  .crumb { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); flex-wrap: wrap; margin-bottom: 8px; }
+  .crumb button { background: none; border: 0; padding: 0; color: var(--amber-ink); }
+  .crumb .x { margin-left: auto; background: var(--tint); padding: 2px 10px; color: var(--muted); border-radius: 6px; }
+  .ititle { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .ititle b { font-family: var(--mono); font-size: 14px; }
+  .facts { color: var(--muted); font-size: 12px; margin: 4px 0 10px; }
+  .why-line { font-family: var(--mono); font-size: 12px; margin: 4px 0 10px; }
+  .callout { border-radius: 10px; padding: 10px 12px; margin: 10px 0; background: var(--tint); }
+  .callout .lbl { font-size: 12px; font-weight: 600; }
+  .callout.finding .lbl { color: var(--bad-ink); } .callout.approval .lbl { color: var(--amber-ink); }
+  .callout .muted { font-size: 12px; }
+  .callout pre { margin: 6px 0 0; font: 12px/1.45 var(--mono); white-space: pre-wrap; color: var(--muted); }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+  .chip { background: var(--tint); border-radius: 999px; padding: 2px 10px; font-size: 12px; color: var(--muted); }
+  .chip b { font-family: var(--mono); font-weight: 600; color: var(--text); }
+  .chip.on { background: var(--amber-dim); color: var(--amber-ink); }
+  svg.spark { width: 100%; height: 64px; display: block; }
+  .sparkmeta { display: flex; justify-content: space-between; color: var(--muted); font-size: 12px; }
+  .kind > button { width: 100%; display: flex; align-items: center; gap: 8px; background: none; border: 0; border-radius: 6px; padding: 6px 2px; text-align: left; font-size: 14px; color: var(--text); }
+  .kind > button:hover { background: var(--hover); border-color: transparent; }
+  .kind > button .caret { width: 10px; color: var(--faint); font-size: 10px; }
+  .kind > button .cnt { font-family: var(--mono); font-size: 12px; color: var(--faint); }
+  .kind > button .st { margin-left: auto; font-size: 12px; white-space: nowrap; }
+  .kind .body { padding: 0 0 6px 18px; }
+  .kind .kind > button { padding: 3px 2px; font-family: var(--mono); font-size: 12px; min-width: 0; }
+  .rrow { display: grid; grid-template-columns: 8px minmax(0, 1fr) auto; gap: 8px; align-items: center; padding: 3px 4px; border-radius: 6px; cursor: pointer; }
+  .rrow:hover { background: var(--hover); }
+  .rrow.sel { background: var(--sel); }
+  .rrow .nm { font-family: var(--mono); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .rrow .sm { font-family: var(--mono); font-size: 12px; color: var(--muted); white-space: nowrap; }
+  .rrow.u .nm { font-weight: 600; }
+  .kv { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 2px 14px; margin: 0; font-size: 12px; }
+  .kv dt { color: var(--muted); } .kv dd { margin: 0; font-family: var(--mono); overflow-wrap: anywhere; }
+
+  footer { max-width: 1480px; margin: 0 auto; padding: 6px 24px 26px; color: var(--faint); font-size: 12px; display: flex; flex-wrap: wrap; align-items: center; gap: 6px 16px; }
+  footer select { padding: 1px 6px; color: var(--muted); }
+  footer .t-degraded { color: var(--warn-ink); }
+  :root {
+    --fx-ring: rgba(240, 164, 41, .10); --fx-grid: rgba(130, 160, 210, .06); --fx-arc: rgba(240, 164, 41, .16);
+  }
+  html[data-theme="light"] {
+    --mk-tile: #fffdf9; --mk-edge: #e2d5c3; --mk-tower: #e6d8c3; --mk-tedge: #cdb998; --mk-arc: #c47f0a; --mk-head: #e09a1c; --mk-light: #0e7c6b;
+    --fx-ring: rgba(150, 95, 20, .10); --fx-grid: rgba(120, 90, 50, .07); --fx-arc: rgba(196, 127, 10, .18);
+  }
+  .bgfx { position: absolute; top: 0; left: 0; width: 100%; height: 560px; z-index: 0; pointer-events: none;
+    -webkit-mask-image: linear-gradient(#000 30%, transparent); mask-image: linear-gradient(#000 30%, transparent); }
+  .layout, footer { position: relative; z-index: 1; }
+  .ic { width: 14px; height: 14px; flex: none; fill: currentColor; color: var(--faint); vertical-align: -2px; }
+  .ic.lg { width: 16px; height: 16px; color: var(--muted); }
+  .ln { fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+  .ic.sm { width: 12px; height: 12px; vertical-align: -1px; margin-right: 5px; }
+  .logo { width: 26px; height: 26px; display: block; }
+  .live svg { width: 18px; height: 18px; display: block; overflow: visible; }
+  .live .trk { fill: none; stroke: var(--line); stroke-width: 2; }
+  .live .arc { fill: none; stroke: var(--amber); stroke-width: 2.4; stroke-linecap: round; transform-origin: 10px 10px; }
+  .live .core { fill: var(--ok); transition: fill .3s; }
+  header[data-health="degraded"] .live .core { fill: var(--warn); } header[data-health="failed"] .live .core { fill: var(--bad); }
+  .paused .live .arc { stroke: var(--faint); } .paused .live .core { fill: var(--faint); }
+  .sweep .live .arc { animation: spin 1.2s cubic-bezier(.3, .6, .3, 1); }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  header::after { content: ""; position: absolute; left: 0; bottom: -1px; height: 1px; width: 32%; opacity: 0;
+    background: linear-gradient(90deg, transparent, var(--amber), transparent); }
+  header.sweep::after { animation: sweep 1.4s ease-out; }
+  @keyframes sweep { 0% { transform: translateX(-100%); opacity: 0; } 15% { opacity: .9; } 100% { transform: translateX(320%); opacity: 0; } }
+  #panel:not([hidden]) { animation: slide .22s ease-out; }
+  @keyframes slide { from { transform: translateX(14px); opacity: 0; } }
+  .calm { display: flex; align-items: center; gap: 22px; padding: 22px 24px;
+    background: radial-gradient(120% 160% at 0% 50%, color-mix(in srgb, var(--ok) 9%, transparent), transparent 60%), var(--panel); }
+  .calmart { position: relative; width: 72px; height: 72px; flex: none; display: grid; place-items: center; --mk-arc: var(--ok); --mk-head: var(--ok-ink); }
+  .calmart svg { width: 60px; height: 60px; position: relative; }
+  .calmart i { position: absolute; inset: 6px; border-radius: 22px; border: 1px solid var(--ok); opacity: 0; animation: ring 4.5s ease-out infinite; }
+  .calmart i + i { animation-delay: 2.25s; }
+  @keyframes ring { 0% { transform: scale(.9); opacity: .45; } 100% { transform: scale(1.45); opacity: 0; } }
+  .calm .big { font-size: 20px; font-weight: 600; color: var(--text); }
+  .calm .scopesline { display: flex; flex-wrap: wrap; gap: 4px 16px; margin-top: 6px; font-size: 12px; color: var(--muted); }
+  .calm .scopesline span { display: inline-flex; align-items: center; gap: 6px; }
+  footer .logo { width: 14px; height: 14px; display: inline-block; vertical-align: -2px; margin-right: 6px; }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation: none !important; transition: none !important; }
+    .calmart i { opacity: .25; transform: scale(1.15); }
+  }
+
+  html[data-theme="dark"] .mark-light { display: none; }
+  html[data-theme="light"] .mark-dark { display: none; }
+  .err { background: var(--bad-bg); color: var(--bad-ink); border-radius: 10px; padding: 8px 12px; }
 </style>
 </head>
 <body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs><symbol id="pb-mark" viewBox="0 0 64 64"><rect x="1" y="1" width="62" height="62" rx="14" fill="var(--mk-tile,#0b1020)" stroke="var(--mk-edge,#24344d)" stroke-width="2"/><rect x="25.5" y="16" width="13" height="32" rx="2" fill="var(--mk-tower,#1c2a45)" stroke="var(--mk-tedge,#2c3f62)" stroke-width="1.5"/><circle cx="32" cy="23" r="2.6" fill="var(--mk-light,#2fcea8)"/><g fill="none" stroke="var(--mk-arc,#f0a429)" stroke-width="4.5" stroke-linecap="round"><path d="M21.5 50.2A21 21 0 0 1 11.3 28.4" opacity=".38"/><path d="M11.3 28.4A21 21 0 1 1 48.1 45.5"/></g><circle cx="48.1" cy="45.5" r="4" fill="var(--mk-head,#ffd27a)"/></symbol><symbol id="i-k8s" viewBox="0 0 48 48"><path d="m20 29h0l-2 5a10 10 0 0 1-4-6l5-1h0a1 1 0 0 1 1 2zm-1-5a1 1 0 0 0 0-1h0l-4-4a10 10 0 0 0-1 7l5-2h0zm2-4a1 1 0 0 0 1 0h0l1-5a10 10 0 0 0-6 2l4 3h0zm2 6l1 1l1-1l1-2l-1-1h-2l-1 1l1 2zm3-6a1 1 0 0 0 1 0h0l4-3a10 10 0 0 0-6-2l1 5h0zm21 12l-11 14a3 3 0 0 1-3 1h-18a3 3 0 0 1-3-1l-11-14a3 3 0 0 1-1-3l4-18c0-1 1-2 2-2l17-8a3 3 0 0 1 2 0l17 8c1 0 2 1 2 2l4 18c0 1 0 2-1 3zm-6-4c0 0 0 0-1 0c0-1 0-1-1-1c0 0-1 0-1 0c-1 0-1 0-1 0h0a13 13 0 0 0 0-5a13 13 0 0 0-2-4c0 0 0-1 0-1c0 0 0 0 0 0c1-1 1-1 2-1c0 0 0-1 1-1c0 0 0 0 0 0c0 0 0-1 0-1c0-1-1-1-1-1c0 1-1 1-1 1c0 0 0 0 0 0c-1 1-1 1-2 2c0 0 0 0 0 0h-1a13 13 0 0 0-8-4v-1c0 0 0 0 0 0c0-1 0-1 0-2c0 0 0 0 0-1c0 0 0 0 0 0c0-1 0-1-1-1c-1 0-1 0-1 1h0c0 0 0 0 0 0c0 1 0 1 0 1c0 1 0 1 0 2a1 1 0 0 1 0 0v1a13 13 0 0 0-8 4a17 17 0 0 1-1 0c0 0 0 0 0 0c-1-1-1-1-2-2c0 0 0 0 0 0c0 0-1 0-1 0a1 1 0 0 0 0-1a1 1 0 0 0-1 1c0 0 0 1 0 1h0h0c1 0 1 1 1 1c1 0 1 0 2 1c0 0 0 0 0 0v1a13 13 0 0 0-2 9h0c0 0-1 0-1 0c0 0-1 0-1 0c-1 1-1 1-1 1c-1 0-1 0-1 0h0h0c0 0-1 0-1 1c1 0 1 1 2 1h0h0h0c0-1 1-1 1-1c1 0 1 0 2 0c0 0 0 0 0 0h1a13 13 0 0 0 5 7h0c0 1 0 1 0 1c0 0 0 1-1 2c0 0 0 0 0 0c0 0 0 1 0 1c-1 0 0 1 0 1c1 0 1 0 2 0h0c0-1 0-1 0-1c0 0 0 0 0-1c0 0 0-1 1-1c0-1 0-1 0-1h0a13 13 0 0 0 10 0h0c0 0 0 0 0 1c1 0 1 1 1 1c0 1 0 1 0 1c0 0 0 0 0 1c1 0 1 0 2 0c0 0 1-1 0-1c0 0 0-1 0-1c0 0 0 0 0 0c-1-1-1-1-1-2c0 0 0 0 0-1c0 0 0 0 0 0a13 13 0 0 0 5-7c0 0 1 0 1 0c0 0 0 0 0 0c1 0 1 0 2 0c0 0 1 0 1 1c0 0 0 0 0 0h0h0c1 0 1-1 2-1c0-1-1-1-1-1zm-8-9l-4 4h0a1 1 0 0 0 0 1h0l5 2a10 10 0 0 0 0-3a10 10 0 0 0-1-4zm-8 11a1 1 0 0 0-1 0a1 1 0 0 0-1 0h0l-2 5a10 10 0 0 0 6 0l-2-5h0zm4-3a1 1 0 0 0-1 1a1 1 0 0 0 0 1h0l2 5a10 10 0 0 0 4-6l-5-1h0z"/></symbol><symbol id="i-pve" viewBox="0 0 48 48"><path d="m10 4c-2 1-2 1 0 3c11 13 14 16 14 16c0 0 16-17 16-18c0 0 0 0-1-1c-1-1-2-1-3-1c-4 0-5 1-9 5c-1 2-3 4-3 4c0 0-1-2-3-4s-4-4-5-4c-1-1-5-1-6 0zm-7 5c-2 0-3 1-3 1c0 1 3 4 6 7c3 4 6 7 6 7c0 0-3 3-6 7c-3 3-6 6-6 7c0 1 3 2 5 2c4 0 4-1 11-9c4-4 7-7 7-7c0 0-3-3-7-7c-4-5-6-8-7-8c-2-1-5-1-6 0zm37 0c-1 0-4 3-8 8c-4 4-7 7-7 7c0 0 3 3 7 7c7 8 8 9 11 9c2 0 5-1 5-2c0-1-3-4-6-7c-3-4-6-7-6-7c0 0 3-3 6-7c3-3 6-6 6-7c0 0-3-2-5-2c-2 0-2 0-3 1zm-24 25c-4 5-8 9-8 9c0 0 0 0 1 1c1 1 2 1 3 1c4 0 5-1 9-5c2-2 3-4 3-4s2 2 3 4c4 4 5 5 9 5c1 0 2 0 3-1c1-1 1-1 1-1c0-1-16-18-16-18c0 0-4 4-8 9z"/></symbol><symbol id="i-linux" viewBox="0 0 48 48"><path d="m25 0c0 0-1 0-1 0c-8 1-6 10-6 13c0 2-1 4-2 6c-2 2-5 5-6 9c0 1-1 3 0 5a1 1 0 0 0-1 0c0 1-1 1-1 2c0 0-1 0-2 0c0 1-1 1-1 2c0 0-1 1-1 1c0 0 1 1 1 1c0 1 0 2 0 2c-1 1-1 2-1 3c1 1 2 1 2 1c2 1 4 0 6 1c2 1 4 2 5 1c1 0 2-1 3-2c1 0 2 0 4 0c1 0 3 0 5 0c0 0 0 1 0 1h0c1 1 3 2 4 2c2 0 3-1 5-3c1-1 3-2 4-3c1 0 2-1 2-1c0-1-1-2-2-3h0h0c0-1 0-1 0-2c-1-1-1-2-1-2h0c0 0-1 0-1-1a1 1 0 0 0 0 0c1-2 0-5 0-7c-2-3-3-5-5-7c-1-2-3-4-3-7c0-4 1-12-7-12zm1 7h0c1 0 1 0 1 0c1 0 1 1 1 1c0 1 0 1 0 2c0 0 0 0 0 0h0a0 0 0 0 1 0 0h0a4 4 0 0 1 0 1a2 2 0 0 1 0 1a1 1 0 0 0 0 0c-1 0-1 0-1-1a3 3 0 0 0 0 0c0 0 0 0 0 0c0 0 0-1 0-1h0a2 2 0 0 0 0-1c0 0 0 0 0 0c-1-1-1-1-1-1h0c0 0 0 0 0 1a2 2 0 0 0-1 0a2 2 0 0 0 0 1h0c0 0 0 0 0 1c0 0-1-1-1-1a3 3 0 0 1 0 0h0a4 4 0 0 1 0-2c0 0 0-1 1-1a2 2 0 0 1 1 0zm-6 0h0c0 0 1 0 1 0c0 0 1 1 1 1c0 1 0 1 0 1h0c0 1 0 1 0 1h0c0 0 0 0 0 0c0 0-1 0-1 1c0-1 0-1 0-1h0c0 0 0 0 0-1a1 1 0 0 0 0 0a0 0 0 0 0-1 0h0c0 0 0 0 0 0a1 1 0 0 0 0 1a2 2 0 0 0-1 0h0c1 0 1 1 1 1c0 0 0 0 0 0c0 0 0 0 0 0c0 1 0 1 0 1a1 1 0 0 1-1 0a5 5 0 0 1 0-1a4 4 0 0 1 0-1a4 4 0 0 1 0-2a3 3 0 0 1 0-1c1 0 1 0 1 0zm3 3c1 0 1 0 2 1c1 1 1 1 2 1h0c1 0 1 1 1 1h0a1 1 0 0 1 0 1c0 0-1 1-2 1h0c0 1-1 1-1 1c-1 0-1 1-2 1a2 2 0 0 1-1 0a7 7 0 0 1-1-1c0 0-1 0-1-1h0h0c-1 0-1-1-1-1c-1-1 0-1 0-1c0-1 1-1 1-1c0 0 0 0 0 0h0h0c1-1 1-1 2-2c0 0 1 0 1 0zm5 5c1 2 3 7 4 9c1 1 2 3 2 6c0 0 1 0 1 0c1-4-1-7-2-8c0-1 0-1 0-1c1 1 2 3 3 6c0 1 0 2 0 3c0 0 0 0 1 0c2 1 2 2 2 3h0c0 0 0 0 0 0h0c0-1-1-2-3-2c-1-1-3-1-3 1c0 0 0 0 0 0c0 0 0 0-1 0c0 1-1 1-1 2c0 1 0 3-1 4h0c0 1 0 2 0 3c-3 2-7 3-11 0a5 5 0 0 0-1-1a3 3 0 0 0 0 0c0 0 0 0 1 0a1 1 0 0 0 0-1c1-1 0-1 0-2c-1-1-2-2-4-3c-1-1-2-2-2-3c-1-1-1-2 0-3c0-3 1-5 2-6c0 0 0 0-1 2c0 1-2 5 0 8a16 16 0 0 1 2-6c1-3 3-7 3-11c0 0 1 1 1 1c0 0 1 0 1 1c0 0 1 0 2 0c0 0 0 0 0 0c1 0 1 0 2 0c0 0 1-1 1-1h0c1 0 2-1 2-1zm5 18c0 1 1 2 2 2c1 1 2 0 3-1h1c0 0 1 0 1 0h0c1 1 1 1 1 2c0 1 0 2 1 2c1 1 1 2 1 2h0h0h0c0 1 0 1-1 2c-1 0-3 1-5 3c-1 1-2 2-4 2c-1 0-2 0-3-2h0c0 0 0-2 0-3c1-1 1-3 1-4c0-1 0-2 0-3c1-1 1-2 2-2h0zm-22 0h0c0 0 0 0 1 0c0 0 1 0 2 1l1 3v1c1 1 2 2 3 3c1 1 1 2 1 3h0c0 1-1 2-2 3c-1 0-3 0-5-1c-2-1-4-1-5-2c-1 0-2 0-2 0c0-1 0-2 0-3h0h0c1-1 0-1 0-2c0-1 0-2 0-2c1-1 1-1 2-1c0 0 1 0 2-1h0h0c0-1 0-1 1-2c0 0 1 0 1 0zm15-19c-1 1-2 2-3 2c-2 0-2-1-3-1c0-1-1-1-1-1c0 0 0-1 0-1c0 0 0 1 1 1c0 0 0 0 0 0c1 1 2 1 3 1c1 0 2 0 2-1c1 0 1 0 2-1c0 0 0 0 0 0c0 0 0 0 0 1a16 16 0 0 1-1 0zm-3-3h0c0 0 0 0 0 0c1 0 1 0 1 0c0 0 0 0 0 0c0 1 0 1 0 1c0 0 0 0 0-1c0 0-1 0-1 0zm-1 0c0 0 0 0 0 0c0 1 0 1 0 1c0 0-1 0-1-1c0 0 1 0 1 0c0 0 0 0 0 0c0 0 0 0 0 0h0h0z"/></symbol><symbol id="i-debian" viewBox="0 0 48 48"><path d="m28 25c-1 0 0 1 1 1c0 0 1-1 1-1a6 6 0 0 1-2 0m4-1c1 0 1-1 1-2c0 1 0 1-1 2c-1 1 0-1 0-1c-1 2 0 1 0 1m2-4c0-1-1-1-1 0c0 0 0 1 1 0m-9-19c0 0 1 0 1 0c0 0 0 0-1 0m1 0h-1h1h0m13 20c0 1-1 2-1 3h-1c0 1 0 1 0 2c-1 0-3 2-3 2c-1 0 0 0 0 0c-1 0-1 1-3 1h0c-4 2-10-2-10-8c0 1 0 1 0 1a7 7 0 0 1 4-7a7 7 0 0 1 7 1a7 7 0 0 0-5-3c-3 0-5 2-6 3c-1 1-1 3-1 4c-1 5 1 7 4 10c1 0 0 0 0 0a9 9 0 0 1-3-2c1 1 1 1 2 2c-1 0-3-3-3-3c2 4 8 6 11 5a12 12 0 0 1-5-1c-1 0-2-1-1-1a12 12 0 0 0 11-1c1-1 2-2 2-2c0 0 1 0 0 0c1-1 0 0 1-2l1 1c-1-2 1-3 1-5c0 0 0 1 0 2c1-1 0-2 0-3c0 1 1 1 1 1c-1-1 0-2 0-3c0 0 0 1 0-1c0-1 0 0 0 0c0 0-1-1-1-2c0 0 1 1 1 1c0-1-1-2-1-3c0-1 0 1 0 0c-1-2 0-1 0-2c1 2 2 4 2 5c0-1 0-2-1-3c1 0 0-3 1-1a16 16 0 0 0-8-9c1 1 1 1 1 1c-1-1-1-1-1-1c-2-1-2 0-3 0c-2-2-2-1-4-2h0c-2 0-2 0-4 0c0 0 1 0 1 0c-1 0-1 0-3 0c1 0 1 0 2-1c-2 0-3 1-3 0c-2 1-5 3-7 4h0c-1 1-4 3-4 5h-1c0 0-1 1-1 2c0 1-1 1-1 1c-1 2-1 4-2 6c0 1 0 3 0 5c0 11 8 22 17 25c1 0 3 0 5 0c-2-1-2 0-4-1c-2-1-2-1-3-2h0c-2 0-1 0-2-1h0c-1 0-2-1-2-2h-1c0-1-1-2-1-2h0c0 0-3-4-2-3c0 0 0 0-1-1h1c-1-1-2-2-2-3c1 1 1 1 1 1c-1-4-1 0-3-5h0c0 0 0 0 0-1v-1c-1-1 0-6 0-9c0-1 1-2 2-4h-1c1-1 5-5 7-5c1-1 0 0-1 0c2-2 3-2 4-2c2-1-1 0 0-1c2 0 1-1 4-1c1 0 0 0-1 0c2-1 7 0 10 1c3 1 6 6 7 10h0c0 2 0 4-1 6l1-1m-20 5v1c0 1 1 1 2 2c-1-1-1-1-2-3m1 0c0 0 0 0 0-1c0 1 0 2 1 2l-1-1m22-4h0c0 1-1 3-1 4c0-1 1-3 1-4m-17-22c0 0 1 0 2 0c-1 0-2 0-2 0h0m-19 10c0 1-1 2 0 1c1-1 0 0 0-1m-1 6c0-1 0-2 0-2c-1 1 0 1 0 2"/></symbol><symbol id="i-ubuntu" viewBox="0 0 48 48"><path d="m35 1a7 7 0 0 0-7 7a7 7 0 0 0 7 7a7 7 0 0 0 7-7a7 7 0 0 0-7-7zm-9 1c-8 0-16 4-20 11a9 9 0 0 1 1 0a10 10 0 0 1 5 1a17 17 0 0 1 13-7a10 10 0 0 1 2-5a22 22 0 0 0-1 0zm18 10a10 10 0 0 1-4 4a17 17 0 0 1 0 17a10 10 0 0 1 3 5a22 22 0 0 0 1-26zm-37 4a7 7 0 0 0-7 7a7 7 0 0 0 7 7a7 7 0 0 0 7-7a7 7 0 0 0-7-7zm4 16a10 10 0 0 1-6 0a22 22 0 0 0 16 14a22 22 0 0 0 5 0a10 10 0 0 1-2-5a17 17 0 0 1-2-1a17 17 0 0 1-11-8zm23 1a7 7 0 0 0-7 7a7 7 0 0 0 7 7a7 7 0 0 0 7-7a7 7 0 0 0-7-7z"/></symbol><symbol id="i-arch" viewBox="0 0 48 48"><path d="m23 1c-2 5-3 8-6 13c2 2 3 3 6 5c-3-1-5-2-6-3c-3 6-8 14-17 31c7-4 13-7 18-8a13 13 0 0 1 0-3h0c0-5 2-8 5-8c3 0 5 4 5 9a13 13 0 0 1 0 2c5 1 10 4 18 8c-2-3-3-5-4-7c-2-2-4-4-8-6c3 1 5 2 6 3c-12-23-13-26-17-36zm23 42v-2h-1h0h1h0h0v2h1v-2h0v1v1a5 5 0 0 1 0-1l1-1h0v2h0v-1l-1 1h0v-1v1h0"/></symbol><symbol id="i-docker" viewBox="0 0 48 48"><path d="m28 22h4a0 0 0 0 0 1 0v-4a0 0 0 0 0-1 0h-4a0 0 0 0 0 0 0v4c0 0 0 0 0 0m-6-11h4a0 0 0 0 0 1 0v-4a0 0 0 0 0-1 0h-4a0 0 0 0 0 0 0v4c0 0 0 0 0 0m0 6h4a0 0 0 0 0 1-1v-3a0 0 0 0 0-1-1h-4a0 0 0 0 0 0 1v3c0 1 0 1 0 1m-6 0h4a0 0 0 0 0 1-1v-3a0 0 0 0 0-1-1h-4a0 0 0 0 0 0 1v3c0 1 0 1 0 1m-6 0h5a0 0 0 0 0 0-1v-3a0 0 0 0 0 0-1h-5a0 0 0 0 0 0 1v3c0 1 0 1 0 1m12 5h4a0 0 0 0 0 1 0v-4a0 0 0 0 0-1 0h-4a0 0 0 0 0 0 0v4c0 0 0 0 0 0m-6 0h4a0 0 0 0 0 1 0v-4a0 0 0 0 0-1 0h-4a0 0 0 0 0 0 0v4c0 0 0 0 0 0m-6 0h5a0 0 0 0 0 0 0v-4a0 0 0 0 0 0 0h-5a0 0 0 0 0 0 0v4c0 0 0 0 0 0m-6 0h5a0 0 0 0 0 0 0v-4a0 0 0 0 0 0 0h-5a0 0 0 0 0 0 0v4c0 0 0 0 0 0m44-2c-1 0-2-1-4-1c-1 0-2 0-2 0c-1-3-4-5-4-5l-1-1v1c-1 1-1 2-1 3c-1 2 0 4 1 5c-2 1-3 1-4 1h-31a2 2 0 0 0-2 2a23 23 0 0 0 1 8c1 3 3 5 5 6c3 1 6 2 11 2c2 0 4 0 6 0a24 24 0 0 0 7-3c2-1 4-3 5-4c3-3 4-6 6-9h0c3 0 4-1 5-2c1-1 1-1 2-2v-1z"/></symbol><symbol id="i-disk" viewBox="0 0 16 16"><g class="ln"><rect x="2" y="3.5" width="12" height="9" rx="2"/><path d="M2 9h12M10.5 11h1.5"/></g></symbol><symbol id="i-net" viewBox="0 0 16 16"><g class="ln"><path d="M2.5 4.5h11V11H11v1.5H5V11H2.5zM5.5 7.5v1M8 7.5v1M10.5 7.5v1"/></g></symbol><symbol id="i-proc" viewBox="0 0 16 16"><g class="ln"><rect x="4" y="4" width="8" height="8" rx="1.5"/><path d="M6.5 2v2M9.5 2v2M6.5 12v2M9.5 12v2M2 6.5h2M2 9.5h2M12 6.5h2M12 9.5h2"/></g></symbol><symbol id="i-vm" viewBox="0 0 16 16"><g class="ln"><rect x="2" y="2.5" width="12" height="8.5" rx="1.5"/><path d="M5.5 13.5h5M8 11v2.5"/></g></symbol><symbol id="i-lxc" viewBox="0 0 16 16"><g class="ln"><rect x="2.5" y="5.5" width="11" height="8" rx="1"/><path d="M1.8 3h12.4v2.5H1.8zM6.5 8.5h3"/></g></symbol><symbol id="i-storage" viewBox="0 0 16 16"><g class="ln"><ellipse cx="8" cy="4" rx="5.5" ry="2"/><path d="M2.5 4v8c0 1.1 2.5 2 5.5 2s5.5-.9 5.5-2V4M2.5 8c0 1.1 2.5 2 5.5 2s5.5-.9 5.5-2"/></g></symbol><symbol id="i-pod" viewBox="0 0 16 16"><g class="ln"><path d="M8 1.8l5.3 3.1v6.2L8 14.2l-5.3-3.1V4.9z"/><circle cx="8" cy="8" r="1.6"/></g></symbol><symbol id="i-workload" viewBox="0 0 16 16"><g class="ln"><path d="M8 2l6 3-6 3-6-3zM2 8.2l6 3 6-3M2 11.2l6 3 6-3"/></g></symbol><symbol id="i-unit" viewBox="0 0 16 16"><g class="ln"><path d="M5 3H3v10h2M11 3h2v10h-2"/><circle cx="8" cy="8" r="1.8" fill="currentColor" stroke="none"/></g></symbol><symbol id="i-host" viewBox="0 0 16 16"><g class="ln"><rect x="2.5" y="2.5" width="11" height="4.5" rx="1"/><rect x="2.5" y="9" width="11" height="4.5" rx="1"/><path d="M5 4.75h.5M5 11.25h.5"/></g></symbol></defs></svg>
+<svg class="bgfx" id="bgfx" viewBox="0 0 1440 560" preserveAspectRatio="xMidYMin slice" aria-hidden="true"></svg>
 <header id="hdr">
-  <div class="brand"><span class="pulse" aria-hidden="true"></span>Pulse<span class="mark">blade</span></div>
-  <span class="meta" id="hdr-meta">loading…</span>
-  <span class="spacer"></span>
-  <span class="meta" id="updated"></span>
-  <div class="controls">
-    <div class="theme-switch" role="group" aria-label="Color theme">
+  <div class="bar">
+    <div class="brand"><svg class="logo mark-dark" viewBox="0 0 64 64" aria-hidden="true"><rect x="1" y="1" width="62" height="62" rx="14" fill="#0b1020" stroke="#24344d" stroke-width="2"/><rect x="25.5" y="16" width="13" height="32" rx="2" fill="#1c2a45" stroke="#2c3f62" stroke-width="1.5"/><circle cx="32" cy="23" r="2.6" fill="#2fcea8"/><path d="M11.3 28.4A21 21 0 1 1 48.1 45.5" fill="none" stroke="#f0a429" stroke-width="10" stroke-linecap="round" stroke-linejoin="round" opacity="0.18"/><path d="M21.5 50.2A21 21 0 0 1 11.3 28.4" fill="none" stroke="#f0a429" stroke-width="4.5" stroke-linecap="round" opacity=".38"/><path d="M11.3 28.4A21 21 0 1 1 48.1 45.5" fill="none" stroke="#f0a429" stroke-width="4.5" stroke-linecap="round"/><circle cx="48.1" cy="45.5" r="4" fill="#ffd27a"/></svg><svg class="logo mark-light" viewBox="0 0 64 64" aria-hidden="true"><rect x="1" y="1" width="62" height="62" rx="14" fill="#fffdf9" stroke="#e2d5c3" stroke-width="2"/><rect x="25.5" y="16" width="13" height="32" rx="2" fill="#e6d8c3" stroke="#cdb998" stroke-width="1.5"/><circle cx="32" cy="23" r="2.6" fill="#0e7c6b"/><path d="M21.5 50.2A21 21 0 0 1 11.3 28.4" fill="none" stroke="#c47f0a" stroke-width="4.5" stroke-linecap="round" opacity=".38"/><path d="M11.3 28.4A21 21 0 1 1 48.1 45.5" fill="none" stroke="#c47f0a" stroke-width="4.5" stroke-linecap="round"/><circle cx="48.1" cy="45.5" r="4" fill="#e09a1c"/></svg><span>Pulse<span class="mark">blade</span></span></div>
+    <button type="button" class="live" id="live" title="Live · click to pause" aria-label="Pause live refresh"><svg viewBox="0 0 20 20" aria-hidden="true"><circle class="trk" cx="10" cy="10" r="7"/><path class="arc" d="M10 3a7 7 0 0 1 7 7"/><circle class="core" cx="10" cy="10" r="2.6"/></svg></button>
+    <span class="spacer"></span>
+    <input id="q" type="search" placeholder="Find or filter…  ( / )" aria-label="Find or filter resources">
+    <div class="seg" role="group" aria-label="Color theme">
       <button type="button" data-theme-choice="dark" aria-pressed="true">Dark</button>
       <button type="button" data-theme-choice="light" aria-pressed="false">Light</button>
     </div>
-    <select id="interval" title="Refresh interval" aria-label="Refresh interval">
-      <option value="5">5s</option><option value="15" selected>15s</option><option value="60">60s</option>
-    </select>
-    <button type="button" id="toggle">Pause</button>
   </div>
+  <nav class="tabs" role="tablist" aria-label="Views" id="tabs"></nav>
 </header>
-<main id="main">
-  <div class="err" id="err" hidden></div>
-  <section class="c3"><h2>Pulseblade</h2><dl class="kv" id="self"></dl></section>
-  <section class="c3"><h2>Collectors</h2><div id="collectors"></div></section>
-  <section class="c3"><h2>Host</h2><div id="hosts"></div></section>
-  <section class="c3"><h2>Resources by kind</h2><table class="counts"><thead><tr><th>Kind</th><th style="text-align:right">Total</th>
-    <th style="text-align:right">Failed</th><th style="text-align:right">Degraded</th></tr></thead><tbody id="counts"></tbody></table></section>
-  <section class="c12" id="unhealthy-sec"><h2>Unhealthy <span class="right muted" id="unhealthy-n"></span></h2><div id="unhealthy"></div></section>
-  <section class="c7">
-    <h2>Resources <span class="right muted" id="res-n"></span></h2>
-    <div class="filters"><select id="kind" aria-label="Kind"><option value="">all kinds</option></select>
-      <input id="q" placeholder="filter by id or name…" aria-label="Filter resources"></div>
-    <div class="scroll"><table><thead><tr><th></th><th>Resource</th><th>State</th></tr></thead><tbody id="resources"></tbody></table></div>
-  </section>
-  <section class="c5" id="detail-panel">
-    <h2>Details <span class="right"><select id="range" aria-label="Metric range"><option>15m</option><option selected>1h</option><option>6h</option><option>24h</option></select></span></h2>
-    <div id="detail"><div class="empty">Select a resource to see its attributes, metrics, and recent changes.</div></div>
-  </section>
-  <section class="c6"><h2>Findings <span class="right muted" id="findings-n"></span></h2><div id="findings"></div></section>
-  <section class="c6"><h2>Actions <span class="right muted" id="actions-n"></span></h2><div id="actions"></div></section>
-  <section class="c12">
-    <h2>Recent changes <span class="right"><select id="window" aria-label="Changes window"><option>15m</option><option selected>1h</option><option>6h</option><option>24h</option><option>7d</option></select></span></h2>
-    <div class="scroll"><table><thead><tr><th>Time</th><th>Seq</th><th>Resource</th><th>Change</th></tr></thead><tbody id="changes"></tbody></table></div>
-  </section>
-</main>
+<div class="layout" id="layout">
+  <main class="view" id="view"></main>
+  <aside class="card" id="panel" hidden></aside>
+</div>
+<div id="err" class="err" hidden style="max-width:980px;margin:0 auto 12px"></div>
+<footer id="foot"></footer>
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
-// Deep links: ?kind=service&q=ssh&select=<resource id>&metric=<metric>
-const link = new URLSearchParams(location.search);
-const state = { timer: null, paused: false, resources: [], selected: link.get("select"),
-  metric: link.get("metric"), kind: link.get("kind") || "" };
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const RANK = { failed: 0, degraded: 1, unknown: 2, ok: 3 };
+const HOST_KINDS = new Set(["host", "disk", "net_iface", "service", "process", "session", "container", "image", "vm", "storage"]);
+const KIND_LABEL = { disk: "disks", net_iface: "network", service: "services", process: "processes", session: "sessions", node: "nodes",
+  pod: "pods", workload: "workloads", container: "LXC", vm: "VMs", storage: "storage pools", host: "host" };
+const KIND_ORDER = ["workload", "pod", "vm", "container", "storage", "service", "disk", "process", "session", "net_iface", "image"];
+const SCOPE_LABEL = { k8s: "Kubernetes", pve: "Proxmox", host: "Hosts" };
+const SCOPE_ICON = { k8s: "k8s", pve: "pve", host: "linux" };
+const KIND_ICON = { disk: "disk", net_iface: "net", service: "unit", process: "proc", vm: "vm", container: "lxc", storage: "storage", pod: "pod", workload: "workload", host: "host", node: "host", image: "storage" };
+const ic = (n, cls = "", label = "") => n ? `<svg class="ic ${cls}" ${label ? `role="img" aria-label="${esc(label)}"><title>${esc(label)}</title>` : 'aria-hidden="true">'}<use href="#i-${n}"/></svg>` : "";
+const osIcon = (os) => /proxmox/i.test(os || "") ? "pve" : /debian/i.test(os || "") ? "debian" : /ubuntu/i.test(os || "") ? "ubuntu" : /arch|cachy|manjaro|endeavour/i.test(os || "") ? "arch" : /linux/i.test(os || "") ? "linux" : "";
+const machineIcon = (m) => m.pnode ? "pve" : osIcon(((m.host || {}).attrs || {}).os || "");
+const DOCKERISH = /^(docker|containerd)(\.service)?$|^docker0$|^ctr:/;
+const TABS = [["overview", "Overview"], ["fleet", "Fleet"], ["changes", "Changes"], ["actions", "Actions"]];
+const QUIET_METRICS = /^(load\.(5|15)m|mem\.available_bytes|proc\.rss_bytes|net\.(rx|tx)_errors|k8s\.replicas)$/;
+const KIND_ALIAS = { disk: "disk", disks: "disk", vm: "vm", vms: "vm", lxc: "container", container: "container", containers: "container", pod: "pod", pods: "pod",
+  workload: "workload", workloads: "workload", service: "service", services: "service", unit: "service", units: "service", process: "process", processes: "process",
+  storage: "storage", net: "net_iface", node: "node", nodes: "node", host: "host", hosts: "host" };
+const PRESETS = ["disks over 90%", "storage over 85%", "pods is:unhealthy", "vms is:paused", "is:stopped", "services is:failed", "cpu over 50%", "mem over 75%"];
+const params = new URLSearchParams(location.search);
+const state = {
+  tab: "overview", fleet: "all", win: "1h", sel: null, filter: null, churn: false, metric: params.get("metric"),
+  paused: false, timer: null, interval: 15, open: {}, showOk: {}, attnAll: false,
+  changesKey: "", spark: null, sparkLoading: null, detailRecent: {}, detailFindings: {}, detailActions: {}, missing: {},
+};
+let D = { status: null, all: [], findings: { total: 0, findings: [] }, actions: { runs: [] }, changes: [], counts: {} };
+let byId = new Map();
 
-function syncThemePressed() {
-  const theme = document.documentElement.getAttribute("data-theme") === "light" ? "light" : "dark";
-  document.querySelectorAll("[data-theme-choice]").forEach((b) => {
-    b.setAttribute("aria-pressed", b.getAttribute("data-theme-choice") === theme ? "true" : "false");
-  });
+function countOf(kind) {
+  const c = D.counts[kind];
+  return c && c.total ? c.total : 0;
 }
-document.querySelectorAll("[data-theme-choice]").forEach((b) => {
-  b.addEventListener("click", () => {
-    const theme = b.getAttribute("data-theme-choice") === "light" ? "light" : "dark";
-    document.documentElement.setAttribute("data-theme", theme);
-    document.documentElement.style.colorScheme = theme;
-    document.documentElement.style.backgroundColor = theme === "light" ? "#f4efe6" : "#0b1020";
-    try { localStorage.setItem("pulseblade-theme", theme); } catch (e) {}
-    syncThemePressed();
-  });
-});
-syncThemePressed();
-
+function resourceTotal() {
+  const n = Object.values(D.counts).reduce((s, c) => s + ((c && c.total) || 0), 0);
+  return n || D.all.length;
+}
+function k8sPresent() {
+  return D.all.some((r) => /^(knode|pod|workload):/.test(r.id)) || countOf("pod") + countOf("workload") > 0;
+}
+function pvePresent() {
+  return D.all.some((r) => /^(vm|lxc|storage):/.test(r.id)) || countOf("vm") + countOf("storage") > 0;
+}
+function norm(raw) {
+  const id = raw.id;
+  const metrics = {};
+  for (const [k, v] of Object.entries(raw.metrics || {})) {
+    if (v == null) continue;
+    metrics[k] = typeof v === "object" && v && "value" in v ? v.value : v;
+  }
+  const name = raw.name || (id.includes(":") ? id.split(":").pop() : id);
+  return {
+    id, kind: raw.kind, name, health: raw.health || "unknown",
+    labels: Object.assign({}, raw.labels || {}), metrics,
+    attrs: Object.assign({}, raw.attrs || {}), parent: raw.parent || null,
+  };
+}
+function mergeResources(list, detail) {
+  for (const raw of list || []) {
+    if (!raw || !raw.id) continue;
+    const r = norm(raw);
+    if (detail || raw.detail) r.detail = true;
+    const prev = byId.get(r.id);
+    if (!prev) { D.all.push(r); byId.set(r.id, r); continue; }
+    if (r.name) prev.name = r.name;
+    if (r.health) prev.health = r.health;
+    Object.assign(prev.labels, r.labels);
+    Object.assign(prev.metrics, r.metrics);
+    if (Object.keys(r.attrs).length) Object.assign(prev.attrs, r.attrs);
+    if (r.parent) prev.parent = r.parent;
+    if (r.detail) prev.detail = true;
+  }
+}
 async function api(path) {
   const r = await fetch(path, { headers: { accept: "application/json" } });
   const body = await r.json().catch(() => ({ error: r.statusText }));
   if (!r.ok) throw new Error(body.error || r.statusText);
   return body;
 }
+function showError(e) {
+  const el = $("err");
+  if (!el) return;
+  el.hidden = !e;
+  el.textContent = e ? "Could not reach Pulseblade: " + (e.message || e) : "";
+}
 
 function bytes(n) {
-  if (n == null) return "–";
+  if (n == null || Number.isNaN(n)) return "–";
   const u = ["B", "KB", "MB", "GB", "TB"]; let i = 0;
   while (Math.abs(n) >= 1024 && i < u.length - 1) { n /= 1024; i++; }
   return (i ? n.toFixed(1) : Math.round(n)) + " " + u[i];
 }
 function fmt(metric, v) {
-  if (v == null) return "–";
-  if (metric.endsWith("_pct")) return v.toFixed(1) + "%";
-  if (metric.endsWith("bytes_per_s")) return bytes(v) + "/s";
-  if (metric.endsWith("_bytes")) return bytes(v);
-  return Number.isInteger(v) ? String(v) : v.toFixed(2);
+  if (v == null || Number.isNaN(Number(v))) return "–";
+  if (String(metric).endsWith("_pct")) return (v >= 10 ? Math.round(v) : Number(v).toFixed(1)) + "%";
+  if (String(metric).endsWith("bytes_per_s")) return bytes(v) + "/s";
+  if (String(metric).endsWith("_bytes")) return bytes(v);
+  return Number.isInteger(v) ? String(v) : Number(v).toFixed(2);
 }
 function ago(secs) {
-  if (secs == null) return "–";
-  if (secs < 60) return secs + "s ago";
-  if (secs < 3600) return Math.round(secs / 60) + "m ago";
-  if (secs < 86400) return (secs / 3600).toFixed(1) + "h ago";
-  return (secs / 86400).toFixed(1) + "d ago";
+  if (secs == null || Number.isNaN(secs)) return "–";
+  secs = Math.max(0, Math.round(secs));
+  if (secs < 60) return secs + "s";
+  if (secs < 3600) return Math.round(secs / 60) + "m";
+  if (secs < 86400) return (secs / 3600).toFixed(1) + "h";
+  return Math.round(secs / 86400) + "d";
 }
-function dur(secs) {
-  if (secs == null) return "–";
-  const d = Math.floor(secs / 86400), h = Math.floor(secs % 86400 / 3600), m = Math.floor(secs % 3600 / 60);
-  return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : `${m}m ${secs % 60}s`;
-}
-const time = (ts) => new Date(ts).toLocaleTimeString();
+const agoTs = (ts) => { const t = Date.parse(ts); return Number.isNaN(t) ? "–" : ago((Date.now() - t) / 1000); };
+const clock = (ts) => { const d = new Date(ts); return Number.isNaN(d.getTime()) ? "–" : d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false }); };
 const dot = (h) => `<span class="dot ${esc(h)}" title="${esc(h)}"></span>`;
-const rid = (id) => `<span class="mono">${esc(id)}</span>`;
-const showError = (e) => { $("err").hidden = !e; $("err").textContent = e ? "Could not reach Pulseblade: " + e.message : ""; };
+const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
+const bad = (r) => r && (r.health === "failed" || r.health === "degraded");
+function valText(v) {
+  if (v == null) return "∅";
+  if (typeof v === "object") return v.health && v.kind ? `${v.kind} ${v.health}` : JSON.stringify(v);
+  return String(v);
+}
 
-function summary(r) {
+function hostOf(r) {
+  if (!r) return null;
+  if (r.labels && r.labels.host && r.kind !== "node") return r.labels.host;
+  if (r.kind === "vm" || r.kind === "container" || r.kind === "storage") {
+    if (r.labels && r.labels.node) return r.labels.node;
+  }
+  if (HOST_KINDS.has(r.kind)) {
+    const host = r.id.split(":")[1];
+    return host || null;
+  }
+  return null;
+}
+function clusterOf(r) {
+  if (!r) return null;
+  if (r.labels && r.labels.cluster) return r.labels.cluster;
+  if (/^(knode|pod|workload):/.test(r.id)) return r.id.split(":")[1] || null;
+  return null;
+}
+const isPveNode = (r) => r.kind === "node" && r.id.startsWith("node:");
+function buildModel() {
+  const machines = new Map(), groups = new Map();
+  const mach = (name) => machines.get(name) || machines.set(name, { name, rs: [] }).get(name);
+  const pve = pvePresent();
+  for (const r of D.all) {
+    if (r.kind === "host") mach(r.name).host = r;
+    else if (r.id.startsWith("knode:")) { const m = mach((r.labels && r.labels.host) || r.name); m.knode = r; m.cluster = clusterOf(r); }
+    else if (pve && isPveNode(r)) mach(r.name).pnode = r;
+  }
+  for (const r of D.all) { const h = hostOf(r); if (h && machines.has(h)) machines.get(h).rs.push(r); }
+  const pushes = (D.status && D.status.nodes) || [];
+  for (const m of machines.values()) {
+    const push = pushes.find((n) => n.node === m.name);
+    const own = m.rs.concat([m.knode, m.pnode].filter((x) => x && !m.rs.includes(x)));
+    const pct = (k, list) => { const v = list.map((r) => r.metrics[k]).filter((x) => x != null); return v.length ? Math.max(...v) : null; };
+    Object.assign(m, {
+      own, type: m.cluster ? "k8s" : m.pnode ? "pve" : "host",
+      cpu: m.host ? m.host.metrics["cpu.used_pct"] : m.pnode && m.pnode.metrics["node.cpu_pct"],
+      mem: m.host ? m.host.metrics["mem.used_pct"] : m.pnode && m.pnode.metrics["node.mem_pct"],
+      disk: pct("disk.used_pct", m.rs.filter((r) => r.kind === "disk")),
+      stor: pct("storage.used_pct", m.rs.filter((r) => r.kind === "storage")),
+      failed: own.filter((r) => r.health === "failed").length,
+      degraded: own.filter((r) => r.health === "degraded").length,
+      stale: !!(push && push.stale), age: push && push.last_push_age_secs,
+    });
+    const key = m.type === "k8s" ? "k8s:" + m.cluster : m.type === "pve" ? "pve:" + m.name : "host:" + m.name;
+    const g = groups.get(key) || groups.set(key, { key, type: m.type, name: m.type === "k8s" ? m.cluster : m.name, machines: [], rs: [] }).get(key);
+    g.machines.push(m); g.rs.push(...own);
+    m.group = key;
+  }
+  for (const r of D.all) {
+    if (!r.id.startsWith("workload:") && !r.id.startsWith("pod:")) continue;
+    const g = groups.get("k8s:" + clusterOf(r));
+    if (g && !g.rs.includes(r)) g.rs.push(r);
+  }
+  if (k8sPresent() && ![...groups.values()].some((g) => g.type === "k8s")) {
+    const name = (D.all.map(clusterOf).find(Boolean)) || "cluster";
+    groups.set("k8s:" + name, { key: "k8s:" + name, type: "k8s", name, machines: [], rs: D.all.filter((r) => clusterOf(r)) });
+  }
+  for (const g of groups.values()) {
+    g.failed = g.rs.filter((r) => r.health === "failed").length;
+    g.degraded = g.rs.filter((r) => r.health === "degraded").length;
+    g.stale = g.machines.filter((m) => m.stale).length;
+    g.sev = g.failed ? 0 : g.degraded || g.stale ? 1 : 2;
+    g.machines.sort(machineOrder);
+  }
+  return { machines, groups };
+}
+const machineOrder = (a, b) => (b.failed - a.failed) || (b.degraded - a.degraded) || ((b.stale ? 1 : 0) - (a.stale ? 1 : 0)) ||
+  (Math.max(b.cpu || 0, b.mem || 0, b.disk || 0, b.stor || 0) - Math.max(a.cpu || 0, a.mem || 0, a.disk || 0, a.stor || 0));
+const single = () => M && M.groups.size === 1 && [...M.groups.values()][0].type === "host" && !k8sPresent() && !pvePresent();
+function scopeOf(r) {
+  if (!r || !M) return null;
+  const c = clusterOf(r);
+  if (c) return { g: "k8s:" + c, type: "k8s", name: c, detail: r.kind === "node" ? r.name : (r.labels && r.labels.namespace) || "" };
+  const m = M.machines.get(hostOf(r) || (isPveNode(r) ? r.name : ""));
+  if (!m) return null;
+  const g = M.groups.get(m.group);
+  if (!g) return null;
+  return { g: g.key, type: g.type, name: g.name, detail: g.type === "k8s" ? m.name : "" };
+}
+const scopeWhere = (s) => s ? ic(SCOPE_ICON[s.type], "sm", SCOPE_LABEL[s.type]) + esc(`${s.name}${s.detail ? " · " + s.detail : ""}`) : "";
+const scopeText = (s) => s ? `${s.type === "k8s" ? "k8s" : s.type === "pve" ? "pve" : "host"} · ${s.name}${s.detail ? " · " + s.detail : ""}` : "";
+
+function reason(r) {
   const m = r.metrics || {}, a = r.attrs || {};
   switch (r.kind) {
-    case "host": return `cpu ${fmt("cpu.used_pct", m["cpu.used_pct"])} · mem ${fmt("mem.used_pct", m["mem.used_pct"])} · load ${fmt("load.1m", m["load.1m"])}`;
-    case "disk": return `${fmt("disk.used_pct", m["disk.used_pct"])} used · ${fmt("disk.available_bytes", m["disk.available_bytes"])} free`;
-    case "net_iface": return `rx ${fmt("net.rx_bytes_per_s", m["net.rx_bytes_per_s"])} · tx ${fmt("net.tx_bytes_per_s", m["net.tx_bytes_per_s"])}`;
-    case "service": return [a.active, a.sub, a.unit_file_state].filter(Boolean).join(" · ");
-    case "process": return `cpu ${fmt("proc.cpu_pct", m["proc.cpu_pct"])} · mem ${fmt("proc.mem_pct", m["proc.mem_pct"])}`;
-    case "session": return [a.user, a.state, a.linger === "yes" ? "linger" : ""].filter(Boolean).join(" · ");
-    case "container": return [a.state, a.health, a.image].filter(Boolean).join(" · ");
-    case "image": return a.image_id || "";
-    case "vm": return [a.status, a.vmid != null ? "id " + a.vmid : ""].filter(Boolean).join(" · ");
-    case "node": return a.status || "";
-    case "storage": return [a.kind, a.active === false ? "inactive" : ""].filter(Boolean).join(" · ");
-    case "pod": return [a.phase, a.namespace].filter(Boolean).join(" · ");
-    case "workload": return [a.kind, a.ready].filter(Boolean).join(" · ");
-    default: return Object.keys(m).slice(0, 2).map((k) => `${k} ${fmt(k, m[k])}`).join(" · ");
+    case "pod": return [m["k8s.restarts"] ? `${m["k8s.restarts"]} restarts` : "", a.reason || a.phase].filter(Boolean).join(" · ");
+    case "workload": return `${a.ready || (m["k8s.ready"] != null ? m["k8s.ready"] + "/" + (m["k8s.replicas"] ?? "?") : "?")} ready`;
+    case "disk": return `${fmt("disk.used_pct", m["disk.used_pct"])} full · ${bytes(m["disk.available_bytes"])} free`;
+    case "storage": return `${fmt("storage.used_pct", m["storage.used_pct"])} full${a.kind ? " · " + a.kind : ""}${a.active === false ? " · inactive" : ""}`;
+    case "vm": case "container": { const p = r.id.split(":")[0]; return a.status && a.status !== "running" ? a.status : `cpu ${fmt("x_pct", m[p + ".cpu_pct"])} · ${bytes(m[p + ".mem_bytes"])}`; }
+    case "process": return (m["proc.cpu_pct"] > 50 ? `cpu ${fmt("proc.cpu_pct", m["proc.cpu_pct"])}` : `mem ${fmt("proc.mem_pct", m["proc.mem_pct"])} · ${bytes(m["proc.rss_bytes"])}`);
+    case "service": return [a.active, a.sub, a.result].filter(Boolean).join(" · ");
+    case "net_iface": return (a.addresses && !a.addresses.length) ? "no address" : `rx ${fmt("net.rx_bytes_per_s", m["net.rx_bytes_per_s"])}`;
+    case "host": return `cpu ${fmt("cpu.used_pct", m["cpu.used_pct"])} · mem ${fmt("mem.used_pct", m["mem.used_pct"])}`;
+    case "node": return [a.status, (a.conditions || []).join(", ")].filter(Boolean).join(" · ");
+    default: return "";
   }
 }
+function sinceOf(id) {
+  if (!D.changes.length) return "–";
+  for (let i = D.changes.length - 1; i >= 0; i--) {
+    const c = D.changes[i];
+    if (c.resource_id === id && (c.field === "health" || c.kind === "appeared") && c.ts) return agoTs(c.ts);
+  }
+  return ">1h";
+}
+const isChurn = (c) => (String(c.resource_id).startsWith("proc:") && c.kind !== "changed") || (String(c.resource_id).startsWith("net:") && c.field === "attrs.mac");
+const unhealthy = () => D.all.filter(bad);
+const pending = () => ((D.actions && D.actions.runs) || []).filter((a) => a.status === "awaiting_approval");
+function staleSources() {
+  const nodes = ((D.status && D.status.nodes) || []).filter((n) => n.stale).map((n) => ({ name: n.node, id: "host:" + n.node, age: n.last_push_age_secs, what: "no push from node agent" }));
+  const cols = ((D.status && D.status.collectors) || []).filter((c) => c.stale || !c.ok).map((c) => ({ name: c.source + " collector", id: null, age: c.age_secs, what: c.stale ? "no pass" : (c.error || "failing") }));
+  return nodes.concat(cols);
+}
+function ownerOf(pod) {
+  if (!pod || pod.kind !== "pod") return null;
+  const cluster = clusterOf(pod), ns = pod.labels && pod.labels.namespace;
+  const owner = pod.labels && pod.labels.owner;
+  if (owner && cluster && ns) {
+    const id = `workload:${cluster}:${ns}:${String(owner).replace("/", ":")}`;
+    const hit = byId.get(id);
+    if (hit) return hit;
+  }
+  if (pod.parent) {
+    const p = byId.get(pod.parent);
+    if (p && p.kind === "workload") return p;
+  }
+  let best = null;
+  for (const w of D.all) {
+    if (w.kind !== "workload") continue;
+    if (cluster && clusterOf(w) && clusterOf(w) !== cluster) continue;
+    if (ns && w.labels.namespace && w.labels.namespace !== ns) continue;
+    if (pod.name === w.name || pod.name.startsWith(w.name + "-")) {
+      if (!best || w.name.length > best.name.length) best = w;
+    }
+  }
+  return best;
+}
+const podsOf = (w) => D.all.filter((p) => p.kind === "pod" && ownerOf(p) === w);
+const winSecs = () => ({ "15m": 900, "1h": 3600, "6h": 21600, "24h": 86400 })[state.win] || 3600;
 
-function renderStatus(s) {
-  $("hdr-meta").textContent = `v${s.version} · seq ${s.as_of_seq}`;
-  $("self").innerHTML = [
-    ["Version", s.version], ["Uptime", dur(s.uptime_secs)], ["Journal seq", s.as_of_seq],
-    ["Resources", s.resources.total], ["Open findings", s.open_findings ?? 0],
-    ["Awaiting approval", s.awaiting_actions ?? 0],
-    ["Samples", s.samples.toLocaleString()], ["Changes", s.changes.toLocaleString()],
-    ["Checkpoints", s.checkpoints], ["Database", bytes(s.db.size_bytes)],
-  ].map(([k, v]) => `<dt>${k}</dt><dd>${esc(v)}</dd>`).join("") +
-    (s.db.path ? `<dt>Path</dt><dd class="mono muted" title="${esc(s.db.path)}">${esc(s.db.path.split("/").pop())}</dd>` : "");
-  $("collectors").innerHTML = s.collectors.length ? s.collectors.map((c) => `
-    <div class="row">${dot(c.ok ? "ok" : c.stale ? "degraded" : "failed")}<b>${esc(c.source)}</b>
-      <span class="spacer"></span><span class="muted num">${ago(c.age_secs)} · ${c.duration_ms} ms · ${c.resource_count} res</span></div>
-    ${c.error ? `<div class="t-failed mono">${esc(c.error)}</div>` : ""}
-    ${c.stale ? `<div class="t-degraded">stale: no pass in ${ago(c.age_secs).replace(" ago", "")}</div>` : ""}`).join("")
-    : `<div class="empty">No collector runs recorded yet.</div>`;
-  $("counts").innerHTML = Object.entries(s.resources.by_kind).map(([k, c]) => `
-    <tr><td>${esc(k)}</td><td class="num">${c.total}</td>
-    <td class="num ${c.failed ? "t-failed" : "muted"}">${c.failed || 0}</td>
-    <td class="num ${c.degraded ? "t-degraded" : "muted"}">${c.degraded || 0}</td></tr>`).join("");
+function attentionItems() {
+  const items = new Map();
+  const row = (id, init) => items.get(id) || (items.set(id, Object.assign({ id, tags: [], pods: 0 }, init)), items.get(id));
+  for (const r of unhealthy()) {
+    const owner = r.kind === "pod" && ownerOf(r);
+    if (owner) {
+      const it = row(owner.id, { name: owner.name, health: owner.health === "ok" ? r.health : owner.health,
+        why: owner.health === "ok" ? reason(r) : reason(owner), scope: scopeOf(owner), since: sinceOf(owner.health === "ok" ? r.id : owner.id) });
+      if (RANK[r.health] < RANK[it.health]) it.health = r.health;
+      it.pods++;
+      continue;
+    }
+    row(r.id, { name: r.name, health: r.health, why: reason(r), scope: scopeOf(r), since: sinceOf(r.id) });
+  }
+  for (const f of (D.findings.findings || [])) {
+    const it = row(f.resource_id, { name: f.summary, health: "failed", why: f.severity, scope: scopeOf(byId.get(f.resource_id)), since: agoTs(f.opened_at) });
+    it.tags.push("finding"); it.critical = it.critical || f.severity === "critical";
+  }
+  for (const a of pending()) {
+    const it = row(a.resource_id, { name: a.action, health: "degraded", why: "", scope: scopeOf(byId.get(a.resource_id)), since: agoTs(a.created_at) });
+    it.tags.push("approval");
+  }
+  for (const s of staleSources()) {
+    const it = row(s.id || s.name, { name: s.name, health: "unknown", why: `${s.what} · ${ago(s.age)}`, scope: s.id ? scopeOf(byId.get(s.id)) : null, since: ago(s.age) });
+    it.tags.push("stale"); it.stale = true; if (!s.id) it.id = null;
+  }
+  const rank = (i) => (i.health === "failed" || i.critical ? 0 : i.tags.includes("approval") ? 1 : i.stale ? 2 : 3);
+  return [...items.values()].sort((a, b) => rank(a) - rank(b) || String(a.name).localeCompare(String(b.name)));
+}
+const matchesFilter = (i, f) => f === "failed" ? i.health === "failed" : f === "degraded" ? i.health === "degraded" : i.tags.includes(f);
+
+function badges() {
+  const items = attentionItems();
+  const fleet = M ? [...M.machines.values()].filter((m) => m.failed || m.degraded || m.stale).length : 0;
+  const hour = D.changes.filter((c) => !isChurn(c) && c.ts && Date.now() - Date.parse(c.ts) <= 3600e3).length;
+  return {
+    overview: [items.length, items.some((i) => i.health === "failed" || i.critical) ? "bad" : "warn"],
+    fleet: [fleet, "warn"],
+    changes: [state.tab === "changes" ? D.changes.filter((c) => !isChurn(c) && c.ts && Date.now() - Date.parse(c.ts) <= winSecs() * 1000).length : hour, ""],
+    actions: [pending().length, "warn"],
+  };
+}
+function renderTabs() {
+  const b = badges();
+  $("tabs").innerHTML = TABS.filter(([k]) => !(k === "fleet" && single())).map(([k, label]) => {
+    const [n, tone] = b[k];
+    return `<button type="button" class="tab" role="tab" data-tab="${k}" aria-selected="${state.tab === k}">${label}<span class="badge ${n ? tone : ""}">${n}</span></button>`;
+  }).join("");
 }
 
-function renderHosts(list) {
-  const hosts = list.filter((r) => r.kind === "host");
-  $("hosts").innerHTML = hosts.length ? hosts.map((h) => {
-    const m = h.metrics || {};
-    const bar = (k, label) => {
-      const v = m[k]; if (v == null) return "";
-      const color = v >= 90 ? "var(--bad)" : v >= 75 ? "var(--warn)" : "var(--ok)";
-      return `<div class="metric"><div class="lbl"><span>${label}</span><b>${fmt(k, v)}</b></div>
-        <div class="bar"><i style="width:${Math.min(100, v)}%;background:${color}"></i></div></div>`;
-    };
-    return `<div class="row">${dot(h.health)}<b>${esc(h.name || h.id.slice(5))}</b><span class="spacer"></span>
-      <span class="muted">load ${fmt("load.1m", m["load.1m"])} / ${fmt("load.5m", m["load.5m"])} / ${fmt("load.15m", m["load.15m"])}</span></div>
-      ${bar("cpu.used_pct", "CPU")}${bar("mem.used_pct", "Memory")}${bar("swap.used_pct", "Swap")}
-      <div class="lbl muted">available memory <b>${fmt("mem.available_bytes", m["mem.available_bytes"])}</b></div>`;
-  }).join("") : `<div class="empty">No host resource.</div>`;
+function statsRow() {
+  const u = unhealthy(), failed = u.filter((r) => r.health === "failed").length;
+  const findingN = D.findings.total || 0;
+  return `<div class="stats">${[["failed", failed, "failed", "bad"], ["degraded", u.length - failed, "degraded", "warn"],
+    ["finding", findingN, "findings", "bad"], ["approval", pending().length, "awaiting approval", "warn"],
+    ["stale", staleSources().length, "stale", "warn"]].map(([key, n, label, tone]) =>
+    `<button type="button" class="stat ${n ? tone : ""} ${state.filter === key ? "on" : ""}" data-strip="${key}" ${n ? "" : "disabled"}><b>${n}</b><span>${label}</span></button>`).join("")}</div>`;
+}
+function itemRow(i) {
+  const selId = state.sel && state.sel.t === "res" ? state.sel.id : null;
+  const extra = [i.pods && plural(i.pods, "pod"), i.tags.includes("finding") && "<em>finding open</em>", i.tags.includes("approval") && "<em>approval waiting</em>"].filter(Boolean);
+  const tone = i.health === "failed" || i.critical ? "failed" : i.stale ? "unknown" : "degraded";
+  return `<div class="item ${i.id && i.id === selId ? "sel" : ""}" ${i.id ? `data-res="${esc(i.id)}"` : ""} role="button" tabindex="0">
+    ${dot(tone)}<span class="what"><b>${esc(i.name)}</b>${extra.length ? `<span class="sub">${extra.join(" · ")}</span>` : ""}</span>
+    <span class="why t-${tone}">${esc(i.why)}</span><span class="where">${scopeWhere(i.scope) || "this node"}</span><span class="since">${esc(i.since)}</span></div>`;
+}
+function scopeLines(items) {
+  const groups = [...M.groups.values()];
+  return ["k8s", "pve", "host"].filter((t) => groups.some((g) => g.type === t)).map((t) => {
+    const gs = groups.filter((g) => g.type === t), n = items.filter((i) => i.scope && i.scope.type === t).length;
+    const what = t === "k8s" ? (gs.length <= 2 ? gs.map((g) => g.name).join(", ") : plural(gs.length, "cluster")) : plural(gs.length, t === "pve" ? "node" : "host");
+    const worst = Math.min(...gs.map((g) => g.sev));
+    return `<button type="button" class="sline" data-gofleet="${t}">${dot(worst === 0 ? "failed" : worst === 1 ? "degraded" : "ok")}${ic(SCOPE_ICON[t], "lg")}
+      <span>${SCOPE_LABEL[t]}</span><span class="muted">${esc(what)}</span>
+      <span class="right ${n ? "" : "faint"}">${n ? plural(n, "issue") : "all ok"}</span><span class="go">›</span></button>`;
+  }).join("");
+}
+function overviewView() {
+  const all = attentionItems(), filtered = state.filter ? all.filter((i) => matchesFilter(i, state.filter)) : all;
+  const shown = state.attnAll || state.filter ? filtered : filtered.slice(0, 5);
+  const list = all.length
+    ? `<section class="card"><h2>Needs attention <span class="right">${state.filter ? `<button type="button" class="linkish" data-strip="${state.filter}">clear filter</button>`
+        : filtered.length > shown.length ? `<button type="button" class="linkish" data-attnall>view all ${filtered.length}</button>` : state.attnAll && all.length > 5 ? `<button type="button" class="linkish" data-attnless>show fewer</button>` : ""}</span></h2>
+        ${shown.map(itemRow).join("")}</section>`
+    : `<section class="card calm"><div class="calmart" aria-hidden="true"><i></i><i></i><svg viewBox="0 0 64 64"><use href="#pb-mark"/></svg></div>
+        <div><div class="big">All quiet</div><div class="muted">All ${resourceTotal()} resources healthy, every source reporting.</div>
+        <div class="scopesline">${["k8s", "pve", "host"].filter((t) => [...M.groups.values()].some((g) => g.type === t)).map((t) => `<span>${ic(SCOPE_ICON[t])}${SCOPE_LABEL[t]}</span>`).join("")}</div></div></section>`;
+  if (single()) {
+    const m = [...M.machines.values()][0];
+    return statsRow() + list + `<section class="card">${machineView(m.name, true)}</section>`;
+  }
+  return statsRow() + list + `<section class="card"><h2>Scopes</h2>${scopeLines(all) || `<div class="empty">No scopes yet.</div>`}</section>`;
 }
 
-function renderUnhealthy(list) {
-  const bad = list.filter((r) => r.health === "failed" || r.health === "degraded");
-  $("unhealthy-sec").classList.toggle("attention", bad.length > 0);
-  $("unhealthy-n").textContent = bad.length ? `${bad.length} resource(s)` : "";
-  $("unhealthy").innerHTML = bad.length ? bad.map((r) => `
-    <div class="row click health-${esc(r.health)}" data-id="${esc(r.id)}">${dot(r.health)}
-      <span class="t-${esc(r.health)}">${esc(r.health)}</span>${rid(r.id)}<span class="spacer"></span>
-      <span class="muted">${esc(summary(r))}</span></div>`).join("")
-    : `<div class="empty t-ok">Everything reporting is healthy.</div>`;
+function meter(label, v) {
+  if (v == null) return "";
+  const cls = v >= 90 ? "bad" : v >= 75 ? "warn" : "";
+  return `<div class="meter"><span>${label}</span><span class="track"><i class="${cls}" style="width:${Math.min(100, v).toFixed(0)}%"></i></span>
+    <span class="num ${cls ? "hot" : ""}">${Math.round(v)}%</span></div>`;
 }
-
-function renderActions(page) {
-  const runs = (page && page.runs) || [];
-  $("actions-n").textContent = runs.length ? String(runs.length) : "";
-  $("actions").innerHTML = runs.length ? runs.map((a) =>
-    `<div class="row"><span class="muted">${esc(a.status)}</span><b>${esc(a.action)}</b>
-      <span class="mono">${esc(a.resource_id)}</span><span class="spacer"></span>
-      <span class="muted">${esc(a.tier || "")}</span></div>`).join("")
-    : `<div class="empty">No actions recorded.</div>`;
+const issues = (x) => [x.failed && `<span class="t-failed">${x.failed} failed</span>`, x.degraded && `<span class="t-degraded">${x.degraded} degraded</span>`,
+  x.stale && `<span class="muted">${x.stale === true ? "stale" : x.stale + " stale"}</span>`].filter(Boolean).join(" · ");
+function machineTile(m) {
+  const health = m.failed ? "failed" : m.degraded ? "degraded" : "ok", sel = state.sel && state.sel.t === "machine" && state.sel.id === m.name;
+  const a = (m.host || {}).attrs || {};
+  const badge = m.knode ? `<span class="num ${m.knode.attrs.status === "Ready" ? "" : "t-failed"}">${esc(m.knode.attrs.status || "")}</span>`
+    : m.pnode ? `<span class="num ${m.pnode.attrs.status === "online" ? "" : "t-failed"}">${esc(m.pnode.attrs.status || "")}</span>`
+    : `<span class="num">${a.cpu_count || "?"} cpu</span>`;
+  const glyph = m.type === "k8s" ? "" : ic(machineIcon(m), "", a.os ? String(a.os).replace(/^Linux \((.*)\)$/, "$1") : (m.pnode ? "Proxmox VE" : ""));
+  const guests = m.type === "pve" ? `${plural(m.rs.filter((r) => r.kind === "vm").length, "VM")} · ${m.rs.filter((r) => r.id.startsWith("lxc:")).length} LXC` : "";
+  const foot = m.stale ? `<div class="tfoot">stale · last push ${ago(m.age)} ago</div>`
+    : m.failed || m.degraded ? `<div class="tfoot">${[guests, issues(m)].filter(Boolean).join(" · ")}</div>`
+    : `<div class="tfoot">${guests || plural(m.own.length, "resource") + " ok"}</div>`;
+  return `<button type="button" class="tile ${m.stale ? "stale" : ""} ${sel ? "sel" : ""}" data-machine="${esc(m.name)}" title="${esc(a.os || "")}">
+    <div class="tname">${dot(m.stale ? "unknown" : health)}<b>${esc(m.name)}</b>${badge}${glyph}</div>
+    ${meter("cpu", m.cpu)}${meter("mem", m.mem)}${m.type === "pve" ? meter("store", m.stor) : meter("disk", m.disk)}${foot}</button>`;
 }
-
-function renderFindings(page) {
-  const rows = (page && page.findings) || [];
-  $("findings-n").textContent = page && page.total ? `${page.total} open` : "";
-  $("findings").innerHTML = rows.length ? rows.map((f) => `
-    <div class="row click" data-id="${esc(f.resource_id)}">
-      <span class="t-${f.severity === "critical" ? "failed" : f.severity === "warning" ? "degraded" : "unknown"}">${esc(f.severity)}</span>
-      ${rid(f.resource_id)}<span class="muted">${esc(f.rule)}</span><span class="spacer"></span>
-      <span>${esc(f.summary)}</span></div>`).join("")
-    : `<div class="empty t-ok">No open findings.</div>`;
+function groupSummary(g) {
+  if (g.type === "k8s") {
+    const wl = g.rs.filter((r) => r.kind === "workload"), pods = g.rs.filter((r) => r.kind === "pod");
+    const clusters = [...M.groups.values()].filter((x) => x.type === "k8s").length;
+    const wlN = wl.length || (clusters <= 1 ? countOf("workload") : 0);
+    const podN = pods.length || (clusters <= 1 ? countOf("pod") : 0);
+    const ready = g.machines.filter((m) => m.knode && m.knode.attrs.status === "Ready").length;
+    const nodes = g.machines.length ? (ready === g.machines.length ? `${g.machines.length} nodes ok` : `${ready}/${g.machines.length} nodes ready`) : "";
+    return [nodes, wlN ? plural(wlN, "workload") : "", podN ? plural(podN, "pod") : ""].filter(Boolean).join(" · ");
+  }
+  if (g.type === "pve") {
+    const n = (k) => g.rs.filter((r) => r.kind === k);
+    const lxc = g.rs.filter((r) => r.id.startsWith("lxc:"));
+    return `${n("vm").length} VMs (${n("vm").filter((r) => r.attrs.status === "running").length} running) · ${lxc.length} LXC · ${n("storage").length} storage`;
+  }
+  const m = g.machines[0];
+  if (!m) return "";
+  return `cpu ${fmt("x_pct", m.cpu)} · mem ${fmt("x_pct", m.mem)} · disk ${fmt("x_pct", m.disk)} · ${plural(m.own.length, "resource")}`;
 }
-
-function renderResources() {
-  const kind = $("kind").value, q = $("q").value.trim().toLowerCase();
-  const rows = state.resources.filter((r) => (!kind || r.kind === kind) &&
-    (!q || r.id.toLowerCase().includes(q) || (r.name || "").toLowerCase().includes(q)));
-  $("res-n").textContent = `${rows.length} of ${state.resources.length}`;
-  $("resources").innerHTML = rows.map((r) => `
-    <tr class="click ${r.id === state.selected ? "sel" : ""}" data-id="${esc(r.id)}">
-      <td>${dot(r.health)}</td><td>${rid(r.id)}</td><td class="muted">${esc(summary(r))}</td></tr>`).join("");
+function groupBody(g) {
+  const narrow = window.innerWidth <= 720, quiet = g.machines.filter((m) => !m.failed && !m.degraded && !m.stale);
+  const fold = g.type === "k8s" && narrow && !state.showOk["q:" + g.key] && quiet.length > 1;
+  const shown = fold ? g.machines.filter((m) => !quiet.includes(m)) : g.machines;
+  let html = `<div class="tiles">${shown.map(machineTile).join("")}</div>${fold ? `<button type="button" class="linkish" data-showok="q:${esc(g.key)}">show ${quiet.length} quiet nodes</button>` : ""}`;
+  if (g.type === "k8s") {
+    const wl = g.rs.filter((r) => r.kind === "workload"), pods = g.rs.filter((r) => r.kind === "pod");
+    const wlOk = wl.filter((r) => !bad(r)).length, podOk = pods.filter((r) => !bad(r)).length;
+    html += `<div class="gnote">${wl.length ? `<span>workloads <b>${wlOk}/${wl.length}</b></span>` : ""}<span>pods <b>${pods.length ? podOk + "/" + pods.length : countOf("pod") || 0}</b></span>
+      <button type="button" class="linkish" data-scope="${esc(g.key)}">namespaces ›</button></div>`;
+  }
+  return html;
 }
-
-function fillKinds(list) {
-  const sel = $("kind"), cur = sel.value || state.kind;
-  state.kind = "";
-  const kinds = [...new Set(list.map((r) => r.kind))].sort();
-  sel.innerHTML = `<option value="">all kinds</option>` + kinds.map((k) => `<option ${k === cur ? "selected" : ""}>${esc(k)}</option>`).join("");
+function fleetView() {
+  const groups = [...M.groups.values()];
+  const types = ["k8s", "pve", "host"].filter((t) => groups.some((g) => g.type === t));
+  if (state.fleet !== "all" && !types.includes(state.fleet)) state.fleet = "all";
+  const issueN = (t) => groups.filter((g) => (t === "all" || g.type === t) && g.sev < 2).length;
+  const seg = `<div class="subnav"><div class="seg" role="group" aria-label="Scope">${["all"].concat(types).map((t) =>
+    `<button type="button" data-fleet="${t}" aria-pressed="${state.fleet === t}">${t === "all" ? "All" : ic(SCOPE_ICON[t], "sm") + SCOPE_LABEL[t]}${issueN(t) ? ` <span class="t-degraded">•</span>` : ""}</button>`).join("")}</div>
+    <span class="small faint">healthy groups stay collapsed</span></div>`;
+  const shownTypes = state.fleet === "all" ? types.slice().sort((a, b) => Math.min(...groups.filter((g) => g.type === a).map((g) => g.sev)) - Math.min(...groups.filter((g) => g.type === b).map((g) => g.sev))) : [state.fleet];
+  const selG = state.sel && (state.sel.t === "scope" ? state.sel.id : state.sel.t === "machine" ? (M.machines.get(state.sel.id) || {}).group : null);
+  return seg + (shownTypes.length ? shownTypes.map((t) => {
+    const gs = groups.filter((g) => g.type === t).sort((a, b) => a.sev - b.sev || a.name.localeCompare(b.name));
+    return `<section class="card"><h2>${ic(SCOPE_ICON[t], "lg")}${SCOPE_LABEL[t]}<span class="right faint">${plural(gs.length, t === "k8s" ? "cluster" : t === "pve" ? "node" : "host")}</span></h2>
+      ${gs.map((g) => {
+        const open = state.open["g:" + g.key] ?? g.sev < 2;
+        return `<div class="group"><div class="ghead">
+          <button type="button" class="gline" data-g="${esc(g.key)}" aria-expanded="${open}"><span class="caret">${open ? "▾" : "▸"}</span>${dot(g.failed ? "failed" : g.sev === 1 ? (g.degraded ? "degraded" : "unknown") : "ok")}
+            <b ${selG === g.key ? 'class="t-degraded"' : ""}>${esc(g.name)}</b><span class="gsum">${groupSummary(g)}</span><span class="giss">${issues(g) || `<span class="faint">ok</span>`}</span></button>
+          <button type="button" class="linkish" data-scope="${esc(g.key)}">details</button></div>
+          ${open ? `<div class="gbody">${groupBody(g)}</div>` : ""}</div>`;
+      }).join("")}</section>`;
+  }).join("") : `<section class="card"><div class="empty">No machines in this scope.</div></section>`);
 }
 
 function changeText(c) {
-  const v = (x) => x == null ? "∅" : typeof x === "object" ? (x.health ? `${x.kind} ${x.health}` : JSON.stringify(x)) : String(x);
-  if (c.kind === "changed") return `${esc(c.field)}: ${esc(v(c.before))} → ${esc(v(c.after))}`;
-  return c.kind === "appeared" ? `appeared (${esc(v(c.after))})` : `disappeared (was ${esc(v(c.before))})`;
-}
-
-async function refreshChanges() {
-  const cs = await api(`/api/v1/changes?since=${encodeURIComponent($("window").value)}&limit=1000&compact=false`);
-  const list = cs.changes.slice().reverse().slice(0, 300);
-  $("changes").innerHTML = list.length ? list.map((c) => `
-    <tr class="click" data-id="${esc(c.resource_id)}"><td class="num muted">${time(c.ts)}</td><td class="num muted">${c.seq}</td>
-    <td>${rid(c.resource_id)}</td><td class="chg-${esc(c.kind)}">${changeText(c)}</td></tr>`).join("")
-    : `<tr><td colspan="4" class="empty">No changes in this window.</td></tr>`;
-}
-
-function spark(series) {
-  const vals = series.values, present = vals.filter((v) => v != null);
-  if (!present.length) return `<div class="empty">No samples in range.</div>`;
-  const W = 600, H = 120, P = 8, min = Math.min(...present), max = Math.max(...present), span = max - min || 1;
-  const x = (i) => P + (vals.length < 2 ? (W - 2 * P) / 2 : i * (W - 2 * P) / (vals.length - 1));
-  const y = (v) => H - P - (v - min) / span * (H - 2 * P);
-  let d = "", dots = "", pen = false;
-  vals.forEach((v, i) => {
-    if (v == null) { pen = false; return; }
-    const p = `${x(i).toFixed(1)},${y(v).toFixed(1)}`;
-    d += `${pen ? "L" : "M"}${p} `;
-    if (!pen && vals[i + 1] == null) dots += `M${p} l0.01,0 `;
-    pen = true;
-  });
-  const s = series.stats;
-  return `<svg class="spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
-      <path d="${d}" fill="none" stroke="var(--amber)" stroke-width="2" vector-effect="non-scaling-stroke"/>
-      <path d="${dots}" stroke="var(--amber)" stroke-width="5" stroke-linecap="round" vector-effect="non-scaling-stroke"/></svg>
-    <div class="muted num" style="display:flex;justify-content:space-between;margin-top:4px">
-      <span>min ${fmt(series.metric, s.min)}</span><span>avg ${fmt(series.metric, s.avg)}</span>
-      <span>max ${fmt(series.metric, s.max)}</span><span>last <b style="color:var(--text)">${fmt(series.metric, s.last)}</b></span>
-      <span>step ${series.step_secs}s</span></div>`;
-}
-
-async function refreshDetail() {
-  const id = state.selected;
-  $("detail-panel").classList.toggle("has-sel", !!id);
-  if (!id) return;
-  const e = await api(`/api/v1/resources/${encodeURIComponent(id)}?changes_limit=10`);
-  const r = e.resource, metrics = Object.keys(e.metrics);
-  if (!metrics.includes(state.metric)) state.metric = metrics[0] || null;
-  let chart = "";
-  if (state.metric) {
-    const s = await api(`/api/v1/metrics?id=${encodeURIComponent(id)}&metric=${encodeURIComponent(state.metric)}&range=${$("range").value}`);
-    chart = spark(s);
+  if (c.kind === "changed") {
+    const field = String(c.field || "field").replace(/^attrs\./, "").replace(/^labels\./, "");
+    return `${field} ${valText(c.before)} → ${valText(c.after)}`;
   }
-  const kv = (obj) => Object.entries(obj || {}).map(([k, v]) =>
-    `<dt>${esc(k)}</dt><dd class="mono">${esc(typeof v === "object" ? JSON.stringify(v) : v)}</dd>`).join("");
-  $("detail").innerHTML = `
-    <div class="row">${dot(r.health)}<b class="mono">${esc(r.id)}</b><span class="spacer"></span><span class="t-${esc(r.health)}">${esc(r.health)}</span></div>
-    <dl class="kv" style="margin:8px 0">
-      <dt>kind</dt><dd>${esc(r.kind)}</dd><dt>source</dt><dd>${esc(r.source)}</dd>
-      ${r.parent ? `<dt>parent</dt><dd class="mono">${esc(r.parent)}</dd>` : ""}
-      <dt>first seen</dt><dd>${esc(new Date(r.first_seen).toLocaleString())}</dd>
-      ${e.children.total ? `<dt>children</dt><dd>${e.children.total} (${e.children.unhealthy.length} unhealthy)</dd>` : ""}
-      ${kv(r.labels)}${kv(r.attrs)}</dl>
-    ${metrics.length ? `<div class="chips" style="margin-bottom:8px">${metrics.map((m) =>
-      `<span class="chip ${m === state.metric ? "on" : ""}" data-metric="${esc(m)}">${esc(m)} <b>${fmt(m, e.metrics[m].value)}</b></span>`).join("")}</div>${chart}` : ""}
-    <h2 style="margin-top:12px">Recent changes here and on parent</h2>
-    ${e.recent_changes.length ? e.recent_changes.map((c) => `<div class="row"><span class="muted num">${time(c.ts)}</span>
-      ${rid(c.resource_id === r.id ? "" : c.resource_id)}<span class="chg-${esc(c.kind)}">${changeText(c)}</span></div>`).join("")
-      : `<div class="empty">None retained.</div>`}
-    ${(e.findings || []).length ? `<h2 style="margin-top:12px">Findings</h2>` + e.findings.map((f) =>
-      `<div class="row"><span class="t-${f.severity === "critical" ? "failed" : "degraded"}">${esc(f.severity)}</span>
-      <span>${esc(f.summary)}</span></div>` + (f.logs || []).slice(0, 3).map((l) =>
-        `<div class="muted mono">${esc(l.message)}</div>`).join("")).join("") : ""}
-    ${(e.notes || []).length ? `<h2 style="margin-top:12px">Notes</h2>` + e.notes.map((n) =>
-      `<div class="row"><span class="muted">${esc(n.author)}</span><span>${esc(n.text)}</span></div>`).join("") : ""}
-    ${(e.actions || []).length ? `<h2 style="margin-top:12px">Prior actions</h2>` + e.actions.map((a) =>
-      `<div class="row"><span class="muted">${esc(a.status)}</span><span>${esc(a.action)}</span></div>`).join("") : ""}`;
+  const v = c.after || c.before || {};
+  const health = v && typeof v === "object" ? v.health : "";
+  return `${c.kind}${health && health !== "ok" ? " " + health : ""}`;
+}
+function changeRow(c, compact) {
+  const r = byId.get(c.resource_id);
+  const name = r ? r.name : ((c.after || c.before || {}).name) || String(c.resource_id).split(":").pop();
+  const tone = c.field === "health" ? (c.after === "failed" ? "failed" : c.after === "degraded" ? "degraded" : "ok") : c.kind === "appeared" ? "ok" : "unknown";
+  const s = scopeOf(r || { kind: "process", id: c.resource_id, labels: {} });
+  return `<div class="ch" data-res="${esc(c.resource_id)}"><span class="num faint">${c.ts ? clock(c.ts) : "–"}</span>${dot(tone)}
+    <span class="what">${esc(name)} <span class="small ${c.field === "health" ? "t-" + tone : ""}">${esc(changeText(c))}</span></span>${compact ? "" : `<span class="where">${scopeWhere(s)}</span>`}</div>`;
+}
+function changesView() {
+  const inWin = D.changes.filter((c) => c.ts && Date.now() - Date.parse(c.ts) <= winSecs() * 1000);
+  const churn = inWin.filter(isChurn), keep = state.churn ? inWin : inWin.filter((c) => !isChurn(c));
+  const list = keep.slice().reverse().slice(0, 80);
+  return `<div class="subnav"><div class="seg" role="group" aria-label="Time range">${["15m", "1h", "6h", "24h"].map((w) =>
+      `<button type="button" data-win="${w}" aria-pressed="${state.win === w}">${w}</button>`).join("")}</div>
+      <span class="small faint">${plural(keep.length, "change")}${churn.length && !state.churn ? ` · ${churn.length} routine hidden` : ""}</span></div>
+    <section class="card feed">${list.length ? list.map((c) => changeRow(c)).join("") : `<div class="empty">Nothing changed in this window.</div>`}
+      ${churn.length ? `<div class="note">${state.churn ? "Showing routine changes too. " : "Process start/stop and veth MAC changes are hidden. "}<button type="button" class="linkish" data-churn>${state.churn ? "hide routine" : "show them"}</button></div>` : ""}</section>`;
 }
 
-function select(id) {
-  state.selected = id; state.metric = null;
-  renderResources();
-  refreshDetail().catch(showError);
-  if (window.innerWidth < 1100) $("detail-panel").scrollIntoView({ behavior: "smooth" });
+function actionsView() {
+  const wait = pending(), rest = ((D.actions && D.actions.runs) || []).filter((a) => a.status !== "awaiting_approval");
+  const tone = { succeeded: "ok", failed: "failed", rejected: "unknown", expired: "unknown", running: "degraded", planned: "unknown" };
+  const card = (a) => {
+    const r = byId.get(a.resource_id), f = (D.findings.findings || []).find((x) => x.resource_id === a.resource_id);
+    const exp = a.expires_at ? `expires in ${ago((Date.parse(a.expires_at) - Date.now()) / 1000)}` : "no expiry";
+    return `<div class="appr"><div class="top"><b>${esc(a.action)}</b><span class="muted small">on</span><button type="button" class="linkish" data-res="${esc(a.resource_id)}">${esc(r ? r.name : a.resource_id)}</button>
+        <span class="right">${esc(exp)}</span></div>
+      <div class="small muted">${esc(scopeText(scopeOf(r)))} · requested ${agoTs(a.created_at)} ago · tier ${esc(a.tier)} · <span class="mono">${esc(a.id)}</span></div>
+      ${f ? `<div class="small">Because: <span class="t-failed">${esc(f.summary)}</span></div>` : ""}
+      ${a.params && Object.keys(a.params).length ? `<div class="mono muted">${esc(JSON.stringify(a.params))}</div>` : ""}
+      <div class="small faint">Approve from an agent (MCP) or the CLI. This view is read-only.</div></div>`;
+  };
+  return `<section class="card"><h2>Waiting for approval<span class="right faint">${wait.length || "none"}</span></h2>
+      ${wait.length ? wait.map(card).join("") : `<div class="empty">Nothing is waiting for a human.</div>`}</section>
+    <section class="card"><h2>Recent runs</h2>${rest.length ? rest.map((a) => {
+      const r = byId.get(a.resource_id);
+      return `<div class="run" data-res="${esc(a.resource_id)}">${dot(tone[a.status] || "unknown")}<span class="st">${esc(a.status)}</span>
+        <span class="mono">${esc(a.action)}</span><span class="tgt small muted">${esc(r ? r.name : String(a.resource_id).split(":").pop())}${a.output ? ` · <span class="t-failed">${esc(a.output)}</span>` : ""}</span>
+        <span class="small faint" style="text-align:right">${agoTs(a.created_at)}</span></div>`;
+    }).join("") : `<div class="empty">No runs yet.</div>`}</section>`;
 }
 
+function sparkKey(id, metric) { return id + "|" + metric + "|1h"; }
+function chartMetric(r) {
+  const keys = Object.keys(r.metrics || {}).filter((k) => r.metrics[k] != null && !QUIET_METRICS.test(k));
+  if (state.metric && keys.includes(state.metric)) return state.metric.endsWith("_pct") ? state.metric : null;
+  return keys.find((k) => k.endsWith("_pct")) || null;
+}
+function spark(series, metric) {
+  const vals = (series.values || []).filter((v) => v != null);
+  if (vals.length < 2) return "";
+  const W = 400, H = 64, P = 4, min = Math.min(...vals), max = Math.max(...vals), span = max - min || 1;
+  const pts = vals.map((v, i) => `${(P + i * (W - 2 * P) / (vals.length - 1)).toFixed(1)},${(H - P - (v - min) / span * (H - 2 * P)).toFixed(1)}`);
+  const s = series.stats || {};
+  const avg = s.avg != null ? s.avg : vals.reduce((a, b) => a + b, 0) / vals.length;
+  return `<svg class="spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" aria-hidden="true">
+    <polyline points="${pts.join(" ")}" fill="none" stroke="var(--amber)" stroke-width="1.6" vector-effect="non-scaling-stroke"/></svg>
+    <div class="sparkmeta num"><span>1h · min ${esc(fmt(metric, s.min != null ? s.min : min))}</span><span>avg ${esc(fmt(metric, avg))}</span><span>max ${esc(fmt(metric, s.max != null ? s.max : max))}</span><span>now ${esc(fmt(metric, s.last != null ? s.last : vals[vals.length - 1]))}</span></div>`;
+}
+function metricBlock(r, noChart) {
+  const keys = Object.keys(r.metrics || {}).filter((k) => r.metrics[k] != null && !QUIET_METRICS.test(k));
+  if (!keys.length) return "";
+  const cur = keys.includes(state.metric) ? state.metric : keys[0];
+  const drawn = !noChart && state.spark && state.spark.key === sparkKey(r.id, cur) && state.spark.series ? spark(state.spark.series, cur) : "";
+  return `<div class="chips">${keys.map((k) => `<button type="button" class="chip ${!noChart && k === cur ? "on" : ""}" ${noChart ? "" : `data-metric="${esc(k)}"`}>${esc(k)} <b>${esc(fmt(k, r.metrics[k]))}</b></button>`).join("")}</div>${drawn}`;
+}
+function recentFor(pred, n, id) {
+  const fromExplain = id && state.detailRecent[id];
+  let list;
+  if (fromExplain) list = fromExplain.filter((c) => !isChurn(c)).slice(0, n);
+  else list = D.changes.filter((c) => pred(c) && !isChurn(c)).slice(-n).reverse();
+  return list.length ? `<div class="feed">${list.map((c) => changeRow(c, true)).join("")}</div>` : `<div class="empty small">No changes in the last hour.</div>`;
+}
+function rrow(r) {
+  const selId = state.sel && state.sel.t === "res" ? state.sel.id : null;
+  const docker = DOCKERISH.test(r.name) || r.id.startsWith("ctr:") ? " " + ic("docker", "", "Docker") : "";
+  return `<div class="rrow ${bad(r) ? "u" : ""} ${r.id === selId ? "sel" : ""}" data-res="${esc(r.id)}">${dot(r.health)}
+    <span class="nm" title="${esc(r.id)}">${esc(r.label || r.name)}${docker}</span><span class="sm ${bad(r) ? "t-" + r.health : ""}">${esc(reason(r))}</span></div>`;
+}
+function dedupeDisks(list) {
+  const groups = new Map();
+  for (const d of list) {
+    const k = d.health === "ok" && d.attrs && d.attrs.device ? d.attrs.device : d.id;
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k).push(d);
+  }
+  return [...groups.values()].map((g) => {
+    g.sort((a, b) => a.name.length - b.name.length);
+    return g.length > 1 ? Object.assign({}, g[0], { label: `${g[0].name}  +${g.length - 1} mounts` }) : g[0];
+  });
+}
+function fold(key, title, count, list, inner) {
+  const f = list.filter((r) => r.health === "failed").length, dg = list.filter((r) => r.health === "degraded").length;
+  const unk = list.filter((r) => r.health === "unknown").length, open = state.open[key] ?? (f + dg > 0);
+  const st = f || dg ? `<span class="st">${issues({ failed: f, degraded: dg })}</span>` : `<span class="st faint">${unk ? `${unk} unknown` : "ok"}</span>`;
+  return `<div class="kind"><button type="button" data-kind="${esc(key)}" aria-expanded="${open}"><span class="caret">${open ? "▾" : "▸"}</span>
+    ${title} <span class="cnt">${count}</span>${st}</button>${open ? `<div class="body">${inner()}</div>` : ""}</div>`;
+}
+function rowsWithOk(key, list) {
+  const hot = list.filter(bad), rest = list.filter((r) => !bad(r)), showAll = state.showOk[key] || !hot.length;
+  return (showAll ? hot.concat(rest.slice(0, 40)) : hot).map(rrow).join("") +
+    (!showAll && rest.length ? `<button type="button" class="linkish" data-showok="${esc(key)}">show ${rest.length} ok</button>` : "") +
+    (showAll && rest.length > 40 ? `<div class="faint small">+${rest.length - 40} more · use find</div>` : "");
+}
+function kindGroups(rs, scope) {
+  const kinds = [...new Set(rs.map((r) => r.kind))].filter((k) => k !== "host" && k !== "node").sort((a, b) => {
+    const ia = KIND_ORDER.indexOf(a), ib = KIND_ORDER.indexOf(b);
+    return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+  });
+  return kinds.map((k) => {
+    const raw = rs.filter((r) => r.kind === k).sort((a, b) => (RANK[a.health] ?? 9) - (RANK[b.health] ?? 9) || a.name.localeCompare(b.name));
+    const list = k === "disk" ? dedupeDisks(raw) : raw, key = scope + "|" + k;
+    const label = k === "container" && raw.some((r) => r.id.startsWith("ctr:")) && !raw.some((r) => r.id.startsWith("lxc:")) ? "containers" : (KIND_LABEL[k] || k);
+    return fold(key, ic(KIND_ICON[k]) + esc(label), raw.length, list, () => rowsWithOk(key, list));
+  }).join("");
+}
+function nsTree(g) {
+  const rs = g.rs.filter((r) => r.kind === "workload" || r.kind === "pod");
+  const nss = [...new Set(rs.map((r) => (r.labels && r.labels.namespace) || "default"))].map((ns) => ({ ns, rs: rs.filter((r) => ((r.labels && r.labels.namespace) || "default") === ns) }))
+    .sort((a, b) => b.rs.filter(bad).length - a.rs.filter(bad).length || a.ns.localeCompare(b.ns));
+  const hot = nss.filter((n) => n.rs.some(bad)), foldKey = "nsfold:" + g.key, showAll = state.showOk[foldKey];
+  const one = ({ ns, rs: list }) => {
+    const wls = list.filter((r) => r.kind === "workload").sort((a, b) => (RANK[a.health] ?? 9) - (RANK[b.health] ?? 9) || a.name.localeCompare(b.name));
+    const loose = list.filter((r) => r.kind === "pod" && !ownerOf(r));
+    return fold(`ns:${g.key}:${ns}`, `<span class="mono">${esc(ns)}</span>`, `${wls.length}w · ${list.length - wls.length}p`, list, () =>
+      wls.map((w) => { const pods = podsOf(w);
+        return fold(`wl:${w.id}`, ic("workload") + esc(w.name), esc(w.attrs.ready || ""), [w].concat(pods), () =>
+          `<button type="button" class="linkish" data-res="${esc(w.id)}">${esc(w.attrs.kind || "workload")} details ›</button>` + pods.sort((a, b) => (RANK[a.health] ?? 9) - (RANK[b.health] ?? 9)).map(rrow).join("")); }).join("") +
+      (loose.length ? fold(`static:${g.key}:${ns}`, "unowned pods", loose.length, loose, () => loose.map(rrow).join("")) : ""));
+  };
+  return (showAll ? nss : hot).map(one).join("") +
+    (!showAll && nss.length > hot.length ? `<button type="button" class="linkish" data-showok="${esc(foldKey)}">show ${nss.length - hot.length} healthy namespaces</button>` : "") +
+    (!nss.length ? `<div class="empty small">Open this cluster to load workloads.</div>` : "");
+}
+const crumbs = (...parts) => `<div class="crumb">${parts.filter(Boolean).join("<span>›</span>")}<button type="button" class="x" data-close aria-label="Close">close</button></div>`;
+const scopeCrumb = (g) => `<button type="button" data-scope="${esc(g.key)}">${esc(g.name)}</button>`;
+function machineView(name, inline) {
+  const m = M.machines.get(name);
+  if (!m) return (inline ? "" : crumbs()) + `<div class="empty">No machine ${esc(name)}.</div>`;
+  const g = M.groups.get(m.group), a = (m.host || {}).attrs || {};
+  const up = a.boot_time ? ago((Date.now() - Date.parse(a.boot_time)) / 1000) : null;
+  const role = m.knode ? `k8s node · ${esc(m.knode.attrs.status || "")}` : m.pnode ? `proxmox node · ${esc(m.pnode.attrs.status || "")}` : "";
+  return `${inline ? "" : crumbs(g && g.type !== "host" ? scopeCrumb(g) : "<span>host</span>", `<span>${m.knode ? "node" : m.pnode ? "pve node" : ""}</span>`)}
+    <div class="ititle">${dot(m.stale ? "unknown" : m.failed ? "failed" : m.degraded ? "degraded" : "ok")}${ic(machineIcon(m) || "host", "lg", a.os || (m.pnode ? "Proxmox VE" : ""))}<b>${esc(name)}</b>${m.stale ? `<span class="small muted">stale ${ago(m.age)}</span>` : ""}</div>
+    <div class="facts">${[role, a.os, a.cpu_count && a.cpu_count + " cpu", a.memory_total_bytes && bytes(a.memory_total_bytes), up && "up " + up,
+      m.age != null && `last push ${ago(m.age)} ago`].filter(Boolean).join(" · ")}</div>
+    ${(m.host || m.pnode) ? metricBlock(m.host || m.pnode, inline) : ""}
+    <h3>Resources</h3>${kindGroups(m.rs, "m:" + name) || `<div class="empty small">No resources loaded for this machine.</div>`}
+    ${inline ? "" : `<h3>Changed here</h3>${recentFor((c) => hostOf(byId.get(c.resource_id) || { kind: "process", id: c.resource_id, labels: {} }) === name, 5)}`}`;
+}
+function scopeView(key) {
+  const g = M.groups.get(key);
+  if (!g) return crumbs() + `<div class="empty">Gone.</div>`;
+  if (g.type === "host" && g.machines[0]) return machineView(g.machines[0].name);
+  const nodes = g.machines.map((m) => `<div class="rrow ${m.failed || m.degraded ? "u" : ""}" data-machine="${esc(m.name)}">${dot(m.stale ? "unknown" : m.failed ? "failed" : m.degraded ? "degraded" : "ok")}
+      <span class="nm">${esc(m.name)}</span><span class="sm">${esc(((m.knode || m.pnode || {}).attrs || {}).status || "")} · cpu ${fmt("x_pct", m.cpu)} · mem ${fmt("x_pct", m.mem)}${m.stale ? " · stale" : ""}</span></div>`).join("");
+  return `${crumbs(`<span>${SCOPE_LABEL[g.type]}</span>`)}
+    <div class="ititle">${dot(g.failed ? "failed" : g.sev === 1 ? "degraded" : "ok")}${ic(SCOPE_ICON[g.type], "lg")}<b>${esc(g.name)}</b><span class="small">${issues(g)}</span></div>
+    <div class="facts">${groupSummary(g)}</div>${g.machines.length ? `<h3>Nodes</h3>${nodes}` : ""}
+    ${g.type === "k8s" ? `<h3>Namespaces</h3>${nsTree(g)}` : `<h3>Resources</h3>${kindGroups(g.rs, "s:" + key)}`}
+    <h3>Changed here</h3>${recentFor((c) => { const s = scopeOf(byId.get(c.resource_id)); return s && s.g === key; }, 5)}`;
+}
+function findingsFor(id) {
+  return state.detailFindings[id] || (D.findings.findings || []).filter((x) => x.resource_id === id);
+}
+function actionsFor(id) {
+  return state.detailActions[id] || ((D.actions && D.actions.runs) || []).filter((x) => x.resource_id === id);
+}
+function resourceView(id) {
+  const r = byId.get(id);
+  if (!r) return crumbs() + `<div class="empty mono">${esc(state.missing[id] || id)} is gone.</div>`;
+  const s = scopeOf(r), g = s && M.groups.get(s.g), h = hostOf(r);
+  const f = findingsFor(id), acts = actionsFor(id);
+  const kv = Object.entries(Object.assign({}, r.labels, r.attrs)).filter(([, v]) => v != null && v !== "" && !(Array.isArray(v) && !v.length))
+    .map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(typeof v === "object" ? JSON.stringify(v) : v)}</dd>`).join("");
+  const owner = r.kind === "pod" && ownerOf(r);
+  return `${crumbs(g && g.type !== "host" && scopeCrumb(g), h && M.machines.has(h) && `<button type="button" data-machine="${esc(h)}">${esc(h)}</button>`,
+      owner && `<button type="button" data-res="${esc(owner.id)}">${esc(owner.name)}</button>`, `<span>${esc(KIND_LABEL[r.kind] || r.kind)}</span>`)}
+    <div class="ititle">${dot(r.health)}${ic(KIND_ICON[r.kind], "lg")}<b>${esc(r.name)}</b><span class="small t-${esc(r.health)}">${esc(r.health)}</span></div>
+    <div class="mono faint">${esc(r.id)}</div>
+    ${r.health !== "ok" ? `<div class="why-line t-${esc(r.health)}">${esc(reason(r))} · since ${esc(sinceOf(id))}</div>` : ""}
+    ${f.map((x) => `<div class="callout finding"><div class="lbl">Finding · ${esc(x.severity)}</div><div>${esc(x.summary)}</div>
+      <div class="muted">${esc(x.rule)} · opened ${agoTs(x.opened_at)} ago</div>${(x.logs || []).length ? `<pre>${x.logs.slice(0, 3).map((l) => esc(l.message)).join("\n")}</pre>` : ""}</div>`).join("")}
+    ${acts.filter((a) => a.status === "awaiting_approval").map((a) => `<div class="callout approval"><div class="lbl">Waiting for approval</div><div class="mono">${esc(a.action)}</div>
+      <div class="muted">requested ${agoTs(a.created_at)} ago${a.expires_at ? ` · expires in ${ago((Date.parse(a.expires_at) - Date.now()) / 1000)}` : ""} · read-only here</div></div>`).join("")}
+    ${r.kind === "workload" ? `<h3>Pods</h3>${podsOf(r).sort((a, b) => (RANK[a.health] ?? 9) - (RANK[b.health] ?? 9)).map(rrow).join("") || `<div class="empty">No pods linked. Without an owner label, pods group by name prefix.</div>`}` : ""}
+    ${metricBlock(r, false)}
+    <h3>Details</h3><dl class="kv">${kv || `<dt class="muted">—</dt><dd class="faint">no attributes</dd>`}</dl>
+    ${acts.filter((a) => a.status !== "awaiting_approval").length ? `<h3>Prior actions</h3>` + acts.filter((a) => a.status !== "awaiting_approval").map((a) =>
+      `<div class="small muted">${esc(a.status)} · ${esc(a.action)} · ${agoTs(a.created_at)} ago</div>`).join("") : ""}
+    <h3>Changed here</h3>${recentFor((ch) => ch.resource_id === id, 5, id)}`;
+}
+
+function matcher(q) {
+  const normQ = q.toLowerCase().replace(/\b(?:over|above)\s+(\d+(?:\.\d+)?)%?/g, ">$1").replace(/\b(?:under|below)\s+(\d+(?:\.\d+)?)%?/g, "<$1").replace(/%/g, "");
+  const tests = [], kindWord = (t) => KIND_ALIAS[t] && (/s$/.test(t) || t === "storage" || t === "lxc");
+  const toks = normQ.split(/\s+/).filter(Boolean).reduce((out, t) => {
+    const prev = out[out.length - 1];
+    if (/^[<>]=?\d/.test(t) && prev && /^[a-z_.]+$/.test(prev) && !kindWord(prev)) out[out.length - 1] = prev + t; else out.push(t);
+    return out;
+  }, []);
+  for (const t of toks) {
+    let m;
+    if ((m = t.match(/^(?:kind|type):(\w+)$/)) || (kindWord(t) && (m = [t, t]))) { const k = KIND_ALIAS[m[1]] || m[1]; tests.push((r) => r.kind === k); }
+    else if ((m = t.match(/^is:(\w+)$/))) { const w = m[1]; tests.push(w === "unhealthy" ? bad : (r) => r.health === w || (r.attrs && r.attrs.status === w)); }
+    else if ((m = t.match(/^([a-z_.]*)(>=|<=|>|<)(\d+(?:\.\d+)?)$/))) {
+      const key = m[1], op = m[2], v = +m[3], cmp = { ">": (x) => x > v, "<": (x) => x < v, ">=": (x) => x >= v, "<=": (x) => x <= v }[op];
+      tests.push((r) => Object.entries(r.metrics).some(([k, x]) => x != null && (key ? k.includes(key) : k.endsWith("_pct")) && cmp(x)));
+    } else tests.push((r) => r.id.toLowerCase().includes(t) || r.name.toLowerCase().includes(t));
+  }
+  return (r) => tests.every((f) => f(r));
+}
+function searchView(q) {
+  const hits = q ? D.all.filter(matcher(q)).sort((a, b) => (RANK[a.health] ?? 9) - (RANK[b.health] ?? 9) || a.id.localeCompare(b.id)) : [];
+  const word = plural(hits.length, "match").replace("matchs", "matches");
+  return `${crumbs(`<span>${q ? `“${esc(q)}” · ${word}` : "Find or filter"}</span>`)}
+    <div class="chips">${PRESETS.map((p) => `<button type="button" class="chip ${p === q ? "on" : ""}" data-preset="${esc(p)}">${esc(p)}</button>`).join("")}</div>
+    ${hits.slice(0, 60).map((r) => `<div class="rrow ${bad(r) ? "u" : ""}" data-res="${esc(r.id)}">${dot(r.health)}<span class="nm">${esc(r.name)} <span class="faint">${esc(scopeText(scopeOf(r)))}</span></span><span class="sm">${esc(reason(r))}</span></div>`).join("")}
+    ${hits.length > 60 ? `<div class="faint small">+${hits.length - 60} more, keep typing</div>` : q && !hits.length ? `<div class="empty">Nothing matches.</div>` : ""}
+    ${q ? "" : `<div class="faint small">Words match names and ids. Also <span class="mono">kind:disk</span>, <span class="mono">is:degraded</span>, <span class="mono">used&gt;90</span>, “over 90%”.</div>`}`;
+}
+
+let M = null;
+function renderPanel() {
+  const s = state.sel, el = $("panel");
+  el.hidden = !s;
+  $("layout").classList.toggle("open", !!s);
+  if (!s) return;
+  el.innerHTML = s.t === "machine" ? machineView(s.id) : s.t === "scope" ? scopeView(s.id) : s.t === "search" ? searchView(s.id) : resourceView(s.id);
+}
+function renderView() {
+  if (state.tab === "fleet" && single()) state.tab = "overview";
+  $("view").innerHTML = state.tab === "fleet" ? fleetView() : state.tab === "changes" ? changesView() : state.tab === "actions" ? actionsView() : overviewView();
+}
+function renderFoot() {
+  const s = D.status, gs = [...M.groups.values()], n = (t) => gs.filter((g) => g.type === t).length;
+  const scope = (s.nodes && s.nodes.length) ? [n("k8s") && plural(n("k8s"), "cluster"), n("pve") && plural(n("pve"), "pve node"), n("host") && plural(n("host"), "host")].filter(Boolean).join(" · ")
+    : "node " + ((gs[0] && gs[0].name) || "");
+  const src = s.nodes && s.nodes.length ? `${s.nodes.filter((x) => !x.stale).length}/${s.nodes.length} agents pushing`
+    : (s.collectors || []).map((c) => `<span class="${c.stale || !c.ok ? "t-degraded" : ""}">${esc(c.source)} ${ago(c.age_secs)}</span>`).join(" · ");
+  $("foot").innerHTML = `<span>${esc(scope)} · ${resourceTotal()} resources</span><span>${src}</span>
+    <span>${state.paused ? "paused" : "updated " + new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false })}</span>
+    <label>refresh <select id="interval" aria-label="Refresh interval">${[5, 15, 60].map((v) => `<option value="${v}" ${v === state.interval ? "selected" : ""}>${v}s</option>`).join("")}</select></label>
+    <span class="spacer"></span><span><svg class="logo" aria-hidden="true"><use href="#pb-mark"/></svg>Pulseblade v${esc(s.version)} · seq ${s.as_of_seq} · up ${ago(s.uptime_secs)} · db ${bytes(s.db && s.db.size_bytes)}</span>`;
+  $("interval").onchange = (e) => { state.interval = Number(e.target.value); schedule(); };
+}
+function liveHealth() {
+  const u = unhealthy();
+  $("hdr").dataset.health = u.some((r) => r.health === "failed") ? "failed" : u.length || staleSources().length ? "degraded" : "ok";
+}
+function render() {
+  if (!D.status) {
+    $("view").innerHTML = `<section class="card"><div class="empty">Loading…</div></section>`;
+    return;
+  }
+  M = buildModel();
+  liveHealth();
+  if (state.tab === "fleet" && single()) state.tab = "overview";
+  renderTabs(); renderView(); renderPanel(); renderFoot();
+}
+function syncUrl() {
+  const p = new URLSearchParams(location.search);
+  p.set("tab", state.tab);
+  if (p.has("theme")) p.set("theme", document.documentElement.getAttribute("data-theme") || "dark");
+  const q = $("q").value.trim();
+  if (q) p.set("q", q); else p.delete("q");
+  p.delete("kind");
+  if (state.sel && state.sel.t === "res") p.set("select", state.sel.id); else if (state.sel && state.sel.t === "search" && state.sel.id) p.set("q", state.sel.id); else p.delete("select");
+  if (state.metric) p.set("metric", state.metric); else p.delete("metric");
+  if (state.tab === "fleet" && state.fleet !== "all") p.set("fleet", state.fleet); else p.delete("fleet");
+  const next = "?" + p.toString();
+  if (next !== location.search) history.replaceState(null, "", next);
+}
+
+async function loadChanges() {
+  const key = D.status.as_of_seq + ":" + state.win;
+  if (state.changesKey === key) return;
+  let since = state.win;
+  const all = [];
+  for (let i = 0; i < 4; i++) {
+    const cs = await api(`/api/v1/changes?since=${encodeURIComponent(since)}&limit=250&compact=false`);
+    all.push(...(cs.changes || []));
+    if (!cs.truncated || !cs.next_cursor) break;
+    since = cs.next_cursor;
+  }
+  D.changes = all;
+  state.changesKey = key;
+}
+async function loadNodesIfNeeded() {
+  if (!(k8sPresent() || pvePresent() || countOf("node"))) return;
+  if (state.nodesKey === D.status.as_of_seq) return;
+  const jobs = [];
+  if (countOf("node")) jobs.push(api("/api/v1/snapshot?detail=full&kind=node&limit=200"));
+  if (countOf("vm")) jobs.push(api("/api/v1/snapshot?detail=brief&kind=vm&limit=200"));
+  if (countOf("storage")) jobs.push(api("/api/v1/snapshot?detail=brief&kind=storage&limit=200"));
+  const pages = await Promise.all(jobs);
+  for (const p of pages) mergeResources(p.resources || [], true);
+  state.nodesKey = D.status.as_of_seq;
+}
+async function loadFleetExtras() {
+  await loadNodesIfNeeded();
+  const jobs = [];
+  if (countOf("disk")) jobs.push(api("/api/v1/snapshot?detail=brief&kind=disk&limit=200"));
+  if (countOf("container")) jobs.push(api("/api/v1/snapshot?detail=brief&kind=container&limit=200"));
+  const pages = await Promise.all(jobs);
+  for (const p of pages) mergeResources(p.resources || [], true);
+}
+async function loadMachine(name) {
+  const jobs = [api(`/api/v1/snapshot?detail=full&labels=${encodeURIComponent("host=" + name)}&limit=200`)];
+  if (pvePresent() || byId.has("node:" + name)) jobs.push(api(`/api/v1/snapshot?detail=full&labels=${encodeURIComponent("node=" + name)}&limit=200`));
+  const pages = await Promise.all(jobs);
+  for (const p of pages) mergeResources(p.resources || [], true);
+}
+async function loadResource(id) {
+  try {
+    const e = await api("/api/v1/resources/" + encodeURIComponent(id));
+    const raw = e.resource || {};
+    const metrics = {};
+    for (const [k, v] of Object.entries(e.metrics || {})) if (v && typeof v === "object") metrics[k] = v.value;
+    mergeResources([Object.assign({}, raw, { metrics })], true);
+    mergeResources((e.children && e.children.unhealthy) || [], true);
+    state.detailRecent[id] = e.recent_changes || [];
+    state.detailFindings[id] = e.findings || [];
+    state.detailActions[id] = e.actions || [];
+    delete state.missing[id];
+  } catch (err) {
+    state.missing[id] = err.message || "not found";
+  }
+}
+async function loadScope(key) {
+  if (key.startsWith("k8s:")) {
+    const cluster = key.slice(4);
+    const label = encodeURIComponent("cluster=" + cluster);
+    const [wl, pods] = await Promise.all([
+      api(`/api/v1/snapshot?detail=brief&kind=workload&labels=${label}&limit=100`),
+      api(`/api/v1/snapshot?detail=brief&kind=pod&labels=${label}&limit=100`),
+    ]);
+    mergeResources(wl.resources || [], true);
+    mergeResources(pods.resources || [], true);
+  } else {
+    const name = key.split(":").slice(1).join(":");
+    if (name) await loadMachine(name);
+  }
+}
+async function loadSearch(q) {
+  if (!q) return;
+  const jobs = [];
+  const explicit = q.match(/\bkind:(\w+)/);
+  if (explicit) {
+    const k = KIND_ALIAS[explicit[1]] || explicit[1];
+    jobs.push(api("/api/v1/snapshot?detail=brief&kind=" + encodeURIComponent(k) + "&limit=50"));
+  } else if (!/\b(?:is:|over|under|above|below)\b|[<>]/.test(q)) {
+    const word = q.split(/\s+/).find((t) => t && !t.includes(":"));
+    if (word) jobs.push(api("/api/v1/snapshot?detail=brief&query=" + encodeURIComponent(word) + "&limit=50"));
+  }
+  const pages = await Promise.all(jobs);
+  for (const p of pages) mergeResources(p.resources || [], true);
+}
+function loneHostName() {
+  if (k8sPresent() || pvePresent()) return null;
+  const hosts = D.all.filter((r) => r.kind === "host");
+  return hosts.length === 1 && countOf("host") <= 1 ? hosts[0].name : null;
+}
+async function loadSel(sel) {
+  if (!sel) return;
+  if (sel.t === "res") await loadResource(sel.id);
+  else if (sel.t === "machine") await loadMachine(sel.id);
+  else if (sel.t === "scope") await loadScope(sel.id);
+  else if (sel.t === "search") await loadSearch(sel.id);
+}
+async function enrich() {
+  if (!D.status) return;
+  await loadChanges();
+  if (state.tab === "fleet") await loadFleetExtras();
+  else if (k8sPresent() || pvePresent()) await loadNodesIfNeeded();
+  const q = $("q") && $("q").value.trim();
+  if (q && !(state.sel && state.sel.t === "search")) await loadSearch(q);
+  if (state.sel) await loadSel(state.sel);
+  else if (state.tab === "overview") {
+    const only = loneHostName();
+    if (only) await loadMachine(only);
+  }
+}
+async function ensureSpark() {
+  const s = state.sel;
+  if (!s || s.t !== "res") return;
+  const r = byId.get(s.id);
+  if (!r) return;
+  const metric = chartMetric(r);
+  if (!metric) return;
+  const key = sparkKey(r.id, metric);
+  if ((state.spark && state.spark.key === key) || state.sparkLoading === key) return;
+  state.sparkLoading = key;
+  try {
+    const series = await api(`/api/v1/metrics?id=${encodeURIComponent(r.id)}&metric=${encodeURIComponent(metric)}&range=1h`);
+    if (state.sparkLoading !== key) return;
+    state.spark = { key, series };
+    if (M) renderPanel();
+  } catch (e) {
+    state.spark = { key, series: null };
+  } finally {
+    if (state.sparkLoading === key) state.sparkLoading = null;
+  }
+}
+let refreshing = false;
 async function refresh() {
+  if (refreshing) return;
+  refreshing = true;
   try {
     const [status, snap, findings, actions] = await Promise.all([
-      api("/api/v1/status"), api("/api/v1/snapshot?detail=full&limit=500"),
-      api("/api/v1/findings?limit=20"), api("/api/v1/actions")]);
-    state.resources = snap.resources;
-    renderStatus(status); renderHosts(snap.resources); renderUnhealthy(snap.resources);
-    renderFindings(findings); renderActions(actions);
-    fillKinds(snap.resources); renderResources();
-    await Promise.all([refreshChanges(), refreshDetail()]);
-    $("updated").textContent = "updated " + new Date().toLocaleTimeString();
+      api("/api/v1/status"),
+      api("/api/v1/snapshot"),
+      api("/api/v1/findings?limit=20"),
+      api("/api/v1/actions"),
+    ]);
+    D.status = status;
+    D.findings = findings || { total: 0, findings: [] };
+    D.actions = actions || { runs: [] };
+    D.counts = snap.counts || {};
+    const detail = D.all.filter((r) => r.detail);
+    D.all = [];
+    byId = new Map();
+    mergeResources(detail);
+    mergeResources([].concat(snap.hosts || [], snap.resources || []));
+    await enrich();
+    render();
+    sweep();
+    ensureSpark();
     showError(null);
-  } catch (e) { showError(e); }
+  } catch (e) {
+    showError(e);
+    if (!D.status) render();
+  } finally {
+    refreshing = false;
+  }
 }
 
+function select(sel, keepMetric) {
+  const same = sel && state.sel && sel.t === state.sel.t && sel.id === state.sel.id;
+  state.sel = sel;
+  if (!keepMetric && !(sel && sel.t === "res" && same)) state.metric = sel && sel.t === "res" ? state.metric : null;
+  if (!keepMetric && sel && sel.t === "res" && !same) state.metric = null;
+  render();
+  const job = sel ? loadSel(sel).then(() => { render(); return ensureSpark(); }) : Promise.resolve();
+  job.catch(showError);
+  if (sel) { const p = $("panel"); if (p) p.scrollTop = 0; }
+  syncUrl();
+}
+const sameSel = (t, id) => state.sel && state.sel.t === t && state.sel.id === id;
+document.addEventListener("click", (ev) => {
+  const t = ev.target.closest("[data-tab],[data-strip],[data-gofleet],[data-fleet],[data-win],[data-machine],[data-scope],[data-g],[data-res],[data-kind],[data-showok],[data-metric],[data-close],[data-churn],[data-attnall],[data-attnless],[data-preset],[data-theme-choice]");
+  if (!t) return;
+  const d = t.dataset;
+  if (d.themeChoice) return setTheme(d.themeChoice);
+  if (d.tab) { state.tab = d.tab; render(); enrich().then(render).catch(showError); return syncUrl(); }
+  if (d.gofleet) { state.tab = "fleet"; state.fleet = d.gofleet; render(); enrich().then(render).catch(showError); return syncUrl(); }
+  if (d.fleet) { state.fleet = d.fleet; render(); return syncUrl(); }
+  if (d.win) { state.win = d.win; state.changesKey = ""; loadChanges().then(render).catch(showError); return; }
+  if (d.strip) { state.filter = state.filter === d.strip ? null : d.strip; return render(); }
+  if (d.close !== undefined) { $("q").value = ""; return select(null); }
+  if (d.preset) { $("q").value = d.preset; return select({ t: "search", id: d.preset }); }
+  if (d.attnall !== undefined) { state.attnAll = true; return render(); }
+  if (d.attnless !== undefined) { state.attnAll = false; return render(); }
+  if (d.churn !== undefined) { state.churn = !state.churn; return render(); }
+  if (d.metric) { state.metric = d.metric; state.spark = null; render(); ensureSpark(); return syncUrl(); }
+  if (d.g) { state.open["g:" + d.g] = t.getAttribute("aria-expanded") !== "true"; return render(); }
+  if (d.kind) { state.open[d.kind] = t.getAttribute("aria-expanded") !== "true"; return render(); }
+  if (d.showok) { state.showOk[d.showok] = true; return render(); }
+  if (d.machine) return select(sameSel("machine", d.machine) ? null : { t: "machine", id: d.machine });
+  if (d.scope) return select(sameSel("scope", d.scope) ? null : { t: "scope", id: d.scope });
+  if (d.res) return select({ t: "res", id: d.res });
+});
+document.addEventListener("keydown", (ev) => {
+  if (ev.key === "/" && document.activeElement !== $("q")) { ev.preventDefault(); $("q").focus(); }
+  else if (ev.key === "Escape") { $("q").value = ""; $("q").blur(); select(null); }
+  else if (ev.key === "Enter" && ev.target.matches && ev.target.matches(".item")) ev.target.click();
+});
+let searchTimer = null;
+$("q").oninput = () => {
+  const v = $("q").value.trim();
+  state.sel = { t: "search", id: v };
+  render();
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => { loadSearch(v).then(render).catch(showError); }, 180);
+};
+$("q").onfocus = () => { if (!state.sel || state.sel.t !== "res") select({ t: "search", id: $("q").value.trim() }, true); };
+
+function decorate() {
+  const r = (n, f) => Array.from({ length: n }, (_, i) => f(i)).join("");
+  $("bgfx").innerHTML = `<g fill="none" stroke="var(--fx-ring)">${[120, 240, 390, 570, 780].map((v) => `<circle cx="720" cy="64" r="${v}"/>`).join("")}</g>`
+    + `<g stroke="var(--fx-grid)">${r(16, (i) => `<path d="M720 64L${i * 240 - 1080} 560"/>`)}${[118, 150, 196, 262, 356, 490].map((y) => `<path d="M0 ${y}H1440"/>`).join("")}</g>`
+    + `<path d="M990 560C760 470 650 320 720 64" fill="none" stroke="var(--fx-arc)" stroke-width="3" stroke-linecap="round"/>`;
+}
+decorate();
+
+function setTheme(theme) {
+  theme = theme === "light" ? "light" : "dark";
+  document.documentElement.setAttribute("data-theme", theme);
+  document.documentElement.style.colorScheme = theme;
+  document.documentElement.style.backgroundColor = theme === "light" ? "#f4efe6" : "#0b1020";
+  try { localStorage.setItem("pulseblade-theme", theme); } catch (e) {}
+  document.querySelectorAll("[data-theme-choice]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.themeChoice === theme)));
+  const p = new URLSearchParams(location.search);
+  if (p.get("theme") && p.get("theme") !== theme) {
+    p.set("theme", theme);
+    history.replaceState(null, "", "?" + p.toString());
+  }
+}
+setTheme(document.documentElement.getAttribute("data-theme"));
+
+function sweep() {
+  const h = $("hdr");
+  h.classList.remove("sweep"); void h.offsetWidth; h.classList.add("sweep");
+}
 function schedule() {
   clearInterval(state.timer);
-  if (!state.paused) state.timer = setInterval(refresh, Number($("interval").value) * 1000);
+  if (!state.paused) state.timer = setInterval(refresh, state.interval * 1000);
 }
-
-document.addEventListener("click", (ev) => {
-  const chip = ev.target.closest("[data-metric]");
-  if (chip) { state.metric = chip.dataset.metric; refreshDetail().catch(showError); return; }
-  const row = ev.target.closest("[data-id]");
-  if (row) select(row.dataset.id);
-});
-$("toggle").onclick = () => {
+$("live").onclick = () => {
   state.paused = !state.paused;
-  $("toggle").textContent = state.paused ? "Resume" : "Pause";
   $("hdr").classList.toggle("paused", state.paused);
-  schedule(); if (!state.paused) refresh();
+  $("live").title = state.paused ? "Paused · click to resume" : "Live · click to pause";
+  $("live").setAttribute("aria-label", state.paused ? "Resume live refresh" : "Pause live refresh");
+  schedule();
+  if (D.status) renderFoot();
 };
-$("interval").onchange = schedule;
-$("kind").onchange = renderResources;
-$("q").oninput = renderResources;
-$("window").onchange = () => refreshChanges().catch(showError);
-$("range").onchange = () => refreshDetail().catch(showError);
-$("q").value = link.get("q") || "";
-refresh(); schedule();
+
+if (TABS.some(([k]) => k === params.get("tab"))) state.tab = params.get("tab");
+if (["k8s", "pve", "host", "all"].includes(params.get("fleet"))) state.fleet = params.get("fleet");
+if (["15m", "1h", "6h", "24h"].includes(params.get("win"))) state.win = params.get("win");
+if (params.get("filter")) state.filter = params.get("filter");
+const initialQ = [params.get("kind") ? "kind:" + params.get("kind") : "", params.get("q") || ""].filter(Boolean).join(" ");
+if (initialQ) $("q").value = initialQ;
+if (params.get("select")) state.sel = { t: "res", id: params.get("select") };
+else if (initialQ) state.sel = { t: "search", id: initialQ };
+refresh();
+schedule();
+
 </script>
 </body>
 </html>

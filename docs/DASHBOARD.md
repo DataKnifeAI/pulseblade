@@ -1,6 +1,6 @@
 # Dashboard
 
-Proposed layout for the next human view. The page that ships today is the self-contained HTML in `crates/pulseblade-mcp/src/dashboard.html`: dark by default, with a light toggle. This document is the design after that.
+The page at `/` serves this layout. It is the self-contained HTML in `crates/pulseblade-mcp/src/dashboard.html`: dark by default, light toggle kept in `localStorage` and applied before first paint. Detail opens in a side panel; the list stays put. The screenshots are the design reference (sample fleet `poc-apps`, `pve-01`, `ws-01`).
 
 ## Open at a glance
 
@@ -56,10 +56,13 @@ No text in the mark. No blades or weapons. No game imagery. No Greek motifs.
 
 Kubernetes, Proxmox, Linux and distro, and Docker icons are from [Simple Icons](https://simpleicons.org) (CC0) and name those integrated systems; generic line icons are original, and the trademarks stay with their owners.
 
-## Data the real build still needs
+## Data the dashboard still degrades without
 
-- Per-node last-push age on the hub status API.
-- A pod owner label.
-- A pod node label.
-- A host label on Proxmox nodes.
-- A kind or label that distinguishes a Proxmox node from a Kubernetes node.
+Hub `/api/v1/status` includes `nodes` (`node`, `seq`, `last_push_age_secs`, `stale`) once a node has pushed, so a node that stops pushing is not shown as healthy. The field is omitted on a node.
+
+Still missing, and the page works around each gap:
+
+- A pod owner label. Pods group under a workload when `labels.owner` or the parent id matches; otherwise by name prefix, or they stand alone.
+- A pod node label. A pod is not pinned to a machine tile unless its parent or id says which node.
+- A host label on Proxmox nodes. A Proxmox node and a host tile merge when their names match.
+- A kind or label that distinguishes a Proxmox node from a Kubernetes node. Kubernetes nodes are `knode:` ids. The Proxmox section appears only when `vm:`, `lxc:`, or `storage:` resources exist; `node:` ids in that fleet are Proxmox nodes.

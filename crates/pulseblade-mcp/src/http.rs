@@ -24,6 +24,7 @@ use crate::prom;
 use crate::query::{self, Detail, QueryError};
 
 const DASHBOARD: &str = include_str!("dashboard.html");
+const FAVICON_PNG: &[u8] = include_bytes!("../../../docs/assets/dashboard/favicon-32.png");
 
 #[derive(Clone)]
 struct AppState {
@@ -61,6 +62,7 @@ pub fn router_with(
         .fallback(|| async { ApiError::not_found("no such API endpoint") });
     Router::new()
         .route("/", get(|| async { Html(DASHBOARD) }))
+        .route("/favicon.ico", get(favicon))
         .route("/metrics", get(prometheus))
         .nest("/api/v1", api)
         .with_state(AppState {
@@ -321,6 +323,17 @@ async fn logs(
         limit: q.limit,
     };
     ok(blocking(&st, move |s| query::logs(s, params)).await?)
+}
+
+async fn favicon() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "image/png"),
+            (header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        FAVICON_PNG,
+    )
+        .into_response()
 }
 
 async fn prometheus(State(st): State<AppState>) -> ApiResult {
@@ -589,6 +602,27 @@ mod tests {
         assert_eq!(code, StatusCode::OK);
         assert!(ctype.unwrap().starts_with("text/html"));
         assert!(html.contains("/api/v1/status"));
+        assert!(html.contains("Overview"));
+        assert!(html.contains("rel=\"icon\""));
+
+        let res = app
+            .clone()
+            .oneshot(
+                HttpRequest::get("/favicon.ico")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("image/png")
+        );
+        let icon = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        assert!(icon.starts_with(b"\x89PNG"));
     }
 
     #[test]
