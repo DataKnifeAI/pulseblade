@@ -18,7 +18,9 @@ publish:
   tags:
     - kubernetes
   timeout: 2h
-  interruptible: true
+  # Cold release builds take long enough that a newer main push was
+  # canceling this job before the image reached Harbor.
+  interruptible: false
   cache:
     key:
       files:
