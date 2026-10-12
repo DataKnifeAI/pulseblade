@@ -19,3 +19,13 @@ jobs:
 
       - name: make test
         run: make test
+
+  push-to-gitlab:
+    name: Push to GitLab
+    uses: DataKnifeAI/github-workflows/.github/workflows/reusable-gitlab-mirror-push.yml@main
+    needs:
+      - test
+    if: always() && needs.test.result == 'success'
+    secrets: inherit
+    with:
+      gitlab_mirror_path: dk-raas/dkai/pulseblade
