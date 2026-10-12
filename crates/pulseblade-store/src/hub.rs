@@ -39,6 +39,16 @@ pub struct NodeCursor {
     pub sample_ms: i64,
 }
 
+/// One row of `node_cursors`: how far the hub has applied this node, and when
+/// it last accepted a push. `last_push_ms` is 0 for rows written before that
+/// column existed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodePush {
+    pub node: String,
+    pub seq: i64,
+    pub last_push_ms: i64,
+}
+
 /// How far the hub got after one push.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IngestResult {
@@ -67,6 +77,21 @@ impl Store {
             .optional_cursor()?;
         let (seq, sample_ms) = row.unwrap_or((0, 0));
         Ok(NodeCursor { seq, sample_ms })
+    }
+
+    /// Every node that has pushed to this hub, by node id. Empty on a node.
+    pub fn node_pushes(&self) -> crate::Result<Vec<NodePush>> {
+        let conn = self.conn();
+        let mut stmt =
+            conn.prepare("SELECT node_id, seq, last_push_ms FROM node_cursors ORDER BY node_id")?;
+        let rows = stmt.query_map([], |r| {
+            Ok(NodePush {
+                node: r.get(0)?,
+                seq: r.get(1)?,
+                last_push_ms: r.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     /// Copy `batch` into the fleet journal. Changes at or below the cursor are
@@ -165,10 +190,12 @@ impl Store {
                 sample_ms = ms;
             }
         }
+        let pushed_ms = Utc::now().timestamp_millis();
         tx.execute(
-            "INSERT INTO node_cursors (node_id, seq, sample_ms) VALUES (?1, ?2, ?3)
-             ON CONFLICT(node_id) DO UPDATE SET seq = excluded.seq, sample_ms = excluded.sample_ms",
-            params![node_id, cursor, sample_ms],
+            "INSERT INTO node_cursors (node_id, seq, sample_ms, last_push_ms) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(node_id) DO UPDATE SET
+                seq = excluded.seq, sample_ms = excluded.sample_ms, last_push_ms = excluded.last_push_ms",
+            params![node_id, cursor, sample_ms, pushed_ms],
         )?;
         tx.commit()?;
         Ok(IngestResult {
@@ -384,8 +411,47 @@ mod tests {
         assert_eq!(got.applied, 2);
         assert_eq!(got.cursor, 3);
         assert_eq!(store.current_seq().unwrap(), 3);
+        let pushes = store.node_pushes().unwrap();
+        assert_eq!(pushes.len(), 1);
+        assert_eq!(pushes[0].node, "web1");
+        assert_eq!(pushes[0].seq, 3);
+        assert!(pushes[0].last_push_ms > 0);
         let unit = store.resource("unit:web1:sshd.service").unwrap().unwrap();
         assert_eq!(unit.resource.health, Health::Failed);
         assert!(unit.present);
+    }
+
+    #[test]
+    fn old_cursor_table_gains_last_push() {
+        let path = std::env::temp_dir().join(format!(
+            "pulseblade-cursor-migrate-{}-{}.db",
+            std::process::id(),
+            Utc::now().timestamp_millis()
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE node_cursors (
+                    node_id TEXT PRIMARY KEY,
+                    seq INTEGER NOT NULL,
+                    sample_ms INTEGER NOT NULL
+                );
+                INSERT INTO node_cursors (node_id, seq, sample_ms) VALUES ('web1', 4, 10);",
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let pushes = store.node_pushes().unwrap();
+        assert_eq!(pushes.len(), 1);
+        assert_eq!(pushes[0].node, "web1");
+        assert_eq!(pushes[0].seq, 4);
+        assert_eq!(pushes[0].last_push_ms, 0);
+        drop(store);
+        for suffix in ["", "-wal", "-shm"] {
+            let mut sidecar = path.clone().into_os_string();
+            sidecar.push(suffix);
+            let _ = std::fs::remove_file(sidecar);
+        }
     }
 }

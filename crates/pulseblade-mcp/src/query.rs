@@ -12,7 +12,7 @@ use pulseblade_core::{
     parse_duration, ActionRun, Aggregation, Change, ChangeKind, Checkpoint, FindingStatus, Health,
     LogLine, Note, ResourceKind, Severity, Since, StoredResource,
 };
-use pulseblade_store::{ChangeFilter, FindingFilter, ResourceFilter, Store, StoreError};
+use pulseblade_store::{ChangeFilter, FindingFilter, NodePush, ResourceFilter, Store, StoreError};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -30,6 +30,9 @@ const MAX_EXPORT_LINES: usize = 10_000;
 const DEFAULT_INTERVAL_SECS: u64 = 15;
 /// A collector is stale after three intervals without a pass, but never sooner than this.
 const MIN_STALE_SECS: i64 = 60;
+/// A hub node is stale when the hub has not accepted a push in this long.
+/// Nodes push about every 15s, so this is several missed pushes.
+const NODE_PUSH_STALE_SECS: i64 = 90;
 /// Host metrics included in the summary snapshot.
 const KEY_HOST_METRICS: &[&str] = &["cpu.used_pct", "mem.used_pct", "load.1m", "swap.used_pct"];
 
@@ -180,6 +183,19 @@ pub struct Status {
     pub open_findings: u64,
     /// Action runs waiting for a human.
     pub awaiting_actions: u64,
+    /// Hub only. Each node that has pushed, with how long since the hub
+    /// accepted that push. Omitted on a node, which has no cursor rows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nodes: Vec<NodePushStatus>,
+}
+
+/// One node's cursor on the hub, plus whether it has stopped pushing.
+#[derive(Debug, Serialize)]
+pub struct NodePushStatus {
+    pub node: String,
+    pub seq: i64,
+    pub last_push_age_secs: i64,
+    pub stale: bool,
 }
 
 /// Self-health. `process_started` is the serving process's start time, if any.
@@ -210,7 +226,32 @@ pub fn status(store: &Store, process_started: Option<DateTime<Utc>>) -> Result<S
         checkpoints: stats.checkpoints,
         open_findings: store.open_finding_count()?,
         awaiting_actions: store.awaiting_action_count()?,
+        nodes: node_push_statuses(store, now)?,
     })
+}
+
+fn node_push_statuses(store: &Store, now: DateTime<Utc>) -> Result<Vec<NodePushStatus>> {
+    Ok(store
+        .node_pushes()?
+        .iter()
+        .map(|row| node_push_status(now, row))
+        .collect())
+}
+
+fn node_push_status(now: DateTime<Utc>, row: &NodePush) -> NodePushStatus {
+    let age_secs = if row.last_push_ms > 0 {
+        (now.timestamp_millis() - row.last_push_ms)
+            .div_euclid(1000)
+            .max(0)
+    } else {
+        NODE_PUSH_STALE_SECS + 1
+    };
+    NodePushStatus {
+        node: row.node.clone(),
+        seq: row.seq,
+        last_push_age_secs: age_secs,
+        stale: age_secs > NODE_PUSH_STALE_SECS,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1519,6 +1560,45 @@ mod tests {
         assert_eq!(st.resources.failed, 1);
         assert!(st.uptime_secs.unwrap() >= 30);
         assert_eq!(st.collectors.len(), 2);
+        assert!(st.nodes.is_empty());
+    }
+
+    #[test]
+    fn node_push_ages_and_goes_stale() {
+        let now = Utc::now();
+        let fresh = node_push_status(
+            now,
+            &NodePush {
+                node: "web1".into(),
+                seq: 3,
+                last_push_ms: now.timestamp_millis(),
+            },
+        );
+        assert_eq!(fresh.node, "web1");
+        assert_eq!(fresh.seq, 3);
+        assert!(!fresh.stale);
+        assert!(fresh.last_push_age_secs < 5);
+
+        let silent = node_push_status(
+            now,
+            &NodePush {
+                node: "web2".into(),
+                seq: 1,
+                last_push_ms: (now - Duration::seconds(120)).timestamp_millis(),
+            },
+        );
+        assert!(silent.stale);
+        assert!(silent.last_push_age_secs >= 119);
+
+        let unknown = node_push_status(
+            now,
+            &NodePush {
+                node: "old".into(),
+                seq: 1,
+                last_push_ms: 0,
+            },
+        );
+        assert!(unknown.stale);
     }
 
     #[test]

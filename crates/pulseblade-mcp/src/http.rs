@@ -377,7 +377,7 @@ mod tests {
     use axum::body::{to_bytes, Body};
     use axum::http::Request as HttpRequest;
     use chrono::Duration;
-    use pulseblade_core::{CollectorRun, Health, Observation, Resource, Sample};
+    use pulseblade_core::{CollectorRun, Health, Observation, Resource, ResourceKind, Sample};
     use serde_json::Value;
     use tower::ServiceExt;
 
@@ -458,6 +458,42 @@ mod tests {
         assert_eq!(v["resources"]["degraded"], 1);
         assert!(v["uptime_secs"].as_i64().unwrap() >= 90);
         assert_eq!(v["samples"], 6);
+        assert!(v.get("nodes").is_none(), "a node has no cursor rows");
+    }
+
+    #[tokio::test]
+    async fn status_reports_hub_node_push_age() {
+        use pulseblade_core::{Change, ChangeKind};
+        use pulseblade_store::NodeBatch;
+
+        let store = Store::open_in_memory().unwrap();
+        store
+            .ingest_node(
+                "web1",
+                &NodeBatch {
+                    changes: vec![Change {
+                        seq: 1,
+                        ts: Utc::now(),
+                        resource_id: "host:web1".into(),
+                        kind: ChangeKind::Appeared,
+                        field: None,
+                        before: None,
+                        after: None,
+                    }],
+                    resources: vec![
+                        Resource::new("host:web1", ResourceKind::Host, "web1").health(Health::Ok)
+                    ],
+                    samples: vec![],
+                },
+            )
+            .unwrap();
+        let app = router(Arc::new(store), Utc::now());
+        let (code, v) = get_json(&app, "/api/v1/status").await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(v["nodes"][0]["node"], "web1");
+        assert_eq!(v["nodes"][0]["seq"], 1);
+        assert!(v["nodes"][0]["last_push_age_secs"].as_i64().unwrap() < 30);
+        assert_eq!(v["nodes"][0]["stale"], false);
     }
 
     #[tokio::test]

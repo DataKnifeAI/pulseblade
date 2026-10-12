@@ -15,7 +15,7 @@ mod memory;
 mod pilot;
 
 pub use actions::{ActionTransition, NewAction};
-pub use hub::{IngestResult, NodeBatch, NodeCursor, RouteJob, StampedSample};
+pub use hub::{IngestResult, NodeBatch, NodeCursor, NodePush, RouteJob, StampedSample};
 pub use memory::{FindingDraft, FindingFilter};
 pub use pilot::{NewPilotRun, PilotRunRow};
 
@@ -190,9 +190,10 @@ CREATE TABLE IF NOT EXISTS pilot_runs (
 );
 
 CREATE TABLE IF NOT EXISTS node_cursors (
-    node_id   TEXT PRIMARY KEY,
-    seq       INTEGER NOT NULL,
-    sample_ms INTEGER NOT NULL
+    node_id      TEXT PRIMARY KEY,
+    seq          INTEGER NOT NULL,
+    sample_ms    INTEGER NOT NULL,
+    last_push_ms INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS route_rpc (
@@ -310,12 +311,30 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(SCHEMA)?;
+        ensure_last_push_column(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
             path,
         })
     }
+}
 
+/// Databases created before `last_push_ms` still have the old cursor table.
+fn ensure_last_push_column(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(node_cursors)")?;
+    let names: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<std::result::Result<_, _>>()?;
+    if !names.iter().any(|name| name == "last_push_ms") {
+        conn.execute(
+            "ALTER TABLE node_cursors ADD COLUMN last_push_ms INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+impl Store {
     /// Database file, or `None` for in-memory stores.
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
