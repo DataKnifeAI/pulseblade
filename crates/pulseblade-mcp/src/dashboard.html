@@ -1,81 +1,246 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Pulseblade</title>
+<script>
+(function () {
+  var theme = "dark";
+  try {
+    var stored = localStorage.getItem("pulseblade-theme");
+    if (stored === "light" || stored === "dark") theme = stored;
+  } catch (e) {}
+  document.documentElement.setAttribute("data-theme", theme);
+  document.documentElement.style.colorScheme = theme;
+  document.documentElement.style.backgroundColor = theme === "light" ? "#f4efe6" : "#0b1020";
+})();
+</script>
 <style>
   :root {
-    --bg: #0a1020; --panel: #111a2c; --panel2: #16213a; --line: #22304d;
-    --text: #d8e0ee; --muted: #8592ab; --amber: #f5a524; --ok: #2dd4a7;
-    --warn: #f97343; --bad: #ef4444; --unknown: #6b7890;
+    color-scheme: dark;
+    --bg: #0b1020;
+    --glow-amber: rgba(240, 164, 41, .10);
+    --glow-navy: #1a2744;
+    --panel: #141c2f;
+    --panel-end: #10182a;
+    --panel2: #1c2740;
+    --line: #2c3d5c;
+    --line-soft: #24344f;
+    --text: #e8eef8;
+    --muted: #93a0b8;
+    --amber: #f0a429;
+    --amber-ink: #f6b84a;
+    --amber-dim: rgba(240, 164, 41, .16);
+    --ok: #2fcea8;
+    --ok-ink: #49e0b8;
+    --warn: #e8a317;
+    --warn-ink: #f0b429;
+    --bad: #e5484d;
+    --bad-ink: #ff7070;
+    --unknown: #7d8ba3;
+    --header: rgba(11, 16, 32, .88);
+    --hover: #1c2944;
+    --sel: #2a334c;
+    --spark: #0c1424;
+    --err-bg: #3c1820;
+    --err-fg: #ffd4d4;
+    --row-line: #1c2942;
+    --shadow: 0 1px 0 rgba(255, 255, 255, .04) inset;
+    --lane: linear-gradient(90deg, transparent, var(--amber) 20%, var(--amber) 80%, transparent);
+    --sans: "IBM Plex Sans", "Source Sans 3", ui-sans-serif, system-ui, sans-serif;
+    --mono: ui-monospace, "DejaVu Sans Mono", "Noto Sans Mono", "Liberation Mono", SFMono-Regular, Menlo, Consolas, monospace;
   }
+  html[data-theme="light"] {
+    color-scheme: light;
+    --bg: #f4efe6;
+    --glow-amber: rgba(176, 106, 12, .14);
+    --glow-navy: #efe2cc;
+    --panel: #fffdf9;
+    --panel-end: #f7f2e8;
+    --panel2: #f0e6d6;
+    --line: #e2d5c3;
+    --line-soft: #eadfce;
+    --text: #221c16;
+    --muted: #6d645b;
+    --amber: #c47f0a;
+    --amber-ink: #8a5600;
+    --amber-dim: rgba(176, 106, 12, .16);
+    --ok: #0e7c6b;
+    --ok-ink: #0b6b5c;
+    --warn: #b86a08;
+    --warn-ink: #8a4f04;
+    --bad: #d3272d;
+    --bad-ink: #a61b22;
+    --unknown: #8a8178;
+    --header: rgba(255, 252, 247, .92);
+    --hover: #f6efe3;
+    --sel: #f8e6c6;
+    --spark: #fffaf3;
+    --err-bg: #fdeceb;
+    --err-fg: #8c1d22;
+    --row-line: #efe4d4;
+    --shadow: 0 1px 0 rgba(255, 255, 255, .7) inset, 0 1px 2px rgba(70, 48, 16, .04);
+    --lane: linear-gradient(90deg, transparent, #e0a02a 18%, #c47f0a 50%, #e0a02a 82%, transparent);
+  }
+  html { background: var(--bg); }
   * { box-sizing: border-box; }
-  body { margin: 0; background: radial-gradient(1200px 600px at 50% -200px, #1a2440 0%, var(--bg) 60%);
-    color: var(--text); font: 13px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; min-height: 100vh; }
-  header { display: flex; align-items: center; gap: 16px; padding: 12px 20px; border-bottom: 1px solid var(--line);
-    background: rgba(10,16,32,.85); position: sticky; top: 0; z-index: 2; backdrop-filter: blur(6px); }
-  .brand { font-weight: 700; font-size: 16px; letter-spacing: .5px; display: flex; align-items: center; gap: 8px; }
-  .pulse { width: 10px; height: 10px; border-radius: 50%; background: var(--amber); box-shadow: 0 0 0 0 rgba(245,165,36,.7);
-    animation: pulse 2s infinite; }
-  .paused .pulse { animation: none; opacity: .4; }
-  @keyframes pulse { 70% { box-shadow: 0 0 0 10px rgba(245,165,36,0); } 100% { box-shadow: 0 0 0 0 rgba(245,165,36,0); } }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    background:
+      radial-gradient(880px 380px at 88% -140px, var(--glow-amber), transparent 62%),
+      radial-gradient(1100px 480px at 8% -200px, var(--glow-navy), transparent 58%),
+      var(--bg);
+    color: var(--text);
+    font: 14px/1.4 var(--sans);
+  }
+  body::before {
+    content: "";
+    position: fixed;
+    top: 0; left: 0; right: 0;
+    height: 2px;
+    background: var(--lane);
+    z-index: 6;
+    pointer-events: none;
+  }
+  ::selection { background: var(--amber-dim); color: var(--text); }
+  header {
+    display: flex; align-items: center; gap: 10px 14px; flex-wrap: wrap;
+    padding: 10px 18px; border-bottom: 1px solid var(--line);
+    background: var(--header); position: sticky; top: 0; z-index: 4;
+    backdrop-filter: blur(10px);
+  }
+  .brand { font-weight: 700; font-size: 16px; letter-spacing: .01em; display: flex; align-items: center; gap: 8px; }
+  .brand .mark { color: var(--amber-ink); }
+  .pulse {
+    width: 9px; height: 9px; border-radius: 50%; background: var(--amber);
+    box-shadow: 0 0 8px var(--amber);
+    animation: pulse 2.2s ease-out infinite;
+  }
+  .paused .pulse { animation: none; opacity: .35; box-shadow: none; }
+  @keyframes pulse {
+    0% { box-shadow: 0 0 0 0 rgba(240, 164, 41, .55); }
+    70% { box-shadow: 0 0 0 9px rgba(240, 164, 41, 0); }
+    100% { box-shadow: 0 0 0 0 rgba(240, 164, 41, 0); }
+  }
+  @media (prefers-reduced-motion: reduce) { .pulse { animation: none; } }
   .spacer { flex: 1; }
-  .meta { color: var(--muted); }
-  button, select, input { background: var(--panel2); color: var(--text); border: 1px solid var(--line); border-radius: 6px;
-    padding: 5px 9px; font: inherit; }
-  button { cursor: pointer; } button:hover { border-color: var(--amber); }
-  main { padding: 16px 20px; display: grid; gap: 14px; grid-template-columns: repeat(12, 1fr); }
-  section { background: linear-gradient(180deg, var(--panel), #0f1727); border: 1px solid var(--line); border-radius: 10px;
-    padding: 12px 14px; min-width: 0; }
-  h2 { margin: 0 0 10px; font-size: 11px; text-transform: uppercase; letter-spacing: 1.2px; color: var(--muted); font-weight: 600;
-    display: flex; align-items: center; gap: 8px; }
-  h2 .right { margin-left: auto; text-transform: none; letter-spacing: 0; font-weight: 400; }
+  .meta { color: var(--muted); font-size: 13px; white-space: nowrap; }
+  .controls { display: flex; align-items: center; gap: 8px; }
+  button, select, input {
+    background: var(--panel2); color: var(--text); border: 1px solid var(--line);
+    border-radius: 8px; padding: 4px 10px; font: inherit; font-size: 13px;
+  }
+  button { cursor: pointer; font-weight: 600; }
+  button:hover, select:hover, input:hover { border-color: var(--amber); }
+  button:focus-visible, select:focus-visible, input:focus-visible {
+    outline: 2px solid var(--amber); outline-offset: 1px;
+  }
+  input::placeholder { color: var(--muted); }
+  .theme-switch {
+    display: inline-flex; padding: 2px; gap: 2px;
+    background: var(--panel2); border: 1px solid var(--line); border-radius: 999px;
+  }
+  .theme-switch button {
+    border: 0; background: transparent; color: var(--muted);
+    border-radius: 999px; padding: 3px 11px; line-height: 1.3;
+  }
+  .theme-switch button:hover { border-color: transparent; color: var(--text); }
+  html[data-theme="dark"] .theme-switch [data-theme-choice="dark"],
+  html[data-theme="light"] .theme-switch [data-theme-choice="light"] {
+    background: var(--amber-dim); color: var(--amber-ink);
+    box-shadow: inset 0 0 0 1px var(--amber);
+  }
+  main { padding: 14px 18px 28px; display: grid; gap: 12px; grid-template-columns: repeat(12, 1fr); }
+  section {
+    background: linear-gradient(180deg, var(--panel), var(--panel-end));
+    border: 1px solid var(--line); border-radius: 12px;
+    padding: 11px 13px; min-width: 0; box-shadow: var(--shadow);
+  }
+  section.attention { box-shadow: inset 3px 0 0 var(--warn), var(--shadow); }
+  #detail-panel.has-sel { box-shadow: inset 3px 0 0 var(--amber), var(--shadow); border-color: color-mix(in srgb, var(--amber) 55%, var(--line)); }
+  .c7, #detail-panel { align-self: start; }
+  h2 {
+    margin: 0 0 8px; font-size: 11px; text-transform: uppercase; letter-spacing: .12em;
+    color: var(--muted); font-weight: 600; display: flex; align-items: center; gap: 8px;
+  }
+  h2 .right { margin-left: auto; text-transform: none; letter-spacing: 0; font-weight: 500; font-size: 12px; }
   .c3 { grid-column: span 3; } .c4 { grid-column: span 4; } .c5 { grid-column: span 5; } .c6 { grid-column: span 6; }
   .c7 { grid-column: span 7; } .c8 { grid-column: span 8; } .c12 { grid-column: span 12; }
   @media (max-width: 1100px) { .c3, .c4, .c5, .c6, .c7, .c8 { grid-column: span 12; } }
-  .kv { display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; }
-  .kv dt { color: var(--muted); } .kv dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; margin: 0; }
+  .kv dt { color: var(--muted); } .kv dd { margin: 0; text-align: right; font-family: var(--mono); font-size: 12px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
   .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; vertical-align: middle; flex: none; }
   .ok { background: var(--ok); } .degraded { background: var(--warn); } .failed { background: var(--bad); } .unknown { background: var(--unknown); }
-  .t-ok { color: var(--ok); } .t-degraded { color: var(--warn); } .t-failed { color: var(--bad); } .t-unknown { color: var(--muted); }
-  .row { display: flex; align-items: center; gap: 8px; padding: 4px 0; border-bottom: 1px dashed var(--line); }
+  .t-ok { color: var(--ok-ink); } .t-degraded { color: var(--warn-ink); } .t-failed { color: var(--bad-ink); } .t-unknown { color: var(--muted); }
+  .row { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 8px; padding: 5px 2px; border-bottom: 1px dashed var(--line-soft); min-width: 0; }
   .row:last-child { border-bottom: 0; }
-  .num { font-variant-numeric: tabular-nums; }
-  .bar { height: 6px; background: var(--panel2); border-radius: 3px; overflow: hidden; margin-top: 3px; }
-  .bar > i { display: block; height: 100%; background: var(--ok); }
-  .metric { margin-bottom: 8px; }
-  .metric .lbl { display: flex; justify-content: space-between; color: var(--muted); }
-  .metric .lbl b { color: var(--text); font-weight: 600; }
+  .row.click:hover { background: var(--hover); border-radius: 6px; }
+  #unhealthy .row {
+    display: grid;
+    grid-template-columns: auto 4.75rem minmax(0, 22rem) minmax(0, 1fr);
+    align-items: center;
+    justify-items: start;
+    column-gap: 12px;
+  }
+  @media (max-width: 720px) {
+    #unhealthy .row { grid-template-columns: auto 4.75rem minmax(0, 1fr); }
+    #unhealthy .muted { grid-column: 1 / -1; padding-left: 1.4rem; }
+  }
+  #unhealthy .spacer { display: none; }
+  .row.health-failed, .row.health-degraded { border-bottom-style: solid; border-radius: 6px; padding-left: 8px; margin: 2px 0; }
+  .row.health-failed { background: rgba(229, 72, 77, .10); border-color: rgba(229, 72, 77, .28); }
+  .row.health-degraded { background: rgba(232, 163, 23, .10); border-color: rgba(232, 163, 23, .28); }
+  html[data-theme="light"] .row.health-failed { background: rgba(211, 39, 45, .08); border-color: rgba(166, 27, 34, .22); }
+  html[data-theme="light"] .row.health-degraded { background: rgba(184, 106, 8, .10); border-color: rgba(138, 79, 4, .22); }
+  .num { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 12px; }
+  .bar { height: 6px; background: var(--panel2); border-radius: 99px; overflow: hidden; margin-top: 3px; }
+  .bar > i { display: block; height: 100%; background: var(--ok); border-radius: inherit; }
+  .metric { margin-bottom: 7px; }
+  .lbl { display: flex; justify-content: space-between; gap: 8px; color: var(--muted); }
+  .lbl b { color: var(--text); font-weight: 600; font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 12px; }
   table { width: 100%; border-collapse: collapse; }
-  th { text-align: left; color: var(--muted); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: .8px;
-    padding: 6px 8px; border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--panel); }
-  td { padding: 5px 8px; border-bottom: 1px solid #1a2540; vertical-align: top; }
-  tbody tr.click { cursor: pointer; } tbody tr.click:hover { background: #18233c; } tr.sel { background: #1d2a48 !important; }
-  .scroll { max-height: 420px; overflow: auto; }
-  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; overflow-wrap: anywhere; }
+  th { text-align: left; color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: .08em;
+    padding: 4px 8px 6px; border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--panel); }
+  td { padding: 5px 8px; border-bottom: 1px solid var(--row-line); vertical-align: top; }
+  tbody tr.click { cursor: pointer; } tbody tr.click:hover { background: var(--hover); }
+  tr.sel { background: var(--sel) !important; box-shadow: inset 3px 0 0 var(--amber); }
+  .scroll { max-height: 420px; overflow: auto; scrollbar-color: var(--line) transparent; }
+  .mono { font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; }
   .muted { color: var(--muted); }
   .chips { display: flex; flex-wrap: wrap; gap: 6px; }
-  .chip { background: var(--panel2); border: 1px solid var(--line); border-radius: 999px; padding: 2px 9px; cursor: pointer; }
-  .chip.on { border-color: var(--amber); color: var(--amber); }
+  .chip { background: var(--panel2); border: 1px solid var(--line); border-radius: 999px; padding: 2px 9px; cursor: pointer; font-size: 12px; }
+  .chip:hover { border-color: var(--amber); }
+  .chip.on { border-color: var(--amber); color: var(--amber-ink); background: var(--amber-dim); }
+  .chip b { font-family: var(--mono); font-weight: 600; }
   .counts td.num { text-align: right; }
-  .err { background: #3a1620; border: 1px solid var(--bad); color: #ffd6d6; padding: 8px 12px; border-radius: 8px; grid-column: span 12; }
+  .err { background: var(--err-bg); border: 1px solid var(--bad); color: var(--err-fg); padding: 8px 12px; border-radius: 8px; grid-column: span 12; }
   .empty { color: var(--muted); padding: 6px 0; }
-  .filters { display: flex; gap: 8px; margin-bottom: 8px; } .filters input { flex: 1; }
-  svg.spark { width: 100%; height: 120px; display: block; background: #0c1426; border: 1px solid var(--line); border-radius: 8px; }
-  .chg-changed { color: var(--amber); } .chg-appeared { color: var(--ok); } .chg-disappeared { color: var(--bad); }
+  .filters { display: flex; gap: 8px; margin-bottom: 8px; } .filters input { flex: 1; min-width: 0; }
+  svg.spark { width: 100%; height: 120px; display: block; background: var(--spark); border: 1px solid var(--line); border-radius: 8px; }
+  .chg-changed { color: var(--amber-ink); } .chg-appeared { color: var(--ok-ink); } .chg-disappeared { color: var(--bad-ink); }
+  #detail .row b.mono { font-size: 13px; }
+  #detail .kv { grid-template-columns: auto auto; justify-content: start; column-gap: 18px; }
+  #detail .kv dd { text-align: left; }
 </style>
 </head>
 <body>
 <header id="hdr">
-  <div class="brand"><span class="pulse"></span>Pulseblade</div>
+  <div class="brand"><span class="pulse" aria-hidden="true"></span>Pulse<span class="mark">blade</span></div>
   <span class="meta" id="hdr-meta">loading…</span>
   <span class="spacer"></span>
   <span class="meta" id="updated"></span>
-  <select id="interval" title="Refresh interval">
-    <option value="5">5s</option><option value="15" selected>15s</option><option value="60">60s</option>
-  </select>
-  <button id="toggle">Pause</button>
+  <div class="controls">
+    <div class="theme-switch" role="group" aria-label="Color theme">
+      <button type="button" data-theme-choice="dark" aria-pressed="true">Dark</button>
+      <button type="button" data-theme-choice="light" aria-pressed="false">Light</button>
+    </div>
+    <select id="interval" title="Refresh interval" aria-label="Refresh interval">
+      <option value="5">5s</option><option value="15" selected>15s</option><option value="60">60s</option>
+    </select>
+    <button type="button" id="toggle">Pause</button>
+  </div>
 </header>
 <main id="main">
   <div class="err" id="err" hidden></div>
@@ -84,21 +249,21 @@
   <section class="c3"><h2>Host</h2><div id="hosts"></div></section>
   <section class="c3"><h2>Resources by kind</h2><table class="counts"><thead><tr><th>Kind</th><th style="text-align:right">Total</th>
     <th style="text-align:right">Failed</th><th style="text-align:right">Degraded</th></tr></thead><tbody id="counts"></tbody></table></section>
-  <section class="c12"><h2>Unhealthy <span class="right muted" id="unhealthy-n"></span></h2><div id="unhealthy"></div></section>
-  <section class="c12"><h2>Findings <span class="right muted" id="findings-n"></span></h2><div id="findings"></div></section>
-  <section class="c12"><h2>Actions <span class="right muted" id="actions-n"></span></h2><div id="actions"></div></section>
+  <section class="c12" id="unhealthy-sec"><h2>Unhealthy <span class="right muted" id="unhealthy-n"></span></h2><div id="unhealthy"></div></section>
   <section class="c7">
     <h2>Resources <span class="right muted" id="res-n"></span></h2>
-    <div class="filters"><select id="kind"><option value="">all kinds</option></select>
-      <input id="q" placeholder="filter by id or name…"></div>
+    <div class="filters"><select id="kind" aria-label="Kind"><option value="">all kinds</option></select>
+      <input id="q" placeholder="filter by id or name…" aria-label="Filter resources"></div>
     <div class="scroll"><table><thead><tr><th></th><th>Resource</th><th>State</th></tr></thead><tbody id="resources"></tbody></table></div>
   </section>
   <section class="c5" id="detail-panel">
-    <h2>Details <span class="right"><select id="range"><option>15m</option><option selected>1h</option><option>6h</option><option>24h</option></select></span></h2>
+    <h2>Details <span class="right"><select id="range" aria-label="Metric range"><option>15m</option><option selected>1h</option><option>6h</option><option>24h</option></select></span></h2>
     <div id="detail"><div class="empty">Select a resource to see its attributes, metrics, and recent changes.</div></div>
   </section>
+  <section class="c6"><h2>Findings <span class="right muted" id="findings-n"></span></h2><div id="findings"></div></section>
+  <section class="c6"><h2>Actions <span class="right muted" id="actions-n"></span></h2><div id="actions"></div></section>
   <section class="c12">
-    <h2>Recent changes <span class="right"><select id="window"><option>15m</option><option selected>1h</option><option>6h</option><option>24h</option><option>7d</option></select></span></h2>
+    <h2>Recent changes <span class="right"><select id="window" aria-label="Changes window"><option>15m</option><option selected>1h</option><option>6h</option><option>24h</option><option>7d</option></select></span></h2>
     <div class="scroll"><table><thead><tr><th>Time</th><th>Seq</th><th>Resource</th><th>Change</th></tr></thead><tbody id="changes"></tbody></table></div>
   </section>
 </main>
@@ -110,6 +275,24 @@ const link = new URLSearchParams(location.search);
 const state = { timer: null, paused: false, resources: [], selected: link.get("select"),
   metric: link.get("metric"), kind: link.get("kind") || "" };
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+function syncThemePressed() {
+  const theme = document.documentElement.getAttribute("data-theme") === "light" ? "light" : "dark";
+  document.querySelectorAll("[data-theme-choice]").forEach((b) => {
+    b.setAttribute("aria-pressed", b.getAttribute("data-theme-choice") === theme ? "true" : "false");
+  });
+}
+document.querySelectorAll("[data-theme-choice]").forEach((b) => {
+  b.addEventListener("click", () => {
+    const theme = b.getAttribute("data-theme-choice") === "light" ? "light" : "dark";
+    document.documentElement.setAttribute("data-theme", theme);
+    document.documentElement.style.colorScheme = theme;
+    document.documentElement.style.backgroundColor = theme === "light" ? "#f4efe6" : "#0b1020";
+    try { localStorage.setItem("pulseblade-theme", theme); } catch (e) {}
+    syncThemePressed();
+  });
+});
+syncThemePressed();
 
 async function api(path) {
   const r = await fetch(path, { headers: { accept: "application/json" } });
@@ -209,9 +392,10 @@ function renderHosts(list) {
 
 function renderUnhealthy(list) {
   const bad = list.filter((r) => r.health === "failed" || r.health === "degraded");
+  $("unhealthy-sec").classList.toggle("attention", bad.length > 0);
   $("unhealthy-n").textContent = bad.length ? `${bad.length} resource(s)` : "";
   $("unhealthy").innerHTML = bad.length ? bad.map((r) => `
-    <div class="row click" data-id="${esc(r.id)}" style="cursor:pointer">${dot(r.health)}
+    <div class="row click health-${esc(r.health)}" data-id="${esc(r.id)}">${dot(r.health)}
       <span class="t-${esc(r.health)}">${esc(r.health)}</span>${rid(r.id)}<span class="spacer"></span>
       <span class="muted">${esc(summary(r))}</span></div>`).join("")
     : `<div class="empty t-ok">Everything reporting is healthy.</div>`;
@@ -231,7 +415,7 @@ function renderFindings(page) {
   const rows = (page && page.findings) || [];
   $("findings-n").textContent = page && page.total ? `${page.total} open` : "";
   $("findings").innerHTML = rows.length ? rows.map((f) => `
-    <div class="row click" data-id="${esc(f.resource_id)}" style="cursor:pointer">
+    <div class="row click" data-id="${esc(f.resource_id)}">
       <span class="t-${f.severity === "critical" ? "failed" : f.severity === "warning" ? "degraded" : "unknown"}">${esc(f.severity)}</span>
       ${rid(f.resource_id)}<span class="muted">${esc(f.rule)}</span><span class="spacer"></span>
       <span>${esc(f.summary)}</span></div>`).join("")
@@ -295,7 +479,9 @@ function spark(series) {
 }
 
 async function refreshDetail() {
-  const id = state.selected; if (!id) return;
+  const id = state.selected;
+  $("detail-panel").classList.toggle("has-sel", !!id);
+  if (!id) return;
   const e = await api(`/api/v1/resources/${encodeURIComponent(id)}?changes_limit=10`);
   const r = e.resource, metrics = Object.keys(e.metrics);
   if (!metrics.includes(state.metric)) state.metric = metrics[0] || null;
