@@ -148,7 +148,7 @@ Errors are JSON `{"error": "..."}` with 400 for invalid input and 404 for unknow
 
 *Synthetic demo data, not a real machine.*
 
-The dashboard shows collector status, host key metrics, counts by kind, unhealthy resources first, open findings, recent actions, a filterable resource table, recent changes over a selectable window, and per-resource details (metrics, notes, findings, prior actions) with a sparkline of any metric. It refreshes every 15 seconds (pausable). Deep links work: `/?kind=service&q=ssh&select=unit:web1:sshd.service&metric=...`.
+The dashboard shows collector status, host key metrics, counts by kind, unhealthy resources first, open findings, recent actions, a filterable resource table, recent changes over a selectable window, and per-resource details (metrics, notes, findings, prior actions) with a sparkline of any metric. It refreshes every 15 seconds (pausable). Deep links work: `/?kind=service&q=ssh&select=unit:web1:sshd.service&metric=...`. The proposed next layout is in [docs/DASHBOARD.md](docs/DASHBOARD.md).
 
 To reproduce the screenshot, seed two hours of deterministic demo data (written through the normal store API, ending now) and serve it within a minute, before the collectors read as stale:
 

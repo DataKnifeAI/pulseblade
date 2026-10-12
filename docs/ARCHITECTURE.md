@@ -100,6 +100,8 @@ Every collector pass is recorded in a `collector_runs` table (source, time, dura
 - `/metrics` — Prometheus text exposition 0.0.4. Resource health is encoded 0 ok, 1 unknown, 2 degraded, 3 failed.
 - `/` — a single self-contained HTML page (`include_str!`, vanilla JS, no CDN or build step) that polls the JSON API.
 
+The proposed next layout is in [DASHBOARD.md](DASHBOARD.md).
+
 A Host-header allow-list (loopback, the listen address, and `allowed_hosts`) guards every route against DNS rebinding. There is no built-in authentication; remote access goes through a reverse proxy that adds TLS and auth.
 
 ## Response design for agents
