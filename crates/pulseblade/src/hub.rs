@@ -581,12 +581,14 @@ impl HubClient {
 
     fn exchange(&self, method: &str, path: &str, body: Option<Value>) -> anyhow::Result<Value> {
         let url = format!("{}{path}", self.base);
-        if self.base.starts_with("https://") {
-            let tls = self
-                .tls
-                .clone()
-                .context("https hub url needs a client certificate")?;
-            return tls_exchange(&tls, &url, &self.token, method, body);
+        // Client certificates are mutual TLS. An https:// URL without them uses
+        // ureq, which verifies the server certificate and still sends the bearer token.
+        if let Some(tls) = &self.tls {
+            anyhow::ensure!(
+                self.base.starts_with("https://"),
+                "upstream client certificate requires an https:// hub url"
+            );
+            return tls_exchange(tls, &url, &self.token, method, body);
         }
         let auth = format!("Bearer {}", self.token);
         let response = match (method, body) {
@@ -636,6 +638,7 @@ pub fn run_upstream(
             .build(),
         tls,
     };
+    tracing::info!(url = %client.base, mtls = client.tls.is_some(), "pushing to hub");
     let pause = Duration::from_secs(poll_secs.clamp(1, 60));
     while !shutdown.is_cancelled() {
         if let Err(e) = client.push_store(&store) {
@@ -1128,6 +1131,96 @@ mod tests {
             ..authed
         };
         let err = bad.cursor().unwrap_err().to_string();
+        assert!(err.contains("401"), "{err}");
+        shutdown.cancel();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn https_bearer_does_not_require_a_client_cert() {
+        let dir = std::env::temp_dir().join(format!("pulseblade-https-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::CrlSign,
+        ];
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+
+        let server_key = rcgen::KeyPair::generate().unwrap();
+        let mut server_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        server_params.subject_alt_names = vec![rcgen::SanType::IpAddress(std::net::IpAddr::V4(
+            std::net::Ipv4Addr::LOCALHOST,
+        ))];
+        let server = server_params.signed_by(&server_key, &ca, &ca_key).unwrap();
+
+        let ca_path = dir.join("ca.pem");
+        let cert_path = dir.join("cert.pem");
+        let key_path = dir.join("key.pem");
+        std::fs::write(&ca_path, ca.pem()).unwrap();
+        std::fs::write(&cert_path, server.pem()).unwrap();
+        std::fs::write(&key_path, server_key.serialize_pem()).unwrap();
+
+        install_crypto();
+        let tls = Arc::new(
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(
+                    load_certs(&cert_path.display().to_string()).unwrap(),
+                    load_key(&key_path.display().to_string()).unwrap(),
+                )
+                .unwrap(),
+        );
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = CancellationToken::new();
+        let stop = shutdown.clone();
+        let hub = new_hub(
+            store,
+            vec![("web1".into(), "token-web1".into())],
+            Duration::from_secs(2),
+        );
+        tokio::spawn(async move {
+            serve(
+                listener,
+                hub,
+                vec!["127.0.0.1".into()],
+                stop,
+                Arc::new(Registry::builtin()),
+                Some(tls),
+            )
+            .await
+            .ok();
+        });
+
+        let mut roots = rustls::RootCertStore::empty();
+        for c in load_certs(&ca_path.display().to_string()).unwrap() {
+            roots.add(c).unwrap();
+        }
+        let agent = ureq::AgentBuilder::new()
+            .tls_config(Arc::new(
+                rustls::ClientConfig::builder()
+                    .with_root_certificates(roots)
+                    .with_no_client_auth(),
+            ))
+            .build();
+        let authed = HubClient {
+            base: format!("https://127.0.0.1:{}", addr.port()),
+            token: "token-web1".into(),
+            agent,
+            tls: None,
+        };
+        assert_eq!(authed.cursor().unwrap().seq, 0);
+        let err = HubClient {
+            token: "nope".into(),
+            ..authed
+        }
+        .cursor()
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("401"), "{err}");
         shutdown.cancel();
         let _ = std::fs::remove_dir_all(&dir);

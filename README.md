@@ -357,6 +357,8 @@ key = ""
 client_ca = ""
 
 # Node push. An empty url leaves the node standalone.
+# https:// verifies the hub certificate and sends the bearer token.
+# Set ca, cert, and key together only when the hub requires mutual TLS.
 [upstream]
 url = ""
 node_id = ""

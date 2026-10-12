@@ -382,8 +382,25 @@ async fn main() -> anyhow::Result<()> {
             let actions = action_registry(&config)?;
             let upstream =
                 spawn_upstream(store.clone(), actions.clone(), &config, shutdown.clone());
-            let served =
-                pulseblade_mcp::serve_http(store, addr, allowed, shutdown.clone(), actions).await;
+            let served = match pulseblade_mcp::serve_http(
+                store,
+                addr,
+                allowed,
+                shutdown.clone(),
+                actions,
+            )
+            .await
+            {
+                Err(e) if is_addr_in_use(&e) => {
+                    tracing::warn!(
+                        %addr,
+                        "listen address already in use; collecting and pushing without the dashboard"
+                    );
+                    shutdown.cancelled().await;
+                    Ok(())
+                }
+                other => other,
+            };
             shutdown.cancel();
             if let Some(c) = collector {
                 let _ = tokio::task::spawn_blocking(move || c.join()).await;
@@ -412,6 +429,13 @@ async fn main() -> anyhow::Result<()> {
                 }
             };
             let actions = action_registry(&config)?;
+            // The process that holds the collector lock is the one that pushes.
+            // Extra `pulseblade mcp` processes only read the database.
+            let upstream = if collector.is_some() {
+                spawn_upstream(store.clone(), actions.clone(), &config, shutdown.clone())
+            } else {
+                None
+            };
             let http_task = if let Some(addr) = dashboard_addr {
                 let allowed = http_allowed_hosts(&config, addr);
                 let http_store = store.clone();
@@ -444,6 +468,9 @@ async fn main() -> anyhow::Result<()> {
             }
             if let Some(c) = collector {
                 let _ = tokio::task::spawn_blocking(move || c.join()).await;
+            }
+            if let Some(u) = upstream {
+                let _ = tokio::task::spawn_blocking(move || u.join()).await;
             }
             served
         }

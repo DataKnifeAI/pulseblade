@@ -148,7 +148,8 @@ pub struct UpstreamConfig {
     pub node_id: String,
     pub token_env: String,
     pub poll_secs: u64,
-    /// CA that signed the hub certificate. Required with `cert` and `key`.
+    /// Mutual TLS, only when `ca`, `cert`, and `key` are all set.
+    /// Empty means an `https://` url uses ordinary TLS and the bearer token.
     pub ca: String,
     pub cert: String,
     pub key: String,
