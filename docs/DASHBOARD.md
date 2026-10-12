@@ -54,7 +54,7 @@ No text in the mark. No blades or weapons. No game imagery. No Greek motifs.
 
 ## System icons
 
-Kubernetes, Proxmox, Linux and distro, and Docker icons are from [Simple Icons](https://simpleicons.org) (CC0) and name those integrated systems; generic line icons are original, and the trademarks stay with their owners.
+Kubernetes, Proxmox, Linux and distro, and Docker marks in the page are [Simple Icons](https://simpleicons.org) paths (CC0), inlined, and name those integrated systems; generic line icons are original, and the trademarks stay with their owners.
 
 ## Data the dashboard still degrades without
 
@@ -66,3 +66,18 @@ Still missing, and the page works around each gap:
 - A pod node label. A pod is not pinned to a machine tile unless its parent or id says which node.
 - A host label on Proxmox nodes. A Proxmox node and a host tile merge when their names match.
 - A kind or label that distinguishes a Proxmox node from a Kubernetes node. Kubernetes nodes are `knode:` ids. The Proxmox section appears only when `vm:`, `lxc:`, or `storage:` resources exist; `node:` ids in that fleet are Proxmox nodes.
+
+## How the page fetches
+
+It polls a summary snapshot, status, findings, and actions (not a full resource dump) and refreshes every 15 seconds (pausable). Detail stays in the side panel, with at most one sparkline, fetched when that panel opens. Deep links: `/?tab=overview&kind=service&q=ssh&select=unit:web1:sshd.service&metric=cpu.used_pct&theme=dark`.
+
+Sample fleet in the screenshots, not a live machine.
+
+Seed two hours of deterministic demo data (written through the normal store API, ending now) and serve it within a minute, before the collectors read as stale:
+
+```bash
+cargo run -p pulseblade --example seed_demo -- /tmp/pb-demo/pb.db
+cargo run -p pulseblade -- --db /tmp/pb-demo/pb.db node --no-collect --listen 127.0.0.1:7188
+```
+
+Open `http://127.0.0.1:7188/`.

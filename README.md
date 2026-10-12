@@ -11,64 +11,22 @@ It scales in two shapes with the same MCP contract:
 - **Single box** — one node, with an optional **pilot** (a local-LLM reasoning loop) watching the OS and user session.
 - **Fleet** — many nodes feeding a **hub** (control node); pilots and other agents talk to the hub, nodes enforce their own action policy.
 
-## Why
-
-Existing tools are either human-first monitoring stacks with an agent bolted on, or agent-observability tools that watch LLMs rather than infrastructure. Pulseblade is designed the other way around:
-
-- **MCP first** — structured, schema'd tools are the primary interface.
-- **Standing, queryable state** — snapshots, checkpoints, and `changes_since` instead of human-cognitive alert floods.
-- **Semantic labels and causal context** baked into telemetry.
-- **Token-efficient** — a summary snapshot of a ~150-resource host is ~150 tokens; cursors and `if_changed_since` make polling nearly free; series are compact arrays; bulk JSONL export when you really want everything.
-- **Useful without an LLM** — dashboard, REST API, Prometheus exposition, and a terminal status view, all from the same queries the agents use.
-- **Remediation as first-class tools** — idempotent, audited, and gated by risk tier.
-- **Memory** — notes and prior actions attached to resources.
-- **No per-seat anything** — one binary, embedded SQLite, runs anywhere.
-
 ## Status
 
-Milestones **M1** through **M7** are done — see [docs/PLAN.md](docs/PLAN.md).
-
-| Works today | Later |
-|-------------|-------|
-| Host, CPU, memory, disk, network, systemd, journald, processes, user session | Cloud collectors (AWS, Azure, GCP) |
-| Change journal, checkpoints, findings, notes, gated actions | Hub-of-hubs |
-| Pilot over any OpenAI-compatible endpoint | |
-| Docker, Proxmox, and Kubernetes collectors and actions | |
-| Prometheus scrape targets and `/metrics` exposition | |
-| Hub: per-node cursors, `fleet_overview`, routed actions | |
-| Dashboard, REST API, `ctl status` | |
-| MCP over stdio and streamable HTTP | |
+Today: host, CPU, memory, disk, network, systemd, journald, processes, and user session; Docker, Proxmox, and Kubernetes; change journal, checkpoints, findings, notes, and gated actions; a pilot on any OpenAI-compatible endpoint; Prometheus scrape targets and `/metrics`; a hub with per-node cursors, `fleet_overview`, and routed actions; dashboard, REST API, and `ctl status`; MCP over stdio and streamable HTTP. Milestones M1 through M7 are done. Later work is in [docs/PLAN.md](docs/PLAN.md).
 
 ## Quick start
 
 ```bash
-make install            # cargo install --path crates/pulseblade
+make install            # cargo install --path crates/pulseblade --locked
 
-# Run this host's node: collectors, MCP at http://127.0.0.1:7171/mcp,
-# dashboard at http://127.0.0.1:7171/
+# Collectors, MCP at http://127.0.0.1:7171/mcp, dashboard at http://127.0.0.1:7171/
 pulseblade node
-
-# Or serve MCP over stdio (collects in-process unless a node already owns the database).
-# `--dashboard` also serves the HTTP dashboard and API from this process.
-pulseblade mcp --dashboard
-
-# Serve an existing database without collecting (offline inspection, copied databases, demos)
-pulseblade --db ./copy.db node --no-collect
 ```
 
-### Connect an MCP client
+Dashboard: <http://127.0.0.1:7171/>.
 
-Cursor (`~/.cursor/mcp.json`), HTTP against a running node:
-
-```json
-{
-  "mcpServers": {
-    "pulseblade": { "url": "http://127.0.0.1:7171/mcp" }
-  }
-}
-```
-
-Or stdio, with no daemon required:
+Stdio, with no daemon required (Cursor `~/.cursor/mcp.json`):
 
 ```json
 {
@@ -78,326 +36,17 @@ Or stdio, with no daemon required:
 }
 ```
 
-`pulseblade mcp --dashboard` (args `["mcp", "--dashboard"]`) serves the HTTP dashboard and API on the listen address alongside stdio. `--listen 127.0.0.1:7171` implies `--dashboard` and overrides the config `listen` address. `dashboard = true` in the config file turns the same server on with no flag. The stdio MCP process can serve the dashboard when it is the collector, so a second `pulseblade node` is unnecessary. If that listen address is already in use, stdio MCP keeps running and the dashboard is skipped.
-
-Use an absolute path (e.g. `~/.cargo/bin/pulseblade`, expanded) if `~/.cargo/bin` is not on the PATH your editor launches with.
-
-### From the shell
-
-```bash
-pulseblade ctl status                  # plain-text summary: self-health, counts, unhealthy, recent changes
-pulseblade ctl snapshot --detail brief # JSON, same shapes as the MCP tools
-pulseblade ctl checkpoint before-deploy
-pulseblade ctl changes --since before-deploy
-pulseblade ctl export --since 1h > dump.jsonl
-pulseblade ctl findings --detail
-pulseblade ctl approve <run_id>
-pulseblade ctl runs
-pulseblade pilot --once
-
-# Fleet hub. Nodes connect out; set [upstream] on each node and [[hub.nodes]] here.
-pulseblade hub
-```
-
-## MCP tools (M1)
-
-| Tool | Purpose |
-|------|---------|
-| `state_snapshot` | `summary` by default: counts by kind, collector health, host key metrics, unhealthy resources, `as_of_seq`. `detail=brief\|full` for lists; `if_changed_since` for near-free polling |
-| `resource_explain` | One resource: labels, attributes, parent/children, latest metrics, recent changes, notes, open findings, prior actions |
-| `metrics_query` | Bounded, downsampled series as a compact `values` array (`range`, `step`, `agg`) |
-| `checkpoint_create` | Name the current point in the change journal |
-| `changes_since` | Changes since a checkpoint, sequence number, timestamp, or relative duration |
-| `export_bulk` | JSONL dump of resources and changes for offline analysis |
-| `findings_list` | Open findings by default. Summaries only; `detail=true` adds causal context and error lines |
-| `finding_ack` | Acknowledge a finding. An optional note is stored on its resource |
-| `memory_note` / `memory_search` | Attach a short note, or search notes by substring |
-| `logs_query` | Recent error lines for one resource (default 1h, capped) |
-| `actions_list` | Built-in remediations with risk tier, parameter schema, preconditions, and rate limit |
-| `action_plan` | Plan a run. Returns `plan_id` (same as `run_id`) and the tier. Does not execute |
-| `action_execute` | `auto` runs now; `approve` waits; `deny` is rejected. A finished run is not repeated |
-| `action_status` | One run, including output when it has finished |
-
-MCP resources `pulseblade://state` and `pulseblade://findings` notify subscribers when the journal or the open-findings set changes.
-
-The cheap agent loop is: summary snapshot, remember `as_of_seq`, poll `changes_since` or `if_changed_since`, drill down only on what changed. Measured sizes are in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#token-efficiency).
-
-## Dashboard and HTTP API
-
-The node serves a read-only, LLM-free view of the same data on its HTTP port, next to `/mcp`:
-
-| Path | What |
-|------|------|
-| `/` | Built-in dashboard (one self-contained HTML page, no external assets) |
-| `/metrics` | Prometheus text exposition |
-| `/api/v1/status` | Pulseblade self-health: version, `as_of_seq`, database path and size, per-collector last run (age, duration, ok/error, consecutive failures), resource and sample counts, uptime. On a hub, `nodes` lists each node's cursor, `last_push_age_secs`, and `stale` |
-| `/api/v1/snapshot` | `state_snapshot`: `detail`, `if_changed_since`, `kind`, `query`, `labels=k=v,k2=v2`, `unhealthy_only`, `limit` |
-| `/api/v1/resources/{id}` | `resource_explain` (`changes_limit`); ids may be percent-encoded or raw, e.g. `/api/v1/resources/disk:web1:/home` |
-| `/api/v1/metrics` | `metrics_query`: `id`, `metric`, `range`, `step`, `agg` |
-| `/api/v1/changes` | `changes_since`: `since` (default `1h`), `kind`, `prefix`, `limit`, `compact` |
-| `/api/v1/checkpoints` | Checkpoints, newest first |
-| `/api/v1/findings` | `findings_list`: `status`, `severity`, `limit`, `detail` |
-| `/api/v1/logs` | `logs_query`: `resource`, `since`, `limit` |
-| `/api/v1/actions` | Recent action runs |
-| `POST /api/v1/actions/{id}/approve` | Approve a waiting run. Sends `Authorization: Bearer <actions.approve_token>` when that token is set |
-| `/healthz` | `ok` |
-
-Errors are JSON `{"error": "..."}` with 400 for invalid input and 404 for unknown resources, metrics, checkpoints, or endpoints.
-
-![Overview, dark: attention strip, top problems, and one line each for Kubernetes, Proxmox, and Hosts](docs/assets/dashboard/mock4-overview-dark.png)
-
-*Design reference for the page at `/`. Sample fleet, not a live machine.*
-
-The dashboard is four tabs — Overview, Fleet, Changes, and Actions — with detail in a side panel and at most one sparkline, fetched when that panel opens. It polls a summary snapshot, status, findings, and actions (not a full resource dump) and refreshes every 15 seconds (pausable). Deep links: `/?tab=overview&kind=service&q=ssh&select=unit:web1:sshd.service&metric=cpu.used_pct&theme=dark`. Layout and screenshots: [docs/DASHBOARD.md](docs/DASHBOARD.md). Kubernetes, Proxmox, Linux, and Docker marks in the page are [Simple Icons](https://simpleicons.org) paths (CC0), inlined; trademarks stay with their owners.
-
-Seed two hours of deterministic demo data (written through the normal store API, ending now) and serve it within a minute, before the collectors read as stale:
-
-```bash
-cargo run -p pulseblade --example seed_demo -- /tmp/pb-demo/pb.db
-cargo run -p pulseblade -- --db /tmp/pb-demo/pb.db node --no-collect --listen 127.0.0.1:7188
-```
-
-Open `http://127.0.0.1:7188/`.
-
-### Remote access
-
-Everything listens on loopback by default and has no authentication of its own. Requests are only accepted when their `Host` header is loopback, the listen address, or listed in `allowed_hosts` (DNS-rebinding protection for `/mcp`, the API, and the dashboard alike). For access from other machines, put a reverse proxy with TLS and authentication in front and allow its hostname:
-
-```toml
-# pulseblade.toml
-allowed_hosts = ["pulseblade.example.com"]
-```
-
-```caddyfile
-pulseblade.example.com {
-    basic_auth {
-        admin <bcrypt hash from `caddy hash-password`>
-    }
-    reverse_proxy 127.0.0.1:7171
-}
-```
-
-(nginx: `proxy_pass http://127.0.0.1:7171; proxy_set_header Host $host;`.) If you instead set `listen = "0.0.0.0:7171"`, add every name or `ip:port` that clients use to `allowed_hosts`, and firewall the port.
-
-### Prometheus and Grafana
-
-```yaml
-# prometheus.yml
-scrape_configs:
-  - job_name: pulseblade
-    scrape_interval: 15s
-    static_configs:
-      - targets: ["127.0.0.1:7171"]   # remote targets: add "web1:7171" to that node's allowed_hosts
-```
-
-| Series | Meaning |
-|--------|---------|
-| `pulseblade_up`, `pulseblade_build_info{version}`, `pulseblade_journal_seq` | Node liveness, version, journal position |
-| `pulseblade_open_findings`, `pulseblade_actions_awaiting` | Open findings, and runs waiting for approval |
-| `pulseblade_collector_up{collector}` | 1 when the last pass succeeded and is recent |
-| `pulseblade_collector_last_run_timestamp_seconds`, `..._last_success_timestamp_seconds`, `..._last_duration_seconds`, `..._consecutive_failures`, `..._resources` | Per-collector detail |
-| `pulseblade_resource_health{id,kind,host,...}` | **0 ok, 1 unknown, 2 degraded, 3 failed** |
-| `pulseblade_<metric>{id,kind,host,...}` | Latest value of every metric, name sanitized: `cpu.used_pct` becomes `pulseblade_cpu_used_pct`, `load.1m` becomes `pulseblade_load_1m` |
-
-Resource series also carry your semantic labels (e.g. `criticality`, `role`) when their names are valid Prometheus labels. In Grafana, add the Prometheus data source and start from queries such as:
-
-```promql
-pulseblade_resource_health >= 2                                   # degraded or failed resources
-pulseblade_cpu_used_pct{kind="host"}                              # CPU per host
-max by (id) (pulseblade_disk_used_pct)                            # disk fill
-time() - pulseblade_collector_last_success_timestamp_seconds > 60 # stale collectors
-```
-
-### Homepage
-
-A [Homepage](https://gethomepage.dev) `customapi` widget against the status endpoint (Homepage fetches server-side, so the hostname it uses must reach the node and be in `allowed_hosts`):
-
-```yaml
-# services.yaml
-- Infrastructure:
-    - Pulseblade:
-        icon: mdi-heart-pulse
-        href: https://pulseblade.example.com/
-        widget:
-          type: customapi
-          url: https://pulseblade.example.com/api/v1/status
-          refreshInterval: 15000
-          mappings:
-            - field: { resources: total }
-              label: Resources
-              format: number
-            - field: { resources: failed }
-              label: Failed
-              format: number
-            - field: { resources: degraded }
-              label: Degraded
-              format: number
-            - field: samples
-              label: Samples
-              format: number
-```
-
-`/api/v1/snapshot` (summary detail) works too: its `total` is the number of unhealthy resources and `as_of_seq` moves whenever anything changes.
-
-## Configuration
-
-Optional TOML at `~/.config/pulseblade/pulseblade.toml` (or `--config`):
-
-```toml
-interval_secs = 15
-retention_hours = 24
-listen = "127.0.0.1:7171"
-# Set `dashboard = true` so `pulseblade mcp` serves the HTTP dashboard and API
-# when that process is the collector.
-dashboard = false
-allowed_hosts = []        # extra Host header values, e.g. a reverse proxy's hostname
-
-# Semantic labels attached to matching resource ids (`*` wildcard).
-[[labels]]
-match = "unit:*:sshd.service"
-set = { criticality = "high", role = "access" }
-
-[[labels]]
-match = "disk:*:/"
-set = { criticality = "high" }
-
-# Detection. Missing keys keep the defaults (EWMA on, no threshold rules, no webhook).
-[detect]
-webhook = ""          # POST a small JSON body when new findings open; empty disables it
-
-[[detect.rules]]
-match = "disk:*:*"
-metric = "disk.used_pct"
-op = ">="
-value = 95
-severity = "critical"
-
-# Remediation policy is node-local. Omit a tier to keep the built-in default.
-[actions]
-approval_ttl = "1h"   # 30s, 15m, 1h, or 1d; how long an approve-tier run waits
-approve_token = ""    # when set, the approval webhook requires Authorization: Bearer
-
-[actions.systemd_restart]   # default tier: approve
-tier = "approve"
-rate_per_hour = 12
-
-[actions.docker_restart]    # default tier: approve
-tier = "approve"
-
-[actions.disk_prune]        # default tier: approve; only these directories can be pruned
-tier = "approve"
-allow = []
-
-[actions.script_run]        # default tier: deny; only these absolute paths can run
-tier = "deny"
-allow = []
-
-[actions.proxmox_start]     # default tier: approve
-tier = "approve"
-
-[actions.proxmox_stop]
-tier = "approve"
-
-[actions.proxmox_migrate]
-tier = "approve"
-
-[actions.k8s_rollout_restart]   # default tier: approve
-tier = "approve"
-
-[actions.k8s_scale]
-tier = "approve"
-
-[collect]
-docker = true             # false skips the docker collector even when the daemon is up
-
-# Proxmox collector and actions. An empty api_url leaves both off.
-# token_secret_env is the name of an environment variable, never the secret.
-[proxmox]
-api_url = ""
-token_id = ""
-token_secret_env = "PVE_TOKEN_SECRET"
-verify_tls = true
-
-# Pilot. Missing keys keep the defaults (disabled, no model calls).
-# `pulseblade pilot` talks to MCP at mcp_url, or http://<listen>/mcp.
-[pilot]
-enabled = false
-local_only = false        # when true, only loopback base_url values are called
-wake_on = ["findings", "changes"]
-heartbeat_secs = 900
-poll_secs = 30            # MCP poll interval; this is not a model call
-execute_auto = false      # auto-tier plans run only when this is true; approve and deny never do
-mcp_url = ""
-
-[pilot.budget]
-max_tool_calls = 12
-max_tokens = 20000
-max_wall_secs = 120
-
-[[pilot.tiers]]
-name = "triage"
-[[pilot.tiers.endpoints]]
-kind = "openai_compatible"
-base_url = "http://127.0.0.1:11434/v1"
-model = "local"
-
-# Hub. Empty nodes means `pulseblade node` ignores this section.
-# token_env is the name of an environment variable, never the token.
-[hub]
-listen = "127.0.0.1:7170"
-action_wait_secs = 20
-
-[[hub.nodes]]
-id = "web1"
-token_env = "PULSEBLADE_NODE_WEB1"
-
-[hub.tls]
-cert = ""
-key = ""
-client_ca = ""
-
-# Node push. An empty url leaves the node standalone.
-# https:// verifies the hub certificate and sends the bearer token.
-# Set ca, cert, and key together only when the hub requires mutual TLS.
-[upstream]
-url = ""
-node_id = ""
-token_env = "PULSEBLADE_HUB_TOKEN"
-poll_secs = 15
-ca = ""
-cert = ""
-key = ""
-
-# Kubernetes collector and actions. An empty api_url leaves both off.
-# token_env is the name of an environment variable, never the secret.
-[k8s]
-api_url = ""
-token_env = "K8S_TOKEN"
-cluster = "demo"
-verify_tls = true
-ca = ""
-
-# Prometheus text endpoints. An empty url is skipped.
-[[prometheus]]
-name = "app"
-url = ""
-```
-
-`systemd.restart` takes `unit` (a bare name gets `.service`) and optional `user: true` for `systemctl --user`. `docker.restart` takes `container` and shells out to `docker`. `disk.prune_path` deletes regular files in an allow-listed directory and refuses `/`, `/home`, `/etc`, `/usr`, `/var`, `/boot`, and the other system roots. `script.run` runs an allow-listed program with an `args` array and no shell. `proxmox.start` and `proxmox.stop` take `node`, `vmid`, and optional `guest` (`qemu` or `lxc`). `proxmox.migrate` takes `node`, `vmid`, and `target`. `k8s.rollout_restart` takes `namespace`, `name`, and optional `kind` (`deployment`, `statefulset`, or `daemonset`). `k8s.scale` takes `namespace`, `name`, `replicas`, and optional `kind` (`deployment` or `statefulset`). Those wait for approval unless the tier is changed. `action_plan` with `dry_run: true` records the run without invoking the command. Approve a waiting run with `pulseblade ctl approve <run_id>` or `POST /api/v1/actions/{id}/approve`.
-
-`pulseblade pilot` polls the MCP server and calls the model only when a new finding, a journal change, or the heartbeat says so. A quiet `--once` prints `{"investigated": false}` and does not call the model. Conclusions are `memory_note`s; proposed remediations are `action_plan`s. The node still applies its own tier. `pulseblade ctl runs` lists recorded investigations.
-
-`pulseblade hub` serves the same MCP tools for every node that pushes to it, plus `fleet_overview`. Point the pilot at the hub with `mcp_url`; the pilot does not change. An action the hub routes still runs only when the target node's own tier allows it. Image and unit files: `deploy/Dockerfile`, `deploy/pulseblade-hub.service`, `deploy/pulseblade-node.service`. A per-host DaemonSet and Helm chart: `deploy/k8s/daemonset.yaml`, `deploy/helm/pulseblade`.
-
-State lives in `~/.local/state/pulseblade/pulseblade.db` by default (`--db` to override).
-
-## Integrates with
-
-- Any MCP client: Cursor, Claude, agent runtimes such as Hermes Agent, local agents on Ollama, HolmesGPT, custom scripts
-- Any OpenAI-compatible endpoint as the pilot's model, local or remote: Ollama (`http://127.0.0.1:11434/v1`), vLLM, OpenRouter, Hermes models served the same way
-- External agent runtimes such as Hermes Agent, over MCP, without the pilot
-- Prometheus and Grafana (scrape `/metrics`), Homepage and other dashboards (JSON API)
-- systemd, journald, Docker (when the daemon is reachable), Proxmox VE (when `[proxmox]` has an API URL), Kubernetes (when `[k8s]` has an API URL), and Prometheus scrape targets (`[[prometheus]]`)
+Use an absolute path (e.g. `~/.cargo/bin/pulseblade`, expanded) if `~/.cargo/bin` is not on the PATH your editor launches with. HTTP MCP, dashboard flags, and the shell commands: [docs/MCP.md](docs/MCP.md).
+
+## Docs
+
+- [MCP tools and clients](docs/MCP.md)
+- [Configuration](docs/CONFIG.md)
+- [HTTP API](docs/HTTP.md)
+- [Dashboard](docs/DASHBOARD.md)
+- [Deploy, Prometheus, and Homepage](docs/DEPLOY.md)
+- [Architecture](docs/ARCHITECTURE.md)
+- [Plan](docs/PLAN.md)
 
 ## Development
 
@@ -405,8 +54,6 @@ State lives in `~/.local/state/pulseblade/pulseblade.db` by default (`--db` to o
 make help   # list targets
 make ci     # fmt-check + clippy -D warnings + tests
 ```
-
-Architecture: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## License
 
