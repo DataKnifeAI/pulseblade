@@ -10,6 +10,11 @@ target
 
 .cargo/
 
+# Secrets and local env
+.env
+.env.*
+!.env.example
+
 # Local state from running the agent in-tree
 *.db
 *.db-shm

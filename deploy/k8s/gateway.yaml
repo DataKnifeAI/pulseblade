@@ -4,13 +4,14 @@
 # certificate grafana.dataknife.net and harbor.dataknife.net use. Do not add a
 # second gateway controller or a new issuer.
 #
-# The hub ConfigMap allow-list must include this hostname; any other Host
-# header is rejected with 403. DNS should be a CNAME to the worker record,
+# The hub ConfigMap allow-list must include these hostnames; any other Host
+# header is rejected with 403. Canonical DNS is a CNAME to the worker record,
 # matching the other apps:
-#   pb-hub-poc.dataknife.net  CNAME  poc-apps-wk.dataknife.net
+#   pulseblade-poc.dataknife.net  CNAME  poc-apps-wk.dataknife.net
+# pb-hub-poc.dataknife.net stays as an extra rule for one release.
 #
-#   curl -fsS https://pb-hub-poc.dataknife.net/
-#   curl -fsS https://pb-hub-poc.dataknife.net/api/v1/status
+#   curl -fsS https://pulseblade-poc.dataknife.net/
+#   curl -fsS https://pulseblade-poc.dataknife.net/api/v1/status
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -21,6 +22,16 @@ metadata:
 spec:
   ingressClassName: nginx
   rules:
+    - host: pulseblade-poc.dataknife.net
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: pulseblade-hub
+                port:
+                  number: 7170
     - host: pb-hub-poc.dataknife.net
       http:
         paths:

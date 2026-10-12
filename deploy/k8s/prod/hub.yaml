@@ -1,0 +1,420 @@
+# Production hub on prd-apps. The journal is a 1Gi truenas-csi-nfs volume,
+# the same storage class other small stateful apps on this cluster use.
+# Node tokens stay in the pulseblade-hub-tokens Secret (keys are node ids).
+# This file has token env names only. Do not commit secret values.
+# Image is the redesigned dashboard digest, retagged off :poc so prod does
+# not follow the POC tag.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pulseblade
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pulseblade-hub
+  namespace: pulseblade
+data:
+  pulseblade.toml: |
+    allowed_hosts = [
+      "pulseblade.dataknife.net",
+      "pulseblade-hub",
+      "pulseblade-hub.pulseblade",
+      "pulseblade-hub.pulseblade.svc",
+      "pulseblade-hub.pulseblade.svc.cluster.local",
+    ]
+
+    [hub]
+    listen = "0.0.0.0:7170"
+    action_wait_secs = 20
+
+    [[hub.nodes]]
+    id = "prd-apps-1"
+    token_env = "TOKEN_PRD_APPS_1"
+
+    [[hub.nodes]]
+    id = "prd-apps-2"
+    token_env = "TOKEN_PRD_APPS_2"
+
+    [[hub.nodes]]
+    id = "prd-apps-3"
+    token_env = "TOKEN_PRD_APPS_3"
+
+    [[hub.nodes]]
+    id = "prd-apps-large-worker-1"
+    token_env = "TOKEN_PRD_APPS_LARGE_WORKER_1"
+
+    [[hub.nodes]]
+    id = "prd-apps-worker-1"
+    token_env = "TOKEN_PRD_APPS_WORKER_1"
+
+    [[hub.nodes]]
+    id = "prd-apps-worker-2"
+    token_env = "TOKEN_PRD_APPS_WORKER_2"
+
+    [[hub.nodes]]
+    id = "prd-apps-worker-3"
+    token_env = "TOKEN_PRD_APPS_WORKER_3"
+
+    [[hub.nodes]]
+    id = "prd-apps-worker-4"
+    token_env = "TOKEN_PRD_APPS_WORKER_4"
+
+    [[hub.nodes]]
+    id = "prd-apps-worker-5"
+    token_env = "TOKEN_PRD_APPS_WORKER_5"
+
+    [[hub.nodes]]
+    id = "prd-apps-worker-6"
+    token_env = "TOKEN_PRD_APPS_WORKER_6"
+
+    [[hub.nodes]]
+    id = "poc-apps-1"
+    token_env = "TOKEN_POC_APPS_1"
+
+    [[hub.nodes]]
+    id = "poc-apps-2"
+    token_env = "TOKEN_POC_APPS_2"
+
+    [[hub.nodes]]
+    id = "poc-apps-3"
+    token_env = "TOKEN_POC_APPS_3"
+
+    [[hub.nodes]]
+    id = "poc-apps-worker-1"
+    token_env = "TOKEN_POC_APPS_WORKER_1"
+
+    [[hub.nodes]]
+    id = "poc-apps-worker-2"
+    token_env = "TOKEN_POC_APPS_WORKER_2"
+
+    [[hub.nodes]]
+    id = "poc-apps-worker-3"
+    token_env = "TOKEN_POC_APPS_WORKER_3"
+
+    [[hub.nodes]]
+    id = "poc-apps-worker-4"
+    token_env = "TOKEN_POC_APPS_WORKER_4"
+
+    [[hub.nodes]]
+    id = "poc-apps-worker-5"
+    token_env = "TOKEN_POC_APPS_WORKER_5"
+
+    [[hub.nodes]]
+    id = "poc-apps-worker-6"
+    token_env = "TOKEN_POC_APPS_WORKER_6"
+
+    [[hub.nodes]]
+    id = "nprd-apps-1"
+    token_env = "TOKEN_NPRD_APPS_1"
+
+    [[hub.nodes]]
+    id = "nprd-apps-2"
+    token_env = "TOKEN_NPRD_APPS_2"
+
+    [[hub.nodes]]
+    id = "nprd-apps-3"
+    token_env = "TOKEN_NPRD_APPS_3"
+
+    [[hub.nodes]]
+    id = "nprd-apps-worker-1"
+    token_env = "TOKEN_NPRD_APPS_WORKER_1"
+
+    [[hub.nodes]]
+    id = "nprd-apps-worker-2"
+    token_env = "TOKEN_NPRD_APPS_WORKER_2"
+
+    [[hub.nodes]]
+    id = "nprd-apps-worker-3"
+    token_env = "TOKEN_NPRD_APPS_WORKER_3"
+
+    [[hub.nodes]]
+    id = "nprd-apps-worker-4"
+    token_env = "TOKEN_NPRD_APPS_WORKER_4"
+
+    [[hub.nodes]]
+    id = "nprd-apps-worker-5"
+    token_env = "TOKEN_NPRD_APPS_WORKER_5"
+
+    [[hub.nodes]]
+    id = "nprd-apps-worker-6"
+    token_env = "TOKEN_NPRD_APPS_WORKER_6"
+
+    [[hub.nodes]]
+    id = "rancher-manager-1"
+    token_env = "TOKEN_RANCHER_MANAGER_1"
+
+    [[hub.nodes]]
+    id = "rancher-manager-2"
+    token_env = "TOKEN_RANCHER_MANAGER_2"
+
+    [[hub.nodes]]
+    id = "rancher-manager-3"
+    token_env = "TOKEN_RANCHER_MANAGER_3"
+
+    [[hub.nodes]]
+    id = "lee-cachy"
+    token_env = "TOKEN_LEE_CACHY"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pulseblade-hub
+  namespace: pulseblade
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: truenas-csi-nfs
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pulseblade-hub
+  namespace: pulseblade
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: pulseblade-hub
+  template:
+    metadata:
+      labels:
+        app: pulseblade-hub
+    spec:
+      # NFS is root:root until fsGroup runs. The hub writes its sqlite
+      # journal as this user.
+      securityContext:
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+      containers:
+        - name: pulseblade
+          image: harbor.dataknife.net/library/pulseblade:0.1.0@sha256:dbb61d897cdb807ace346474ba94f9606280d84acf7709542e69e6cbccd409f6
+          imagePullPolicy: IfNotPresent
+          command:
+            - pulseblade
+            - hub
+            - --config
+            - /etc/pulseblade/pulseblade.toml
+          env:
+            - name: XDG_STATE_HOME
+              value: /var/lib/pulseblade
+            - name: TOKEN_PRD_APPS_1
+              valueFrom:
+                secretKeyRef:
+                  name: pulseblade-hub-tokens
+                  key: prd-apps-1
+            - name: TOKEN_PRD_APPS_2
+              valueFrom:
+                secretKeyRef:
+                  name: pulseblade-hub-tokens
+                  key: prd-apps-2
+            - name: TOKEN_PRD_APPS_3
+              valueFrom:
+                secretKeyRef:
+                  name: pulseblade-hub-tokens
+                  key: prd-apps-3
+            - name: TOKEN_PRD_APPS_LARGE_WORKER_1
+              valueFrom:
+                secretKeyRef:
+                  name: pulseblade-hub-tokens
+                  key: prd-apps-large-worker-1
+            - name: TOKEN_PRD_APPS_WORKER_1
+              valueFrom:
+                secretKeyRef:
+                  name: pulseblade-hub-tokens
+                  key: prd-apps-worker-1
+            - name: TOKEN_PRD_APPS_WORKER_2
+              valueFrom:
+                secretKeyRef:
+                  name: pulseblade-hub-tokens
+                  key: prd-apps-worker-2
+            - name: TOKEN_PRD_APPS_WORKER_3
+              valueFrom:
+                secretKeyRef:
+                  name: pulseblade-hub-tokens
+                  key: prd-apps-worker-3
+            - name: TOKEN_PRD_APPS_WORKER_4
+              valueFrom:
+                secretKeyRef:
+                  name: pulseblade-hub-tokens
+                  key: prd-apps-worker-4
+            - name: TOKEN_PRD_APPS_WORKER_5
+              valueFrom:
+                secretKeyRef:
+                  name: pulseblade-hub-tokens
+                  key: prd-apps-worker-5
+            - name: TOKEN_PRD_APPS_WORKER_6
+              valueFrom:
+                secretKeyRef:
+                  name: pulseblade-hub-tokens
+                  key: prd-apps-worker-6
+            - name: TOKEN_POC_APPS_1
+              valueFrom:
+                secretKeyRef:
+                  name: pulseblade-hub-tokens
+                  key: poc-apps-1
+            - name: TOKEN_POC_APPS_2
+              valueFrom:
+                secretKeyRef:
+                  name: pulseblade-hub-tokens
+                  key: poc-apps-2
+            - name: TOKEN_POC_APPS_3
+              valueFrom:
+                secretKeyRef:
+                  name: pulseblade-hub-tokens
+                  key: poc-apps-3
+            - name: TOKEN_POC_APPS_WORKER_1
+              valueFrom:
+                secretKeyRef:
+                  name: pulseblade-hub-tokens
+                  key: poc-apps-worker-1
+            - name: TOKEN_POC_APPS_WORKER_2
+              valueFrom:
+                secretKeyRef:
+                  name: pulseblade-hub-tokens
+                  key: poc-apps-worker-2
+            - name: TOKEN_POC_APPS_WORKER_3
+              valueFrom:
+                secretKeyRef:
+                  name: pulseblade-hub-tokens
+                  key: poc-apps-worker-3
+            - name: TOKEN_POC_APPS_WORKER_4
+              valueFrom:
+                secretKeyRef:
+                  name: pulseblade-hub-tokens
+                  key: poc-apps-worker-4
+            - name: TOKEN_POC_APPS_WORKER_5
+              valueFrom:
+                secretKeyRef:
+                  name: pulseblade-hub-tokens
+                  key: poc-apps-worker-5
+            - name: TOKEN_POC_APPS_WORKER_6
+              valueFrom:
+                secretKeyRef:
+                  name: pulseblade-hub-tokens
+                  key: poc-apps-worker-6
+            - name: TOKEN_NPRD_APPS_1
+              valueFrom:
+                secretKeyRef:
+                  name: pulseblade-hub-tokens
+                  key: nprd-apps-1
+            - name: TOKEN_NPRD_APPS_2
+              valueFrom:
+                secretKeyRef:
+                  name: pulseblade-hub-tokens
+                  key: nprd-apps-2
+            - name: TOKEN_NPRD_APPS_3
+              valueFrom:
+                secretKeyRef:
+                  name: pulseblade-hub-tokens
+                  key: nprd-apps-3
+            - name: TOKEN_NPRD_APPS_WORKER_1
+              valueFrom:
+                secretKeyRef:
+                  name: pulseblade-hub-tokens
+                  key: nprd-apps-worker-1
+            - name: TOKEN_NPRD_APPS_WORKER_2
+              valueFrom:
+                secretKeyRef:
+                  name: pulseblade-hub-tokens
+                  key: nprd-apps-worker-2
+            - name: TOKEN_NPRD_APPS_WORKER_3
+              valueFrom:
+                secretKeyRef:
+                  name: pulseblade-hub-tokens
+                  key: nprd-apps-worker-3
+            - name: TOKEN_NPRD_APPS_WORKER_4
+              valueFrom:
+                secretKeyRef:
+                  name: pulseblade-hub-tokens
+                  key: nprd-apps-worker-4
+            - name: TOKEN_NPRD_APPS_WORKER_5
+              valueFrom:
+                secretKeyRef:
+                  name: pulseblade-hub-tokens
+                  key: nprd-apps-worker-5
+            - name: TOKEN_NPRD_APPS_WORKER_6
+              valueFrom:
+                secretKeyRef:
+                  name: pulseblade-hub-tokens
+                  key: nprd-apps-worker-6
+            - name: TOKEN_RANCHER_MANAGER_1
+              valueFrom:
+                secretKeyRef:
+                  name: pulseblade-hub-tokens
+                  key: rancher-manager-1
+            - name: TOKEN_RANCHER_MANAGER_2
+              valueFrom:
+                secretKeyRef:
+                  name: pulseblade-hub-tokens
+                  key: rancher-manager-2
+            - name: TOKEN_RANCHER_MANAGER_3
+              valueFrom:
+                secretKeyRef:
+                  name: pulseblade-hub-tokens
+                  key: rancher-manager-3
+            - name: TOKEN_LEE_CACHY
+              valueFrom:
+                secretKeyRef:
+                  name: pulseblade-hub-tokens
+                  key: lee-cachy
+          ports:
+            - name: http
+              containerPort: 7170
+          volumeMounts:
+            - name: config
+              mountPath: /etc/pulseblade
+              readOnly: true
+            - name: state
+              mountPath: /var/lib/pulseblade
+      volumes:
+        - name: config
+          configMap:
+            name: pulseblade-hub
+        - name: state
+          persistentVolumeClaim:
+            claimName: pulseblade-hub
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pulseblade-hub
+  namespace: pulseblade
+spec:
+  type: ClusterIP
+  selector:
+    app: pulseblade-hub
+  ports:
+    - name: http
+      port: 7170
+      targetPort: http
+---
+# TLS is the existing rke2 nginx default certificate
+# kube-system/wildcard-dataknife-net-tls (*.dataknife.net). Do not issue a
+# new cert. DNS: pulseblade.dataknife.net CNAME prd-apps-wk.dataknife.net
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: pulseblade-hub
+  namespace: pulseblade
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: pulseblade.dataknife.net
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: pulseblade-hub
+                port:
+                  number: 7170

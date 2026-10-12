@@ -1,0 +1,183 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pulseblade
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pulseblade
+  namespace: pulseblade
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: pulseblade
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "pods", "events"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets", "daemonsets"]
+    verbs: ["get", "list", "watch", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: pulseblade
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: pulseblade
+subjects:
+  - kind: ServiceAccount
+    name: pulseblade
+    namespace: pulseblade
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pulseblade
+  namespace: pulseblade
+data:
+  pulseblade.toml: |
+    listen = "0.0.0.0:7171"
+    dashboard = true
+    interval_secs = 10
+
+    [k8s]
+    api_url = "https://kubernetes.default.svc"
+    token_env = "K8S_TOKEN"
+    cluster = "prd-apps"
+    verify_tls = true
+    ca = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+
+    [upstream]
+    url = "https://pulseblade.dataknife.net"
+    token_env = "PULSEBLADE_HUB_TOKEN"
+    poll_secs = 5
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: pulseblade
+  namespace: pulseblade
+spec:
+  selector:
+    matchLabels:
+      app: pulseblade
+  template:
+    metadata:
+      labels:
+        app: pulseblade
+    spec:
+      serviceAccountName: pulseblade
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      securityContext:
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: pulseblade
+          image: harbor.dataknife.net/library/pulseblade:0.1.0@sha256:dbb61d897cdb807ace346474ba94f9606280d84acf7709542e69e6cbccd409f6
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              if [ -z "$K8S_TOKEN" ] && [ -f /var/run/secrets/kubernetes.io/serviceaccount/token ]; then
+                export K8S_TOKEN="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)"
+              fi
+              case "$NODE_NAME" in
+                prd-apps-1) export PULSEBLADE_HUB_TOKEN="$TOKEN_PRD_APPS_1" ;;
+                prd-apps-2) export PULSEBLADE_HUB_TOKEN="$TOKEN_PRD_APPS_2" ;;
+                prd-apps-3) export PULSEBLADE_HUB_TOKEN="$TOKEN_PRD_APPS_3" ;;
+                prd-apps-large-worker-1) export PULSEBLADE_HUB_TOKEN="$TOKEN_PRD_APPS_LARGE_WORKER_1" ;;
+                prd-apps-worker-1) export PULSEBLADE_HUB_TOKEN="$TOKEN_PRD_APPS_WORKER_1" ;;
+                prd-apps-worker-2) export PULSEBLADE_HUB_TOKEN="$TOKEN_PRD_APPS_WORKER_2" ;;
+                prd-apps-worker-3) export PULSEBLADE_HUB_TOKEN="$TOKEN_PRD_APPS_WORKER_3" ;;
+                prd-apps-worker-4) export PULSEBLADE_HUB_TOKEN="$TOKEN_PRD_APPS_WORKER_4" ;;
+                prd-apps-worker-5) export PULSEBLADE_HUB_TOKEN="$TOKEN_PRD_APPS_WORKER_5" ;;
+                prd-apps-worker-6) export PULSEBLADE_HUB_TOKEN="$TOKEN_PRD_APPS_WORKER_6" ;;
+              esac
+              exec pulseblade node --config /etc/pulseblade/pulseblade.toml
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: TOKEN_PRD_APPS_1
+              valueFrom:
+                secretKeyRef:
+                  name: pulseblade-hub-tokens
+                  key: prd-apps-1
+            - name: TOKEN_PRD_APPS_2
+              valueFrom:
+                secretKeyRef:
+                  name: pulseblade-hub-tokens
+                  key: prd-apps-2
+            - name: TOKEN_PRD_APPS_3
+              valueFrom:
+                secretKeyRef:
+                  name: pulseblade-hub-tokens
+                  key: prd-apps-3
+            - name: TOKEN_PRD_APPS_LARGE_WORKER_1
+              valueFrom:
+                secretKeyRef:
+                  name: pulseblade-hub-tokens
+                  key: prd-apps-large-worker-1
+            - name: TOKEN_PRD_APPS_WORKER_1
+              valueFrom:
+                secretKeyRef:
+                  name: pulseblade-hub-tokens
+                  key: prd-apps-worker-1
+            - name: TOKEN_PRD_APPS_WORKER_2
+              valueFrom:
+                secretKeyRef:
+                  name: pulseblade-hub-tokens
+                  key: prd-apps-worker-2
+            - name: TOKEN_PRD_APPS_WORKER_3
+              valueFrom:
+                secretKeyRef:
+                  name: pulseblade-hub-tokens
+                  key: prd-apps-worker-3
+            - name: TOKEN_PRD_APPS_WORKER_4
+              valueFrom:
+                secretKeyRef:
+                  name: pulseblade-hub-tokens
+                  key: prd-apps-worker-4
+            - name: TOKEN_PRD_APPS_WORKER_5
+              valueFrom:
+                secretKeyRef:
+                  name: pulseblade-hub-tokens
+                  key: prd-apps-worker-5
+            - name: TOKEN_PRD_APPS_WORKER_6
+              valueFrom:
+                secretKeyRef:
+                  name: pulseblade-hub-tokens
+                  key: prd-apps-worker-6
+            - name: XDG_STATE_HOME
+              value: /var/lib/pulseblade
+          ports:
+            - name: http
+              containerPort: 7171
+          volumeMounts:
+            - name: config
+              mountPath: /etc/pulseblade
+              readOnly: true
+            - name: state
+              mountPath: /var/lib/pulseblade
+      volumes:
+        - name: config
+          configMap:
+            name: pulseblade
+        - name: state
+          emptyDir: {}
+

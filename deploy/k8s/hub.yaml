@@ -1,7 +1,68 @@
 # Hub on poc-apps. The journal lives on a PVC so a rollout keeps state.
 # Node tokens stay in the pulseblade-hub-tokens Secret (keys are node ids).
 # The ConfigMap pulseblade-hub holds pulseblade.toml; its allow-list must
-# include pb-hub-poc.dataknife.net or the Ingress returns 403.
+# include pulseblade-poc.dataknife.net or the Ingress returns 403.
+# pb-hub-poc.dataknife.net stays for one release so old bookmarks still match.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pulseblade-hub
+  namespace: pulseblade
+data:
+  pulseblade.toml: |
+    allowed_hosts = [
+      "pulseblade-hub",
+      "pulseblade-hub.pulseblade",
+      "pulseblade-hub.pulseblade.svc",
+      "pulseblade-hub.pulseblade.svc.cluster.local",
+      "pulseblade-poc.dataknife.net",
+      "pb-hub-poc.dataknife.net",
+    ]
+
+    [hub]
+    listen = "0.0.0.0:7170"
+    action_wait_secs = 20
+
+    [[hub.nodes]]
+    id = "poc-apps-1"
+    token_env = "TOKEN_POC_APPS_1"
+
+    [[hub.nodes]]
+    id = "poc-apps-2"
+    token_env = "TOKEN_POC_APPS_2"
+
+    [[hub.nodes]]
+    id = "poc-apps-3"
+    token_env = "TOKEN_POC_APPS_3"
+
+    [[hub.nodes]]
+    id = "poc-apps-worker-1"
+    token_env = "TOKEN_POC_APPS_WORKER_1"
+
+    [[hub.nodes]]
+    id = "poc-apps-worker-2"
+    token_env = "TOKEN_POC_APPS_WORKER_2"
+
+    [[hub.nodes]]
+    id = "poc-apps-worker-3"
+    token_env = "TOKEN_POC_APPS_WORKER_3"
+
+    [[hub.nodes]]
+    id = "poc-apps-worker-4"
+    token_env = "TOKEN_POC_APPS_WORKER_4"
+
+    [[hub.nodes]]
+    id = "poc-apps-worker-5"
+    token_env = "TOKEN_POC_APPS_WORKER_5"
+
+    [[hub.nodes]]
+    id = "poc-apps-worker-6"
+    token_env = "TOKEN_POC_APPS_WORKER_6"
+
+    [[hub.nodes]]
+    id = "lee-cachy"
+    token_env = "TOKEN_LEE_CACHY"
+---
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:

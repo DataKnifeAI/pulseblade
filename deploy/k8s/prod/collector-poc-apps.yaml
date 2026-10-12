@@ -1,0 +1,145 @@
+# Second collector on poc-apps. Pushes the same nodes to the production hub.
+# The existing pulseblade DaemonSet keeps pushing to the POC hub.
+# This pod uses its own emptyDir and listen port so it does not share the
+# POC database or bind the POC collector's port.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pulseblade-prod
+  namespace: pulseblade
+data:
+  pulseblade.toml: |
+    listen = "127.0.0.1:7172"
+    dashboard = true
+    interval_secs = 10
+
+    [k8s]
+    api_url = "https://kubernetes.default.svc"
+    token_env = "K8S_TOKEN"
+    cluster = "poc-apps"
+    verify_tls = true
+    ca = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+
+    [upstream]
+    url = "https://pulseblade.dataknife.net"
+    token_env = "PULSEBLADE_HUB_TOKEN"
+    poll_secs = 5
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: pulseblade-prod
+  namespace: pulseblade
+spec:
+  selector:
+    matchLabels:
+      app: pulseblade-prod
+  template:
+    metadata:
+      labels:
+        app: pulseblade-prod
+    spec:
+      serviceAccountName: pulseblade
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      securityContext:
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: pulseblade
+          image: harbor.dataknife.net/library/pulseblade:0.1.0@sha256:dbb61d897cdb807ace346474ba94f9606280d84acf7709542e69e6cbccd409f6
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              if [ -z "$K8S_TOKEN" ] && [ -f /var/run/secrets/kubernetes.io/serviceaccount/token ]; then
+                export K8S_TOKEN="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)"
+              fi
+              case "$NODE_NAME" in
+                poc-apps-1) export PULSEBLADE_HUB_TOKEN="$TOKEN_POC_APPS_1" ;;
+                poc-apps-2) export PULSEBLADE_HUB_TOKEN="$TOKEN_POC_APPS_2" ;;
+                poc-apps-3) export PULSEBLADE_HUB_TOKEN="$TOKEN_POC_APPS_3" ;;
+                poc-apps-worker-1) export PULSEBLADE_HUB_TOKEN="$TOKEN_POC_APPS_WORKER_1" ;;
+                poc-apps-worker-2) export PULSEBLADE_HUB_TOKEN="$TOKEN_POC_APPS_WORKER_2" ;;
+                poc-apps-worker-3) export PULSEBLADE_HUB_TOKEN="$TOKEN_POC_APPS_WORKER_3" ;;
+                poc-apps-worker-4) export PULSEBLADE_HUB_TOKEN="$TOKEN_POC_APPS_WORKER_4" ;;
+                poc-apps-worker-5) export PULSEBLADE_HUB_TOKEN="$TOKEN_POC_APPS_WORKER_5" ;;
+                poc-apps-worker-6) export PULSEBLADE_HUB_TOKEN="$TOKEN_POC_APPS_WORKER_6" ;;
+              esac
+              exec pulseblade node --config /etc/pulseblade/pulseblade.toml
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: TOKEN_POC_APPS_1
+              valueFrom:
+                secretKeyRef:
+                  name: pulseblade-prod-tokens
+                  key: poc-apps-1
+            - name: TOKEN_POC_APPS_2
+              valueFrom:
+                secretKeyRef:
+                  name: pulseblade-prod-tokens
+                  key: poc-apps-2
+            - name: TOKEN_POC_APPS_3
+              valueFrom:
+                secretKeyRef:
+                  name: pulseblade-prod-tokens
+                  key: poc-apps-3
+            - name: TOKEN_POC_APPS_WORKER_1
+              valueFrom:
+                secretKeyRef:
+                  name: pulseblade-prod-tokens
+                  key: poc-apps-worker-1
+            - name: TOKEN_POC_APPS_WORKER_2
+              valueFrom:
+                secretKeyRef:
+                  name: pulseblade-prod-tokens
+                  key: poc-apps-worker-2
+            - name: TOKEN_POC_APPS_WORKER_3
+              valueFrom:
+                secretKeyRef:
+                  name: pulseblade-prod-tokens
+                  key: poc-apps-worker-3
+            - name: TOKEN_POC_APPS_WORKER_4
+              valueFrom:
+                secretKeyRef:
+                  name: pulseblade-prod-tokens
+                  key: poc-apps-worker-4
+            - name: TOKEN_POC_APPS_WORKER_5
+              valueFrom:
+                secretKeyRef:
+                  name: pulseblade-prod-tokens
+                  key: poc-apps-worker-5
+            - name: TOKEN_POC_APPS_WORKER_6
+              valueFrom:
+                secretKeyRef:
+                  name: pulseblade-prod-tokens
+                  key: poc-apps-worker-6
+            - name: XDG_STATE_HOME
+              value: /var/lib/pulseblade
+          ports:
+            - name: http
+              containerPort: 7172
+          volumeMounts:
+            - name: config
+              mountPath: /etc/pulseblade
+              readOnly: true
+            - name: state
+              mountPath: /var/lib/pulseblade
+      volumes:
+        - name: config
+          configMap:
+            name: pulseblade-prod
+        - name: state
+          emptyDir: {}
+

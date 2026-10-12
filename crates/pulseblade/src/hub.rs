@@ -708,6 +708,16 @@ impl HubClient {
     }
 }
 
+/// Overall HTTP deadline shared by hub cursor, push, and poll.
+///
+/// A call still has to finish after sitting in the hub's serialized SQLite
+/// queue. The deadline stays longer than the long-poll the client asks the
+/// hub to hold (`poll_secs`, capped at 30s). It does not change that wait.
+fn hub_client_timeout(poll_secs: u64) -> Duration {
+    let wait_secs = poll_secs.clamp(1, 60).min(30);
+    Duration::from_secs(30.max(wait_secs + 5))
+}
+
 /// Push the local journal and apply any routed actions until `shutdown`.
 pub fn run_upstream(
     store: Arc<Store>,
@@ -722,7 +732,7 @@ pub fn run_upstream(
         base: base.trim_end_matches('/').to_string(),
         token,
         agent: ureq::AgentBuilder::new()
-            .timeout(Duration::from_secs(poll_secs.clamp(1, 30) + 5))
+            .timeout(hub_client_timeout(poll_secs))
             .build(),
         tls,
         interval_secs: poll_secs.clamp(1, 60),
@@ -847,6 +857,22 @@ mod tests {
     use pulseblade_mcp::{query, ActionRoute};
     use std::sync::atomic::AtomicBool;
     use std::thread::JoinHandle;
+
+    #[test]
+    fn hub_client_timeout_outlasts_the_long_poll() {
+        // Nodes poll every 5s. The old deadline was poll_secs + 5 (10s), which
+        // expired while a push sat in the hub SQLite queue.
+        assert_eq!(hub_client_timeout(5), Duration::from_secs(30));
+        for poll in [1_u64, 5, 15, 25, 30, 60] {
+            let wait = Duration::from_secs(poll.clamp(1, 60).min(30));
+            let timeout = hub_client_timeout(poll);
+            assert!(
+                timeout > wait,
+                "timeout {timeout:?} must exceed long-poll {wait:?} for poll_secs={poll}"
+            );
+            assert!(timeout >= Duration::from_secs(30));
+        }
+    }
 
     struct Rec {
         calls: Mutex<Vec<String>>,
