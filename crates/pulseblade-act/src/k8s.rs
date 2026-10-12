@@ -431,9 +431,8 @@ fn connect_from_inside_a_runtime_does_not_panic() {
             verify_tls: false,
             ca: String::new(),
         };
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            KubeApi::connect(&endpoint)
-        }));
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| KubeApi::connect(&endpoint)));
         assert!(
             result.is_ok(),
             "KubeApi::connect panicked inside a tokio runtime"
