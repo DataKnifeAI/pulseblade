@@ -176,7 +176,7 @@ fn parse_detail(s: &str) -> Result<query::Detail, String> {
         .map_err(|_| "expected summary, brief, or full".to_string())
 }
 
-fn open_hub_store(config: &Config, path: &Path) -> anyhow::Result<Arc<Store>> {
+async fn open_hub_store(config: &Config, path: &Path) -> anyhow::Result<Arc<Store>> {
     let url_env = config.hub.database_url_env.trim();
     if url_env.is_empty() {
         return open_store(path);
@@ -189,9 +189,14 @@ fn open_hub_store(config: &Config, path: &Path) -> anyhow::Result<Arc<Store>> {
     )?;
     let ca = config::optional_env(config.hub.database_ca_env.trim())?;
     tracing::info!("hub journal is postgres");
-    Ok(Arc::new(
-        Store::open_postgres(&url, ca.as_deref()).context("opening the hub postgres database")?,
-    ))
+    // This is the #[tokio::main] thread. postgres::Client::drop starts its
+    // own runtime and panics here, so the open runs on a blocking thread.
+    let opened = tokio::task::spawn_blocking(move || {
+        Store::open_postgres(&url, ca.as_deref()).context("opening the hub postgres database")
+    })
+    .await
+    .context("opening the hub postgres database")??;
+    Ok(Arc::new(opened))
 }
 
 fn open_store(path: &Path) -> anyhow::Result<Arc<Store>> {
@@ -516,7 +521,7 @@ async fn main() -> anyhow::Result<()> {
             served
         }
         Command::Hub => {
-            let store = open_hub_store(&config, &db)?;
+            let store = open_hub_store(&config, &db).await?;
             let tokens = hub_tokens(&config)?;
             let addr: SocketAddr =
                 config.hub.listen.parse().with_context(|| {

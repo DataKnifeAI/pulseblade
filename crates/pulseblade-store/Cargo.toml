@@ -19,6 +19,8 @@ serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"
 thiserror.workspace = true
+tokio = { version = "1", default-features = false, features = ["rt"] }
 
 [dev-dependencies]
 tempfile.workspace = true
+tokio = { version = "1", features = ["macros", "rt"] }

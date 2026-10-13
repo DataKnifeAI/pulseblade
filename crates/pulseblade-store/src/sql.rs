@@ -20,8 +20,23 @@ pub(crate) enum Backend {
         path: Option<std::path::PathBuf>,
     },
     Postgres {
-        pool: PgPool,
+        /// `None` after [`Drop`] has moved the pool onto a non-runtime thread.
+        pool: Option<PgPool>,
     },
+}
+
+impl Drop for Backend {
+    fn drop(&mut self) {
+        let Backend::Postgres { pool } = self else {
+            return;
+        };
+        let Some(pool) = pool.take() else {
+            return;
+        };
+        // Idle clients live in the pool. Dropping them here would start a
+        // runtime on whatever thread is dropping the store.
+        off_runtime(move || drop(pool));
+    }
 }
 
 pub(crate) type PgPool = r2d2::Pool<PgManager>;
@@ -374,9 +389,9 @@ impl Store {
         }
     }
 
-    pub(crate) fn with_sql<T>(
+    pub(crate) fn with_sql<T: Send>(
         &self,
-        f: impl FnOnce(&mut dyn Sql) -> crate::Result<T>,
+        f: impl FnOnce(&mut dyn Sql) -> crate::Result<T> + Send,
     ) -> crate::Result<T> {
         match &self.backend {
             Backend::Sqlite { conn, .. } => {
@@ -384,16 +399,19 @@ impl Store {
                 let mut session = SqliteSql { conn: &guard };
                 f(&mut session)
             }
-            Backend::Postgres { pool } => with_pg(pool, |client| {
-                let mut session = PgSql { client };
-                f(&mut session)
-            }),
+            Backend::Postgres { pool } => {
+                let pool = pg_pool(pool)?;
+                with_pg(pool, |client| {
+                    let mut session = PgSql { client };
+                    f(&mut session)
+                })
+            }
         }
     }
 
-    pub(crate) fn transaction<T>(
+    pub(crate) fn transaction<T: Send>(
         &self,
-        f: impl FnOnce(&mut dyn Sql) -> crate::Result<T>,
+        f: impl FnOnce(&mut dyn Sql) -> crate::Result<T> + Send,
     ) -> crate::Result<T> {
         match &self.backend {
             Backend::Sqlite { conn, .. } => {
@@ -411,25 +429,35 @@ impl Store {
                     Err(e) => Err(e),
                 }
             }
-            Backend::Postgres { pool } => with_pg(pool, |client| {
-                let mut session = PgSql { client };
-                session.execute("BEGIN", &[])?;
-                let result = f(&mut session);
-                match &result {
-                    Ok(_) => {
-                        session.execute("COMMIT", &[])?;
+            Backend::Postgres { pool } => {
+                let pool = pg_pool(pool)?;
+                with_pg(pool, |client| {
+                    let mut session = PgSql { client };
+                    session.execute("BEGIN", &[])?;
+                    let result = f(&mut session);
+                    match &result {
+                        Ok(_) => {
+                            session.execute("COMMIT", &[])?;
+                        }
+                        Err(_) => {
+                            let _ = session.execute("ROLLBACK", &[]);
+                        }
                     }
-                    Err(_) => {
-                        let _ = session.execute("ROLLBACK", &[]);
-                    }
-                }
-                result
-            }),
+                    result
+                })
+            }
         }
     }
 
     /// Hub store. `ca_pem` is the server CA when the URL requires TLS.
+    ///
+    /// Safe to call from a tokio runtime. The blocking client is opened on
+    /// another thread.
     pub fn open_postgres(url: &str, ca_pem: Option<&str>) -> crate::Result<Self> {
+        off_runtime(|| Self::open_postgres_blocking(url, ca_pem))
+    }
+
+    fn open_postgres_blocking(url: &str, ca_pem: Option<&str>) -> crate::Result<Self> {
         let mut config: postgres::Config = url
             .parse()
             .map_err(|e: postgres::Error| StoreError::Database(e.to_string()))?;
@@ -451,21 +479,50 @@ impl Store {
             .build(PgManager { config, tls })
             .map_err(|e| StoreError::Database(e.to_string()))?;
         let store = Self {
-            backend: Backend::Postgres { pool },
+            backend: Backend::Postgres { pool: Some(pool) },
         };
         store.with_sql(|sql| sql.batch(PG_SCHEMA))?;
         Ok(store)
     }
 }
 
-fn with_pg<T>(
+fn pg_pool(pool: &Option<PgPool>) -> crate::Result<&PgPool> {
+    pool.as_ref()
+        .ok_or_else(|| StoreError::Database("postgres pool is closed".into()))
+}
+
+/// `postgres` 0.19's blocking `Client` owns a current-thread runtime and
+/// starts it for every call, including `Drop`. That panics with "Cannot
+/// start a runtime from within a runtime" on a tokio worker.
+/// r2d2's pool threads have no runtime handle and run the client directly.
+/// A handle is set on workers, which panic, and also on `spawn_blocking`
+/// threads, which do not. Hopping whenever a handle is present covers both.
+fn off_runtime<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        std::thread::scope(|scope| {
+            scope
+                .spawn(f)
+                .join()
+                .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
+        })
+    } else {
+        f()
+    }
+}
+
+fn with_pg<T: Send>(
     pool: &PgPool,
-    f: impl FnOnce(&mut postgres::Client) -> crate::Result<T>,
+    f: impl FnOnce(&mut postgres::Client) -> crate::Result<T> + Send,
 ) -> crate::Result<T> {
-    let mut conn = pool
-        .get()
-        .map_err(|e| StoreError::Database(e.to_string()))?;
-    f(&mut conn)
+    off_runtime(move || {
+        let mut conn = pool
+            .get()
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        let result = f(&mut conn);
+        // Return or discard the client before leaving this thread.
+        drop(conn);
+        result
+    })
 }
 
 const PG_SCHEMA: &str = r#"
@@ -667,11 +724,203 @@ CREATE UNIQUE INDEX IF NOT EXISTS events_dedupe ON events(resource_id, ts, kind,
 
 #[cfg(test)]
 mod tests {
-    use super::pg_sql;
+    use std::net::TcpListener;
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    use super::{pg_sql, SqlExt};
+    use crate::Store;
 
     #[test]
     fn numbered_and_bare_placeholders_become_postgres_parameters() {
         assert_eq!(pg_sql("SELECT ?1, ?2"), "SELECT $1, $2");
         assert_eq!(pg_sql("IN (?, ?, ?)"), "IN ($1, $2, $3)");
+    }
+
+    /// Opens the blocking client from a tokio runtime. `Client::drop` panics
+    /// there unless the checkout runs on another thread.
+    #[tokio::test]
+    async fn open_postgres_from_tokio_runtime_does_not_panic() {
+        let Some(pg) = disposable_postgres() else {
+            eprintln!("skipping postgres runtime test: docker unavailable");
+            return;
+        };
+        assert!(
+            tokio::runtime::Handle::try_current().is_ok(),
+            "the open must run on a tokio runtime thread"
+        );
+        let store = open_when_ready(&pg.url);
+        let one = store
+            .with_sql(|sql| sql.query_one("SELECT 1::bigint", &[], |row| row.int(0)))
+            .expect("select 1");
+        assert_eq!(one, 1);
+        drop(store);
+    }
+
+    struct DisposablePg {
+        url: String,
+        container: Option<String>,
+    }
+
+    impl Drop for DisposablePg {
+        fn drop(&mut self) {
+            let Some(name) = self.container.take() else {
+                return;
+            };
+            let _ = Command::new("docker")
+                .args(["rm", "-f", &name])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+
+    fn disposable_postgres() -> Option<DisposablePg> {
+        if let Ok(url) = std::env::var("PULSEBLADE_TEST_PG") {
+            let url = url.trim();
+            if !url.is_empty() {
+                return Some(DisposablePg {
+                    url: url.to_string(),
+                    container: None,
+                });
+            }
+        }
+        if !docker_available() {
+            return None;
+        }
+        let port = TcpListener::bind("127.0.0.1:0")
+            .expect("bind a free local port")
+            .local_addr()
+            .expect("read the free port")
+            .port();
+        let name = format!(
+            "pb-pg-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        );
+        let output = Command::new("docker")
+            .args([
+                "run",
+                "-d",
+                "--rm",
+                "--name",
+                &name,
+                "-e",
+                "POSTGRES_USER=pulseblade",
+                "-e",
+                "POSTGRES_HOST_AUTH_METHOD=trust",
+                "-e",
+                "POSTGRES_DB=pulseblade",
+                "-p",
+                &format!("127.0.0.1:{port}:5432"),
+                "postgres:16-alpine",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("run docker");
+        if !output.status.success() {
+            let _ = Command::new("docker")
+                .args(["rm", "-f", &name])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            panic!(
+                "docker run failed ({}): {}",
+                output.status,
+                redact_process(&output.stderr)
+            );
+        }
+        let pg = DisposablePg {
+            url: format!("postgres://pulseblade@127.0.0.1:{port}/pulseblade"),
+            container: Some(name.clone()),
+        };
+        if !wait_ready(&name, port) {
+            panic!("postgres container did not become ready");
+        }
+        Some(pg)
+    }
+
+    fn docker_available() -> bool {
+        Command::new("docker")
+            .arg("info")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    fn wait_ready(name: &str, port: u16) -> bool {
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        for _ in 0..60 {
+            let ready = Command::new("docker")
+                .args([
+                    "exec",
+                    name,
+                    "pg_isready",
+                    "-h",
+                    "127.0.0.1",
+                    "-U",
+                    "pulseblade",
+                    "-d",
+                    "pulseblade",
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false);
+            let published =
+                std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok();
+            if ready && published {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        false
+    }
+
+    fn open_when_ready(url: &str) -> Store {
+        let mut last = String::from("not attempted");
+        for _ in 0..20 {
+            match Store::open_postgres(url, None) {
+                Ok(store) => return store,
+                Err(err) => {
+                    last = redact(&err.to_string());
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+            }
+        }
+        panic!("postgres did not accept a connection: {last}");
+    }
+
+    fn redact(text: &str) -> String {
+        let mut out = String::new();
+        for line in text.lines() {
+            if line.contains("postgres://") || line.to_ascii_lowercase().contains("password") {
+                continue;
+            }
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(line);
+        }
+        if out.is_empty() {
+            "connection failed".into()
+        } else {
+            out
+        }
+    }
+
+    fn redact_process(stderr: &[u8]) -> String {
+        let clipped: String = String::from_utf8_lossy(stderr)
+            .chars()
+            .take(2_000)
+            .collect();
+        redact(&clipped)
     }
 }
