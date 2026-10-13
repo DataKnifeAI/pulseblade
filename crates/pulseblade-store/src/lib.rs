@@ -793,8 +793,8 @@ impl Store {
         let kind = filter.kind.map(|k| k.as_str().to_string());
         let prefix = filter.resource_prefix.as_ref().map(|p| format!("{p}%"));
         let where_clause = "c.seq > ?1
-             AND (?2 IS NULL OR r.kind = ?2)
-             AND (?3 IS NULL OR c.resource_id LIKE ?3)";
+             AND (CAST(?2 AS TEXT) IS NULL OR r.kind = ?2)
+             AND (CAST(?3 AS TEXT) IS NULL OR c.resource_id LIKE ?3)";
         let args = [
             SqlVal::Int(after),
             SqlVal::opt_text(kind),

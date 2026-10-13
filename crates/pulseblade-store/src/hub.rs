@@ -667,7 +667,8 @@ impl Store {
                 )
             };
             drafts.push(FindingDraft {
-                dedupe_key: format!("{OFFLINE_RULE}\u{0}{host_id}"),
+                // U+001F, not U+0000: Postgres rejects NUL in text (UTF8 0x00).
+                dedupe_key: format!("{OFFLINE_RULE}\u{1f}{host_id}"),
                 resource_id: host_id,
                 rule: OFFLINE_RULE.to_string(),
                 severity: if push.shutting_down {
@@ -1101,5 +1102,37 @@ mod tests {
             .changes_after(0, &crate::ChangeFilter::default(), 20)
             .unwrap();
         assert!(!changes.iter().any(|c| c.kind == ChangeKind::Disappeared));
+    }
+
+    /// The hub maintain loop calls this every 15s. Postgres parse rejects a bare
+    /// `$1 IS NULL` (42P08) even when the bound rule is a non-null string.
+    #[test]
+    fn postgres_sync_offline_hosts_opens_one_finding() {
+        let Some(pg) = crate::sql::tests::disposable_postgres() else {
+            eprintln!("skipping postgres offline test: docker unavailable");
+            return;
+        };
+        let store = crate::sql::tests::open_when_ready(&pg.url);
+        let now = Utc::now();
+        store
+            .ingest_node(
+                "web1",
+                &NodeBatch {
+                    changes: vec![change(1, "host:web1", ChangeKind::Appeared)],
+                    resources: vec![Resource::new("host:web1", ResourceKind::Host, "web1")
+                        .health(Health::Degraded)],
+                    interval_secs: 15,
+                    ..NodeBatch::default()
+                },
+            )
+            .unwrap();
+        assert!(store
+            .set_node_last_push("web1", now.timestamp_millis() - 46_000)
+            .unwrap());
+        let opened = store.sync_offline_hosts(now).unwrap();
+        assert_eq!(opened.len(), 1);
+        assert_eq!(opened[0].rule, OFFLINE_RULE);
+        assert!(opened[0].summary.contains("offline"));
+        assert!(store.sync_offline_hosts(now).unwrap().is_empty());
     }
 }

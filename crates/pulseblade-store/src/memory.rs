@@ -144,9 +144,9 @@ impl Store {
         self.with_sql(|sql| {
             let total = sql.query_one(
                 "SELECT COUNT(*) FROM findings
-                 WHERE (?1 IS NULL OR status = ?1)
-                   AND (?2 IS NULL OR severity = ?2)
-                   AND (?3 IS NULL OR resource_id = ?3)",
+                 WHERE (CAST(?1 AS TEXT) IS NULL OR status = ?1)
+                   AND (CAST(?2 AS TEXT) IS NULL OR severity = ?2)
+                   AND (CAST(?3 AS TEXT) IS NULL OR resource_id = ?3)",
                 &args,
                 |row| row.int(0),
             )?;
@@ -156,9 +156,9 @@ impl Store {
                 "SELECT id, dedupe_key, resource_id, rule, severity, status, summary,
                         opened_at, context, logs
                  FROM findings
-                 WHERE (?1 IS NULL OR status = ?1)
-                   AND (?2 IS NULL OR severity = ?2)
-                   AND (?3 IS NULL OR resource_id = ?3)
+                 WHERE (CAST(?1 AS TEXT) IS NULL OR status = ?1)
+                   AND (CAST(?2 AS TEXT) IS NULL OR severity = ?2)
+                   AND (CAST(?3 AS TEXT) IS NULL OR resource_id = ?3)
                  ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END,
                           opened_at DESC
                  LIMIT ?4",
@@ -216,11 +216,13 @@ impl Store {
         let ms = now.timestamp_millis();
         let rule_arg = SqlVal::opt_text(rule.map(|s| s.to_string()));
         self.transaction(|sql| {
+            // CAST: a bare `$1 IS NULL` is untyped, and Postgres rejects the
+            // parse with SQLSTATE 42P08 before the value is bound.
             let mut open = sql.query(
                 "SELECT id, dedupe_key, resource_id, rule, severity, status, summary,
                         opened_at, context, logs
                  FROM findings WHERE status IN ('open', 'acked')
-                   AND (?1 IS NULL OR rule = ?1)",
+                   AND (CAST(?1 AS TEXT) IS NULL OR rule = ?1)",
                 &[rule_arg],
                 map_finding,
             )?;

@@ -723,7 +723,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS events_dedupe ON events(resource_id, ts, kind,
 "#;
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::net::TcpListener;
     use std::process::{Command, Stdio};
     use std::time::Duration;
@@ -757,8 +757,8 @@ mod tests {
         drop(store);
     }
 
-    struct DisposablePg {
-        url: String,
+    pub(crate) struct DisposablePg {
+        pub(crate) url: String,
         container: Option<String>,
     }
 
@@ -775,7 +775,7 @@ mod tests {
         }
     }
 
-    fn disposable_postgres() -> Option<DisposablePg> {
+    pub(crate) fn disposable_postgres() -> Option<DisposablePg> {
         if let Ok(url) = std::env::var("PULSEBLADE_TEST_PG") {
             let url = url.trim();
             if !url.is_empty() {
@@ -884,7 +884,7 @@ mod tests {
         false
     }
 
-    fn open_when_ready(url: &str) -> Store {
+    pub(crate) fn open_when_ready(url: &str) -> Store {
         let mut last = String::from("not attempted");
         for _ in 0..20 {
             match Store::open_postgres(url, None) {
