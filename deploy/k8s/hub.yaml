@@ -83,6 +83,14 @@ spec:
   imageName: ghcr.io/cloudnative-pg/postgresql:18.6-system-trixie
   enableSuperuserAccess: false
   enablePDB: true
+  # truenas-csi-nfs is root-squashed, so kubelet applyFSGroup cannot chown
+  # pgdata. Same override as the working authentik cluster: run as 26, no fsGroup.
+  podSecurityContext:
+    runAsUser: 26
+    runAsGroup: 26
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
   storage:
     size: 40Gi
     storageClass: truenas-csi-nfs
