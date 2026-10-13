@@ -1,5 +1,8 @@
 target
 .git
+# The image toolchain is already Rust 1.99. This file would make rustup
+# download rustfmt and clippy before the release build.
+rust-toolchain.toml
 .env
 .env.*
 .buildkit-cache

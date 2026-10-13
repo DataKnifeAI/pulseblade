@@ -21,14 +21,14 @@ publish:
   # Cold release builds take long enough that a newer main push was
   # canceling this job before the image reached Harbor.
   interruptible: false
-  cache:
-    key:
-      files:
-        - Cargo.lock
-      prefix: pulseblade
-    paths:
-      - .cargo/registry
-      - .cargo/git
+  # The nprd runner defaults to 1 CPU / 2Gi and allows a job to raise
+  # itself up to these caps. BuildKit does not see the GitLab cache, so
+  # dependency reuse is the registry layer cache in the script below.
+  variables:
+    KUBERNETES_CPU_REQUEST: "2"
+    KUBERNETES_CPU_LIMIT: "2"
+    KUBERNETES_MEMORY_REQUEST: "3Gi"
+    KUBERNETES_MEMORY_LIMIT: "4Gi"
   artifacts:
     paths:
       - image-digest.txt
