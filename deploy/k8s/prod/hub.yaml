@@ -194,6 +194,7 @@ spec:
         name: pulseblade-postgres-credentials
   postgresql:
     parameters:
+      shared_buffers: "1GB"
       ssl_min_protocol_version: "TLSv1.3"
 ---
 apiVersion: v1
