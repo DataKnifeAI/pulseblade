@@ -101,6 +101,11 @@ CREATE TABLE IF NOT EXISTS samples (
 );
 CREATE INDEX IF NOT EXISTS samples_series ON samples(resource_id, metric, ts);
 
+CREATE TABLE IF NOT EXISTS sample_count (
+    id INTEGER PRIMARY KEY,
+    n  INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS latest (
     resource_id TEXT NOT NULL,
     metric      TEXT NOT NULL,
@@ -325,6 +330,10 @@ impl Store {
         conn.execute_batch(SCHEMA)?;
         history::ensure_history(&conn)?;
         ensure_cursor_columns(&conn)?;
+        {
+            let mut sql = sql::SqliteSql { conn: &conn };
+            ensure_sample_count(&mut sql)?;
+        }
         Ok(Self {
             backend: sql::Backend::Sqlite {
                 conn: Mutex::new(conn),
@@ -355,6 +364,43 @@ fn ensure_cursor_columns(conn: &Connection) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `sample_count` is one row (`id = 1`). `COUNT(*)` runs only when that row
+/// is missing: store open, or a later read after the row was removed.
+fn ensure_sample_count(sql: &mut dyn sql::Sql) -> Result<()> {
+    let present = sql.query_opt("SELECT id FROM sample_count WHERE id = 1", &[], |row| {
+        row.int(0)
+    })?;
+    if present.is_some() {
+        return Ok(());
+    }
+    let n = sql.query_one("SELECT COUNT(*) FROM samples", &[], |row| row.int(0))?;
+    sql.execute(
+        "INSERT INTO sample_count (id, n) VALUES (1, ?1) ON CONFLICT(id) DO NOTHING",
+        &[SqlVal::Int(n)],
+    )?;
+    Ok(())
+}
+
+fn add_sample_count(sql: &mut dyn sql::Sql, delta: i64) -> Result<()> {
+    if delta == 0 {
+        return Ok(());
+    }
+    ensure_sample_count(sql)?;
+    sql.execute(
+        "UPDATE sample_count SET n = n + ?1 WHERE id = 1",
+        &[SqlVal::Int(delta)],
+    )?;
+    Ok(())
+}
+
+fn sample_count(sql: &mut dyn sql::Sql) -> Result<u64> {
+    ensure_sample_count(sql)?;
+    let n = sql.query_one("SELECT n FROM sample_count WHERE id = 1", &[], |row| {
+        row.int(0)
+    })?;
+    Ok(n.max(0) as u64)
 }
 
 impl Store {
@@ -395,7 +441,7 @@ impl Store {
                 )
             };
             Ok(StoreStats {
-                samples: count(sql, "samples")?,
+                samples: sample_count(sql)?,
                 changes: count(sql, "changes")?,
                 checkpoints: count(sql, "checkpoints")?,
             })
@@ -567,6 +613,11 @@ impl Store {
         history::note_changes(&tx, &changes)?;
 
         {
+            let mut session = sql::SqliteSql { conn: &tx };
+            ensure_sample_count(&mut session)?;
+        }
+        let mut inserted_samples = 0i64;
+        {
             let mut ins = tx.prepare_cached(
                 "INSERT INTO samples (resource_id, metric, ts, value) VALUES (?1, ?2, ?3, ?4)",
             )?;
@@ -578,7 +629,12 @@ impl Store {
                 history::observe_sample(&tx, &s.resource_id, &s.metric, ms, s.value)?;
                 ins.execute(params![s.resource_id, s.metric, ms, s.value])?;
                 latest.execute(params![s.resource_id, s.metric, ms, s.value])?;
+                inserted_samples += 1;
             }
+        }
+        {
+            let mut session = sql::SqliteSql { conn: &tx };
+            add_sample_count(&mut session, inserted_samples)?;
         }
 
         {
@@ -854,11 +910,13 @@ impl Store {
         let sample_ms = samples_before.timestamp_millis();
         let history_ms = history_before.timestamp_millis();
         let change_ms = changes_before.timestamp_millis();
-        self.with_sql(|sql| {
+        self.transaction(|sql| {
+            ensure_sample_count(sql)?;
             let s = sql.execute(
                 "DELETE FROM samples WHERE ts < ?1",
                 &[SqlVal::Int(sample_ms)],
             )?;
+            add_sample_count(sql, -(s as i64))?;
             sql.execute("DELETE FROM logs WHERE ts < ?1", &[SqlVal::Int(sample_ms)])?;
             if !sql.postgres() {
                 sql.execute(
@@ -1271,5 +1329,92 @@ mod tests {
             .unwrap();
         assert_eq!(last[1].value, 5.0);
         assert_eq!(store.latest("host:h").unwrap()["cpu.used_pct"].value, 5.0);
+    }
+
+    #[test]
+    fn sample_counter_tracks_apply_prune_and_reseed() {
+        let path = std::env::temp_dir().join(format!(
+            "pulseblade-sample-count-{}-{}.db",
+            std::process::id(),
+            Utc::now().timestamp_millis()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let old = Utc.timestamp_millis_opt(1_700_000_000_000).unwrap();
+        let new = old + Duration::hours(2);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.stats().unwrap().samples, 0);
+
+        store
+            .apply(
+                "host",
+                old,
+                &Observation {
+                    resources: vec![Resource::new("host:h", ResourceKind::Host, "h")],
+                    samples: vec![
+                        Sample::new("host:h", "cpu.used_pct", 1.0),
+                        Sample::new("host:h", "mem.used_pct", 2.0),
+                        Sample::new("host:h", "load", f64::NAN),
+                    ],
+                    logs: vec![],
+                },
+            )
+            .unwrap();
+        store
+            .apply(
+                "host",
+                new,
+                &Observation {
+                    resources: vec![Resource::new("host:h", ResourceKind::Host, "h")],
+                    samples: vec![
+                        Sample::new("host:h", "cpu.used_pct", 3.0),
+                        Sample::new("host:h", "load", 4.0),
+                    ],
+                    logs: vec![],
+                },
+            )
+            .unwrap();
+        let stats = store.stats().unwrap();
+        assert_eq!(stats.samples, 4);
+        assert!(stats.changes >= 1);
+        assert_eq!(stats.checkpoints, 0);
+        store.create_checkpoint("mark", new).unwrap();
+        assert_eq!(store.stats().unwrap().checkpoints, 1);
+
+        let (removed, _) = store
+            .prune(
+                old + Duration::hours(1),
+                new + Duration::days(1),
+                new + Duration::days(1),
+            )
+            .unwrap();
+        assert_eq!(removed, 2);
+        assert_eq!(store.stats().unwrap().samples, 2);
+        let live: i64 = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM samples", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(store.stats().unwrap().samples, live as u64);
+
+        store
+            .conn()
+            .execute("DELETE FROM sample_count", [])
+            .unwrap();
+        assert_eq!(store.stats().unwrap().samples, 2);
+        drop(store);
+
+        let store = Store::open(&path).unwrap();
+        store
+            .conn()
+            .execute("DELETE FROM sample_count", [])
+            .unwrap();
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.stats().unwrap().samples, 2);
+        drop(store);
+        for suffix in ["", "-wal", "-shm"] {
+            let mut sidecar = path.clone().into_os_string();
+            sidecar.push(suffix);
+            let _ = std::fs::remove_file(sidecar);
+        }
     }
 }

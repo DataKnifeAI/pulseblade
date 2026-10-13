@@ -310,7 +310,12 @@ impl SqlRow for PgRow<'_> {
 }
 
 fn pg_err(err: postgres::Error) -> StoreError {
-    StoreError::Database(err.to_string())
+    let code = err.code().map(|code| code.code().to_string());
+    let message = err.to_string();
+    match code {
+        Some(code) => StoreError::Database(format!("{code}: {message}")),
+        None => StoreError::Database(message),
+    }
 }
 
 fn pg_args(args: &[SqlVal]) -> Vec<Box<dyn PgToSql + Sync>> {
@@ -481,7 +486,10 @@ impl Store {
         let store = Self {
             backend: Backend::Postgres { pool: Some(pool) },
         };
-        store.with_sql(|sql| sql.batch(PG_SCHEMA))?;
+        store.with_sql(|sql| {
+            sql.batch(PG_SCHEMA)?;
+            crate::ensure_sample_count(sql)
+        })?;
         Ok(store)
     }
 }
@@ -567,6 +575,11 @@ CREATE TABLE IF NOT EXISTS samples (
     value       DOUBLE PRECISION NOT NULL
 );
 CREATE INDEX IF NOT EXISTS samples_series ON samples(resource_id, metric, ts);
+
+CREATE TABLE IF NOT EXISTS sample_count (
+    id BIGINT PRIMARY KEY,
+    n  BIGINT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS latest (
     resource_id TEXT NOT NULL,

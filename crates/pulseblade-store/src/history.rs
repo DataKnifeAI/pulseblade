@@ -15,7 +15,7 @@ use crate::{from_ms, Store};
 /// Width of a rolled-up metric bucket.
 pub const BUCKET_MS: i64 = 300_000;
 /// Raw samples kept on a hub. A node's raw window stays `retention_hours`.
-pub const HUB_RAW_HOURS: i64 = 48;
+pub const HUB_RAW_HOURS: i64 = 24;
 /// Buckets and events kept when config does not say otherwise.
 pub const DEFAULT_HISTORY_DAYS: i64 = 90;
 

@@ -4,7 +4,7 @@
 //! resource bodies and samples. The hub copies new changes into its journal,
 //! remembers the highest contiguous node seq, and never executes actions.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use chrono::{DateTime, Utc};
 use pulseblade_core::{Change, ChangeKind, Health, LogLine, Resource, Severity};
@@ -231,7 +231,11 @@ fn ingest_batch(
         .filter(|sample| sample.value.is_finite())
         .collect();
     note_restarts(sql, &samples)?;
-    write_rows(
+    if !samples.is_empty() {
+        // Seed before the insert so a missing counter does not count these rows twice.
+        crate::ensure_sample_count(sql)?;
+    }
+    let inserted = write_rows(
         sql,
         "INSERT INTO samples (resource_id, metric, ts, value) VALUES ",
         "",
@@ -252,20 +256,8 @@ fn ingest_batch(
             })
             .collect::<Vec<_>>(),
     )?;
-    let mut latest: HashMap<(String, String), (i64, f64)> = HashMap::new();
-    for sample in &samples {
-        let ms = sample.ts.timestamp_millis();
-        let key = (sample.resource_id.clone(), sample.metric.clone());
-        latest
-            .entry(key)
-            .and_modify(|(ts, value)| {
-                if ms >= *ts {
-                    *ts = ms;
-                    *value = sample.value;
-                }
-            })
-            .or_insert((ms, sample.value));
-    }
+    crate::add_sample_count(sql, inserted as i64)?;
+    let latest = latest_write_order(&samples);
     write_rows(
         sql,
         "INSERT INTO latest (resource_id, metric, ts, value) VALUES ",
@@ -275,7 +267,7 @@ fn ingest_batch(
         4,
         &latest
             .iter()
-            .map(|((resource, metric), (ts, value))| {
+            .map(|(resource, metric, ts, value)| {
                 vec![
                     SqlVal::text(resource),
                     SqlVal::text(metric),
@@ -288,7 +280,8 @@ fn ingest_batch(
     fold_sample_buckets(sql, &samples)?;
     history::note_changes_sql(sql, &accepted)?;
 
-    let mut pushed_buckets: HashMap<(String, String, i64), &MetricBucket> = HashMap::new();
+    // Key order is the row-lock order for this upsert.
+    let mut pushed_buckets: BTreeMap<(String, String, i64), &MetricBucket> = BTreeMap::new();
     for bucket in batch
         .buckets
         .iter()
@@ -413,6 +406,29 @@ fn ingest_batch(
     })
 }
 
+/// Newest finite sample per series, in `(resource_id, metric)` order.
+/// Cross-node ingests lock `latest` in this order.
+fn latest_write_order(samples: &[&StampedSample]) -> Vec<(String, String, i64, f64)> {
+    let mut latest: BTreeMap<(String, String), (i64, f64)> = BTreeMap::new();
+    for sample in samples {
+        let ms = sample.ts.timestamp_millis();
+        let key = (sample.resource_id.clone(), sample.metric.clone());
+        latest
+            .entry(key)
+            .and_modify(|(ts, value)| {
+                if ms >= *ts {
+                    *ts = ms;
+                    *value = sample.value;
+                }
+            })
+            .or_insert((ms, sample.value));
+    }
+    latest
+        .into_iter()
+        .map(|((resource, metric), (ts, value))| (resource, metric, ts, value))
+        .collect()
+}
+
 fn note_restarts(sql: &mut dyn Sql, samples: &[&StampedSample]) -> crate::Result<()> {
     let mut restarts: Vec<&StampedSample> = samples
         .iter()
@@ -457,7 +473,8 @@ fn fold_sample_buckets(sql: &mut dyn Sql, samples: &[&StampedSample]) -> crate::
         max: f64,
         sum: f64,
     }
-    let mut buckets: HashMap<(String, String, i64), Acc> = HashMap::new();
+    // Same (resource_id, metric, bucket_ms) lock order as the pushed-bucket upsert.
+    let mut buckets: BTreeMap<(String, String, i64), Acc> = BTreeMap::new();
     for sample in samples {
         let start = history::bucket_start(sample.ts.timestamp_millis());
         let key = (sample.resource_id.clone(), sample.metric.clone(), start);
@@ -506,7 +523,8 @@ fn fold_sample_buckets(sql: &mut dyn Sql, samples: &[&StampedSample]) -> crate::
                 ]
             })
             .collect::<Vec<_>>(),
-    )
+    )?;
+    Ok(())
 }
 
 fn write_rows(
@@ -515,17 +533,26 @@ fn write_rows(
     tail: &str,
     cols: usize,
     rows: &[Vec<SqlVal>],
-) -> crate::Result<()> {
+) -> crate::Result<usize> {
     if rows.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
+    let mut inserted = 0usize;
     for chunk in rows.chunks(80) {
         let mut statement = values_sql(head, chunk.len(), cols);
         statement.push_str(tail);
         let args: Vec<SqlVal> = chunk.iter().flatten().cloned().collect();
-        sql.execute(&statement, &args)?;
+        inserted += sql.execute(&statement, &args)?;
     }
-    Ok(())
+    Ok(inserted)
+}
+
+fn is_deadlock(err: &StoreError) -> bool {
+    let StoreError::Database(message) = err else {
+        return false;
+    };
+    let message = message.to_ascii_lowercase();
+    message.contains("40p01") || message.contains("deadlock detected")
 }
 
 impl Store {
@@ -602,7 +629,16 @@ impl Store {
             )?;
             Ok(())
         })?;
-        self.transaction(|sql| ingest_batch(sql, node_id, batch, &changes, interval, pushed_ms))
+        // Same-node pushes serialize on the cursor row. Overlapping keys from
+        // other nodes can still deadlock; the upserts are sorted and one
+        // retry covers Postgres 40P01.
+        let result = self
+            .transaction(|sql| ingest_batch(sql, node_id, batch, &changes, interval, pushed_ms));
+        if matches!(&result, Err(err) if is_deadlock(err)) {
+            self.transaction(|sql| ingest_batch(sql, node_id, batch, &changes, interval, pushed_ms))
+        } else {
+            result
+        }
     }
 
     /// Samples with `ts` strictly after `after_ms`, oldest first.
@@ -827,6 +863,7 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
     use pulseblade_core::{Health, ResourceKind};
 
     fn change(seq: i64, id: &str, kind: ChangeKind) -> Change {
@@ -912,6 +949,121 @@ mod tests {
         assert_contiguous_catch_up(&Store::open_in_memory().unwrap());
     }
 
+    #[test]
+    fn ingest_counts_samples_and_prune_subtracts_them() {
+        let store = Store::open_in_memory().unwrap();
+        let ts = Utc.timestamp_millis_opt(1_700_000_000_000).unwrap();
+        store
+            .ingest_node(
+                "web1",
+                &NodeBatch {
+                    samples: vec![
+                        StampedSample {
+                            resource_id: "host:web1".into(),
+                            metric: "cpu.used_pct".into(),
+                            ts,
+                            value: 1.0,
+                        },
+                        StampedSample {
+                            resource_id: "host:web1".into(),
+                            metric: "mem.used_pct".into(),
+                            ts,
+                            value: 2.0,
+                        },
+                        StampedSample {
+                            resource_id: "host:web1".into(),
+                            metric: "load".into(),
+                            ts,
+                            value: f64::INFINITY,
+                        },
+                    ],
+                    ..NodeBatch::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(store.stats().unwrap().samples, 2);
+        let (removed, _) = store
+            .prune(
+                ts + chrono::Duration::seconds(1),
+                ts + chrono::Duration::days(1),
+                ts + chrono::Duration::days(1),
+            )
+            .unwrap();
+        assert_eq!(removed, 2);
+        assert_eq!(store.stats().unwrap().samples, 0);
+    }
+
+    #[test]
+    fn latest_upserts_follow_resource_then_metric() {
+        let t0 = Utc.timestamp_millis_opt(1_700_000_000_000).unwrap();
+        let t1 = t0 + chrono::Duration::seconds(10);
+        let samples = [
+            StampedSample {
+                resource_id: "host:b".into(),
+                metric: "mem.used_pct".into(),
+                ts: t0,
+                value: 1.0,
+            },
+            StampedSample {
+                resource_id: "host:a".into(),
+                metric: "mem.used_pct".into(),
+                ts: t0,
+                value: 2.0,
+            },
+            StampedSample {
+                resource_id: "host:a".into(),
+                metric: "cpu.used_pct".into(),
+                ts: t0,
+                value: 3.0,
+            },
+            StampedSample {
+                resource_id: "host:b".into(),
+                metric: "cpu.used_pct".into(),
+                ts: t1,
+                value: 4.0,
+            },
+            StampedSample {
+                resource_id: "host:a".into(),
+                metric: "cpu.used_pct".into(),
+                ts: t1,
+                value: 9.0,
+            },
+        ];
+        let refs: Vec<_> = samples.iter().collect();
+        let rows = latest_write_order(&refs);
+        let keys: Vec<_> = rows
+            .iter()
+            .map(|(resource, metric, _, _)| (resource.as_str(), metric.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            keys,
+            vec![
+                ("host:a", "cpu.used_pct"),
+                ("host:a", "mem.used_pct"),
+                ("host:b", "cpu.used_pct"),
+                ("host:b", "mem.used_pct"),
+            ]
+        );
+        assert_eq!(rows[0].3, 9.0);
+        assert_eq!(rows[2].2, t1.timestamp_millis());
+    }
+
+    #[test]
+    fn deadlock_error_matches_postgres_state() {
+        assert!(is_deadlock(&StoreError::Database(
+            "40P01: deadlock detected".into()
+        )));
+        assert!(is_deadlock(&StoreError::Database(
+            "ERROR: deadlock detected".into()
+        )));
+        assert!(!is_deadlock(&StoreError::Database(
+            "23505: unique violation".into()
+        )));
+        assert!(!is_deadlock(&StoreError::Invalid(
+            "deadlock detected".into()
+        )));
+    }
+
     /// Same ingest as the sqlite test. Skipped unless `PULSEBLADE_TEST_PG` is a
     /// disposable `postgres://` URL with no TLS.
     #[test]
@@ -926,7 +1078,7 @@ mod tests {
         store
             .with_sql(|sql| {
                 sql.batch(
-                    "TRUNCATE resources, changes, samples, latest, sample_buckets, events, node_cursors RESTART IDENTITY",
+                    "TRUNCATE resources, changes, samples, sample_count, latest, sample_buckets, events, node_cursors RESTART IDENTITY",
                 )
             })
             .unwrap();

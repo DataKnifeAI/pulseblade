@@ -300,7 +300,7 @@ pub async fn serve(
 }
 
 /// Open a `host offline` finding after three missed pushes, and keep raw samples
-/// for two days. Five-minute buckets and the event index stay for `history_days`.
+/// for one day. Five-minute buckets and the event index stay for `history_days`.
 pub async fn maintain(
     store: Arc<Store>,
     shutdown: CancellationToken,
