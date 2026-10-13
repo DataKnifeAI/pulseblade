@@ -14,7 +14,7 @@ ENV CARGO_BUILD_JOBS=2
 COPY --from=planner /src/recipe.json recipe.json
 RUN cargo chef cook --release --locked --recipe-path recipe.json -p pulseblade
 COPY . .
-RUN cargo chef cook --release --locked --recipe-path recipe.json -p pulseblade
+RUN cargo build --release --locked -p pulseblade
 
 FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587
 # k8s and proxmox enable ureq's native-tls feature, so the binary needs libssl3.
