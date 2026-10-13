@@ -1,4 +1,4 @@
-# Production hub on prd-apps. The journal is a 1Gi truenas-csi-nfs volume,
+# Production hub on prd-apps. The journal is an 80Gi truenas-csi-nfs volume.
 # the same storage class other small stateful apps on this cluster use.
 # Node tokens stay in the pulseblade-hub-tokens Secret (keys are node ids).
 # This file has token env names only. Do not commit secret values.
@@ -167,7 +167,7 @@ spec:
   storageClassName: truenas-csi-nfs
   resources:
     requests:
-      storage: 1Gi
+      storage: 80Gi
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -405,6 +405,7 @@ metadata:
   namespace: pulseblade
   annotations:
     nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "32m"
 spec:
   ingressClassName: nginx
   rules:
