@@ -14,6 +14,7 @@ mod history;
 mod hub;
 mod memory;
 mod pilot;
+mod sql;
 
 pub use actions::{ActionTransition, NewAction};
 pub use history::{MetricBucket, StoredEvent, BUCKET_MS, DEFAULT_HISTORY_DAYS, HUB_RAW_HOURS};
@@ -25,7 +26,11 @@ use pulseblade_core::{
     Aggregation, Change, ChangeKind, Checkpoint, CollectorRun, Health, Observation, Point,
     Resource, ResourceKind, Since, StoredResource,
 };
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use rusqlite::{params, Connection, Row};
+
+use sql::{SqlExt, SqlVal};
+
+const RESOURCE_COLS: &str = "SELECT id, kind, name, parent, health, labels, attrs, source, first_seen, last_seen, present FROM resources";
 use serde_json::{json, Value};
 
 #[derive(Debug, thiserror::Error)]
@@ -47,6 +52,8 @@ pub enum StoreError {
     /// A node sent a journal seq the hub has not caught up to yet.
     #[error("journal gap for node {node}: hub has seq {have}, next change is {next}")]
     Gap { node: String, have: i64, next: i64 },
+    #[error("database: {0}")]
+    Database(String),
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -298,8 +305,7 @@ pub struct StoreStats {
 }
 
 pub struct Store {
-    conn: Mutex<Connection>,
-    path: Option<PathBuf>,
+    backend: sql::Backend,
 }
 
 impl Store {
@@ -320,8 +326,10 @@ impl Store {
         history::ensure_history(&conn)?;
         ensure_cursor_columns(&conn)?;
         Ok(Self {
-            conn: Mutex::new(conn),
-            path,
+            backend: sql::Backend::Sqlite {
+                conn: Mutex::new(conn),
+                path,
+            },
         })
     }
 }
@@ -350,33 +358,47 @@ fn ensure_cursor_columns(conn: &Connection) -> Result<()> {
 }
 
 impl Store {
-    /// Database file, or `None` for in-memory stores.
+    /// Database file, or `None` for an in-memory or Postgres store.
     pub fn path(&self) -> Option<&Path> {
-        self.path.as_deref()
+        match &self.backend {
+            sql::Backend::Sqlite { path, .. } => path.as_deref(),
+            sql::Backend::Postgres { .. } => None,
+        }
     }
 
-    /// Bytes on disk for the database and its WAL, when file-backed.
+    /// Bytes on disk for the SQLite file and its WAL, or the Postgres database.
     pub fn size_bytes(&self) -> Option<u64> {
-        let path = self.path.as_ref()?;
+        if matches!(&self.backend, sql::Backend::Postgres { .. }) {
+            return self
+                .with_sql(|sql| {
+                    sql.query_one("SELECT pg_database_size(current_database())", &[], |row| {
+                        row.int(0)
+                    })
+                })
+                .ok()
+                .map(|n| n as u64);
+        }
+        let path = self.path()?;
         let main = std::fs::metadata(path).ok()?.len();
-        let mut wal = path.clone().into_os_string();
+        let mut wal = path.to_path_buf().into_os_string();
         wal.push("-wal");
         Some(main + std::fs::metadata(wal).map(|m| m.len()).unwrap_or(0))
     }
 
     pub fn stats(&self) -> Result<StoreStats> {
-        let conn = self.conn();
-        let count = |table: &str| -> Result<u64> {
-            Ok(
-                conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| {
-                    r.get::<_, i64>(0)
-                })? as u64,
-            )
-        };
-        Ok(StoreStats {
-            samples: count("samples")?,
-            changes: count("changes")?,
-            checkpoints: count("checkpoints")?,
+        self.with_sql(|sql| {
+            let count = |sql: &mut dyn sql::Sql, table: &str| -> Result<u64> {
+                Ok(
+                    sql.query_one(&format!("SELECT COUNT(*) FROM {table}"), &[], |row| {
+                        row.int(0)
+                    })? as u64,
+                )
+            };
+            Ok(StoreStats {
+                samples: count(sql, "samples")?,
+                changes: count(sql, "changes")?,
+                checkpoints: count(sql, "checkpoints")?,
+            })
         })
     }
 
@@ -410,40 +432,41 @@ impl Store {
 
     /// Latest run of every collector that has ever recorded one, by source.
     pub fn collector_summaries(&self) -> Result<Vec<CollectorSummary>> {
-        let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT r.source, r.ts, r.duration_ms, r.ok, r.error, r.resource_count,
-                    r.sample_count, r.change_count, r.interval_secs,
-                    (SELECT MAX(ts) FROM collector_runs s WHERE s.source = r.source AND s.ok = 1),
-                    (SELECT COUNT(*) FROM collector_runs f WHERE f.source = r.source AND f.ok = 0
-                        AND f.id > COALESCE((SELECT MAX(id) FROM collector_runs g
-                                             WHERE g.source = r.source AND g.ok = 1), 0))
-             FROM collector_runs r
-             WHERE r.id IN (SELECT MAX(id) FROM collector_runs GROUP BY source)
-             ORDER BY r.source",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            Ok(CollectorSummary {
-                last: CollectorRun {
-                    source: r.get(0)?,
-                    ts: from_ms(r.get(1)?),
-                    duration_ms: r.get::<_, i64>(2)? as u64,
-                    ok: r.get(3)?,
-                    error: r.get(4)?,
-                    resource_count: r.get::<_, i64>(5)? as usize,
-                    sample_count: r.get::<_, i64>(6)? as usize,
-                    change_count: r.get::<_, i64>(7)? as usize,
-                    interval_secs: r.get::<_, Option<i64>>(8)?.map(|s| s as u64),
+        self.with_sql(|sql| {
+            sql.query(
+                "SELECT r.source, r.ts, r.duration_ms, r.ok, r.error, r.resource_count,
+                        r.sample_count, r.change_count, r.interval_secs,
+                        (SELECT MAX(ts) FROM collector_runs s WHERE s.source = r.source AND s.ok = 1),
+                        (SELECT COUNT(*) FROM collector_runs f WHERE f.source = r.source AND f.ok = 0
+                            AND f.id > COALESCE((SELECT MAX(id) FROM collector_runs g
+                                                 WHERE g.source = r.source AND g.ok = 1), 0))
+                 FROM collector_runs r
+                 WHERE r.id IN (SELECT MAX(id) FROM collector_runs GROUP BY source)
+                 ORDER BY r.source",
+                &[],
+                |row| {
+                    Ok(CollectorSummary {
+                        last: CollectorRun {
+                            source: row.text(0)?,
+                            ts: from_ms(row.int(1)?),
+                            duration_ms: row.int(2)? as u64,
+                            ok: row.int(3)? != 0,
+                            error: row.opt_text(4)?,
+                            resource_count: row.int(5)? as usize,
+                            sample_count: row.int(6)? as usize,
+                            change_count: row.int(7)? as usize,
+                            interval_secs: row.opt_int(8)?.map(|s| s as u64),
+                        },
+                        last_success: row.opt_int(9)?.map(from_ms),
+                        consecutive_failures: row.int(10)? as usize,
+                    })
                 },
-                last_success: r.get::<_, Option<i64>>(9)?.map(from_ms),
-                consecutive_failures: r.get::<_, i64>(10)? as usize,
-            })
-        })?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+            )
+        })
     }
 
     fn conn(&self) -> MutexGuard<'_, Connection> {
-        self.conn.lock().unwrap_or_else(|e| e.into_inner())
+        self.sqlite_conn()
     }
 
     /// Record one collector pass and return the resulting changes.
@@ -579,76 +602,74 @@ impl Store {
 
     /// Highest sequence number in the change journal (0 when empty).
     pub fn current_seq(&self) -> Result<i64> {
-        Ok(self
-            .conn()
-            .query_row("SELECT COALESCE(MAX(seq), 0) FROM changes", [], |r| {
-                r.get(0)
-            })?)
+        self.with_sql(|sql| {
+            sql.query_one("SELECT COALESCE(MAX(seq), 0) FROM changes", &[], |row| {
+                row.int(0)
+            })
+        })
     }
 
     pub fn resources(&self, filter: &ResourceFilter) -> Result<Vec<StoredResource>> {
-        let conn = self.conn();
-        let mut stmt = conn.prepare("SELECT * FROM resources ORDER BY id")?;
-        let rows = stmt.query_map([], row_to_resource)?;
-        let mut out = Vec::new();
-        for r in rows {
-            let r = r??;
-            if filter.matches(&r) {
-                out.push(r);
-            }
-        }
-        Ok(out)
+        self.with_sql(|sql| {
+            let rows = sql.query(&format!("{RESOURCE_COLS} ORDER BY id"), &[], map_resource)?;
+            Ok(rows.into_iter().filter(|row| filter.matches(row)).collect())
+        })
     }
 
     pub fn resource(&self, id: &str) -> Result<Option<StoredResource>> {
-        self.conn()
-            .query_row(
-                "SELECT * FROM resources WHERE id = ?1",
-                [id],
-                row_to_resource,
+        self.with_sql(|sql| {
+            sql.query_opt(
+                &format!("{RESOURCE_COLS} WHERE id = ?1"),
+                &[SqlVal::text(id)],
+                map_resource,
             )
-            .optional()?
-            .transpose()
+        })
     }
 
     pub fn children(&self, id: &str) -> Result<Vec<StoredResource>> {
-        let conn = self.conn();
-        let mut stmt =
-            conn.prepare("SELECT * FROM resources WHERE parent = ?1 AND present = 1 ORDER BY id")?;
-        let rows = stmt.query_map([id], row_to_resource)?;
-        rows.map(|r| r?).collect()
+        self.with_sql(|sql| {
+            sql.query(
+                &format!("{RESOURCE_COLS} WHERE parent = ?1 AND present = 1 ORDER BY id"),
+                &[SqlVal::text(id)],
+                map_resource,
+            )
+        })
     }
 
     /// Latest value of every metric for one resource.
     pub fn latest(&self, id: &str) -> Result<BTreeMap<String, Latest>> {
-        let conn = self.conn();
-        let mut stmt =
-            conn.prepare("SELECT metric, ts, value FROM latest WHERE resource_id = ?1")?;
-        let rows = stmt.query_map([id], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                Latest {
-                    ts: from_ms(r.get(1)?),
-                    value: r.get(2)?,
+        self.with_sql(|sql| {
+            let rows = sql.query(
+                "SELECT metric, ts, value FROM latest WHERE resource_id = ?1",
+                &[SqlVal::text(id)],
+                |row| {
+                    Ok((
+                        row.text(0)?,
+                        Latest {
+                            ts: from_ms(row.int(1)?),
+                            value: row.float(2)?,
+                        },
+                    ))
                 },
-            ))
-        })?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+            )?;
+            Ok(rows.into_iter().collect())
+        })
     }
 
     /// Latest value of every metric for every resource.
     pub fn latest_all(&self) -> Result<HashMap<String, BTreeMap<String, f64>>> {
-        let conn = self.conn();
-        let mut stmt = conn.prepare("SELECT resource_id, metric, value FROM latest")?;
-        let mut out: HashMap<String, BTreeMap<String, f64>> = HashMap::new();
-        let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get(2)?))
-        })?;
-        for row in rows {
-            let (id, metric, value) = row?;
-            out.entry(id).or_default().insert(metric, value);
-        }
-        Ok(out)
+        self.with_sql(|sql| {
+            let rows = sql.query(
+                "SELECT resource_id, metric, value FROM latest",
+                &[],
+                |row| Ok((row.text(0)?, row.text(1)?, row.float(2)?)),
+            )?;
+            let mut out: HashMap<String, BTreeMap<String, f64>> = HashMap::new();
+            for (id, metric, value) in rows {
+                out.entry(id).or_default().insert(metric, value);
+            }
+            Ok(out)
+        })
     }
 
     /// Downsampled series: one point per `step` bucket in `[from, to]`.
@@ -669,74 +690,96 @@ impl Store {
             // SQLite returns bare columns from the row that produced MAX().
             Aggregation::Last => "value, MAX(ts)",
         };
-        let sql = format!(
-            "SELECT (ts / ?1) * ?1 AS bucket, {select} FROM samples
-             WHERE resource_id = ?2 AND metric = ?3 AND ts BETWEEN ?4 AND ?5
-             GROUP BY bucket ORDER BY bucket"
-        );
-        let conn = self.conn();
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(
-            params![
-                step,
-                id,
-                metric,
-                from.timestamp_millis(),
-                to.timestamp_millis()
-            ],
-            |r| {
-                Ok(Point {
-                    ts: from_ms(r.get(0)?),
-                    value: r.get(1)?,
-                })
-            },
-        )?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+        self.with_sql(|sql| {
+            let statement = if sql.postgres() && matches!(agg, Aggregation::Last) {
+                "SELECT bucket, value FROM (
+                    SELECT DISTINCT ON ((ts / ?1) * ?1) (ts / ?1) * ?1 AS bucket, value
+                    FROM samples
+                    WHERE resource_id = ?2 AND metric = ?3 AND ts BETWEEN ?4 AND ?5
+                    ORDER BY (ts / ?1) * ?1, ts DESC
+                 ) s ORDER BY bucket"
+                    .to_string()
+            } else {
+                format!(
+                    "SELECT (ts / ?1) * ?1 AS bucket, {select} FROM samples
+                     WHERE resource_id = ?2 AND metric = ?3 AND ts BETWEEN ?4 AND ?5
+                     GROUP BY bucket ORDER BY bucket"
+                )
+            };
+            sql.query(
+                &statement,
+                &[
+                    SqlVal::Int(step),
+                    SqlVal::text(id),
+                    SqlVal::text(metric),
+                    SqlVal::Int(from.timestamp_millis()),
+                    SqlVal::Int(to.timestamp_millis()),
+                ],
+                |row| {
+                    Ok(Point {
+                        ts: from_ms(row.int(0)?),
+                        value: row.float(1)?,
+                    })
+                },
+            )
+        })
     }
 
     pub fn create_checkpoint(&self, name: &str, ts: DateTime<Utc>) -> Result<Checkpoint> {
         let seq = self.current_seq()?;
-        self.conn().execute(
-            "INSERT INTO checkpoints (name, seq, ts) VALUES (?1, ?2, ?3)
-             ON CONFLICT(name) DO UPDATE SET seq = excluded.seq, ts = excluded.ts",
-            params![name, seq, ts.timestamp_millis()],
-        )?;
-        Ok(Checkpoint {
-            name: name.to_string(),
-            seq,
-            ts,
+        self.with_sql(|sql| {
+            sql.execute(
+                "INSERT INTO checkpoints (name, seq, ts) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(name) DO UPDATE SET seq = excluded.seq, ts = excluded.ts",
+                &[
+                    SqlVal::text(name),
+                    SqlVal::Int(seq),
+                    SqlVal::Int(ts.timestamp_millis()),
+                ],
+            )?;
+            Ok(Checkpoint {
+                name: name.to_string(),
+                seq,
+                ts,
+            })
         })
     }
 
     pub fn checkpoints(&self) -> Result<Vec<Checkpoint>> {
-        let conn = self.conn();
-        let mut stmt = conn.prepare("SELECT name, seq, ts FROM checkpoints ORDER BY seq DESC")?;
-        let rows = stmt.query_map([], |r| {
-            Ok(Checkpoint {
-                name: r.get(0)?,
-                seq: r.get(1)?,
-                ts: from_ms(r.get(2)?),
-            })
-        })?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+        self.with_sql(|sql| {
+            sql.query(
+                "SELECT name, seq, ts FROM checkpoints ORDER BY seq DESC",
+                &[],
+                |row| {
+                    Ok(Checkpoint {
+                        name: row.text(0)?,
+                        seq: row.int(1)?,
+                        ts: from_ms(row.int(2)?),
+                    })
+                },
+            )
+        })
     }
 
     /// Translate a `since` expression into the journal sequence to read after.
     pub fn resolve_since(&self, since: &Since) -> Result<i64> {
-        let conn = self.conn();
         match since {
             Since::Seq(n) => Ok(*n),
-            Since::Checkpoint(name) => conn
-                .query_row("SELECT seq FROM checkpoints WHERE name = ?1", [name], |r| {
-                    r.get(0)
-                })
-                .optional()?
-                .ok_or_else(|| StoreError::UnknownCheckpoint(name.clone())),
-            Since::Time(t) => Ok(conn.query_row(
-                "SELECT COALESCE(MAX(seq), 0) FROM changes WHERE ts < ?1",
-                [t.timestamp_millis()],
-                |r| r.get(0),
-            )?),
+            Since::Checkpoint(name) => self.with_sql(|sql| {
+                sql.query_opt(
+                    "SELECT seq FROM checkpoints WHERE name = ?1",
+                    &[SqlVal::text(name)],
+                    |row| row.int(0),
+                )?
+                .ok_or_else(|| StoreError::UnknownCheckpoint(name.clone()))
+            }),
+            Since::Time(t) => self.with_sql(|sql| {
+                sql.query_one(
+                    "SELECT COALESCE(MAX(seq), 0) FROM changes WHERE ts < ?1",
+                    &[SqlVal::Int(t.timestamp_millis())],
+                    |row| row.int(0),
+                )
+            }),
         }
     }
 
@@ -747,27 +790,37 @@ impl Store {
         filter: &ChangeFilter,
         limit: usize,
     ) -> Result<(Vec<Change>, usize)> {
-        let kind = filter.kind.map(ResourceKind::as_str);
+        let kind = filter.kind.map(|k| k.as_str().to_string());
         let prefix = filter.resource_prefix.as_ref().map(|p| format!("{p}%"));
         let where_clause = "c.seq > ?1
              AND (?2 IS NULL OR r.kind = ?2)
              AND (?3 IS NULL OR c.resource_id LIKE ?3)";
-        let conn = self.conn();
-        let total: i64 = conn.query_row(
-            &format!(
-                "SELECT COUNT(*) FROM changes c LEFT JOIN resources r ON r.id = c.resource_id WHERE {where_clause}"
-            ),
-            params![after, kind, prefix],
-            |r| r.get(0),
-        )?;
-        let mut stmt = conn.prepare(&format!(
-            "SELECT c.seq, c.ts, c.resource_id, c.kind, c.field, c.before, c.after
-             FROM changes c LEFT JOIN resources r ON r.id = c.resource_id
-             WHERE {where_clause} ORDER BY c.seq LIMIT ?4"
-        ))?;
-        let rows = stmt.query_map(params![after, kind, prefix, limit as i64], row_to_change)?;
-        let changes = rows.map(|r| r?).collect::<Result<Vec<_>>>()?;
-        Ok((changes, total as usize))
+        let args = [
+            SqlVal::Int(after),
+            SqlVal::opt_text(kind),
+            SqlVal::opt_text(prefix),
+        ];
+        self.with_sql(|sql| {
+            let total = sql.query_one(
+                &format!(
+                    "SELECT COUNT(*) FROM changes c LEFT JOIN resources r ON r.id = c.resource_id WHERE {where_clause}"
+                ),
+                &args,
+                |row| row.int(0),
+            )?;
+            let mut listed = args.to_vec();
+            listed.push(SqlVal::Int(limit as i64));
+            let changes = sql.query(
+                &format!(
+                    "SELECT c.seq, c.ts, c.resource_id, c.kind, c.field, c.before, c.after
+                     FROM changes c LEFT JOIN resources r ON r.id = c.resource_id
+                     WHERE {where_clause} ORDER BY c.seq LIMIT ?4"
+                ),
+                &listed,
+                map_change,
+            )?;
+            Ok((changes, total as usize))
+        })
     }
 
     /// Most recent changes touching any of `ids`, newest first.
@@ -776,13 +829,17 @@ impl Store {
             return Ok(Vec::new());
         }
         let placeholders = vec!["?"; ids.len()].join(",");
-        let conn = self.conn();
-        let mut stmt = conn.prepare(&format!(
-            "SELECT seq, ts, resource_id, kind, field, before, after FROM changes
-             WHERE resource_id IN ({placeholders}) ORDER BY seq DESC LIMIT {limit}"
-        ))?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(ids), row_to_change)?;
-        rows.map(|r| r?).collect()
+        let args: Vec<SqlVal> = ids.iter().cloned().map(SqlVal::text).collect();
+        self.with_sql(|sql| {
+            sql.query(
+                &format!(
+                    "SELECT seq, ts, resource_id, kind, field, before, after FROM changes
+                     WHERE resource_id IN ({placeholders}) ORDER BY seq DESC LIMIT {limit}"
+                ),
+                &args,
+                map_change,
+            )
+        })
     }
 
     /// Drop raw samples older than `samples_before`, journal rows older than
@@ -794,29 +851,39 @@ impl Store {
         changes_before: DateTime<Utc>,
         history_before: DateTime<Utc>,
     ) -> Result<(usize, usize)> {
-        let conn = self.conn();
         let sample_ms = samples_before.timestamp_millis();
         let history_ms = history_before.timestamp_millis();
-        let s = conn.execute("DELETE FROM samples WHERE ts < ?1", [sample_ms])?;
-        conn.execute("DELETE FROM logs WHERE ts < ?1", [sample_ms])?;
-        conn.execute(
-            "DELETE FROM events_fts WHERE rowid IN (SELECT id FROM events WHERE ts < ?1)",
-            [history_ms],
-        )?;
-        conn.execute("DELETE FROM events WHERE ts < ?1", [history_ms])?;
-        conn.execute(
-            "DELETE FROM sample_buckets WHERE bucket_ms < ?1",
-            [history_ms],
-        )?;
-        let c = conn.execute(
-            "DELETE FROM changes WHERE ts < ?1",
-            [changes_before.timestamp_millis()],
-        )?;
-        conn.execute(
-            "DELETE FROM resources WHERE present = 0 AND last_seen < ?1",
-            [changes_before.timestamp_millis()],
-        )?;
-        Ok((s, c))
+        let change_ms = changes_before.timestamp_millis();
+        self.with_sql(|sql| {
+            let s = sql.execute(
+                "DELETE FROM samples WHERE ts < ?1",
+                &[SqlVal::Int(sample_ms)],
+            )?;
+            sql.execute("DELETE FROM logs WHERE ts < ?1", &[SqlVal::Int(sample_ms)])?;
+            if !sql.postgres() {
+                sql.execute(
+                    "DELETE FROM events_fts WHERE rowid IN (SELECT id FROM events WHERE ts < ?1)",
+                    &[SqlVal::Int(history_ms)],
+                )?;
+            }
+            sql.execute(
+                "DELETE FROM events WHERE ts < ?1",
+                &[SqlVal::Int(history_ms)],
+            )?;
+            sql.execute(
+                "DELETE FROM sample_buckets WHERE bucket_ms < ?1",
+                &[SqlVal::Int(history_ms)],
+            )?;
+            let c = sql.execute(
+                "DELETE FROM changes WHERE ts < ?1",
+                &[SqlVal::Int(change_ms)],
+            )?;
+            sql.execute(
+                "DELETE FROM resources WHERE present = 0 AND last_seen < ?1",
+                &[SqlVal::Int(change_ms)],
+            )?;
+            Ok((s, c))
+        })
     }
 }
 
@@ -898,6 +965,41 @@ fn parse_json<T: serde::de::DeserializeOwned>(s: Option<String>) -> Result<Optio
         .map_err(Into::into)
 }
 
+fn map_resource(row: &dyn sql::SqlRow) -> Result<StoredResource> {
+    let kind = row.text(1)?;
+    let health = row.text(4)?;
+    let labels = row.text(5)?;
+    let attrs = row.text(6)?;
+    Ok(StoredResource {
+        resource: Resource {
+            id: row.text(0)?,
+            kind: kind.parse().map_err(StoreError::Corrupt)?,
+            name: row.text(2)?,
+            parent: row.opt_text(3)?,
+            health: health.parse().map_err(StoreError::Corrupt)?,
+            labels: serde_json::from_str(&labels)?,
+            attrs: serde_json::from_str(&attrs)?,
+        },
+        source: row.text(7)?,
+        first_seen: from_ms(row.int(8)?),
+        last_seen: from_ms(row.int(9)?),
+        present: row.int(10)? != 0,
+    })
+}
+
+fn map_change(row: &dyn sql::SqlRow) -> Result<Change> {
+    let kind = row.text(3)?;
+    Ok(Change {
+        seq: row.int(0)?,
+        ts: from_ms(row.int(1)?),
+        resource_id: row.text(2)?,
+        kind: kind.parse().map_err(StoreError::Corrupt)?,
+        field: row.opt_text(4)?,
+        before: parse_json(row.opt_text(5)?)?,
+        after: parse_json(row.opt_text(6)?)?,
+    })
+}
+
 fn row_to_resource(row: &Row<'_>) -> rusqlite::Result<Result<StoredResource>> {
     let kind: String = row.get("kind")?;
     let health: String = row.get("health")?;
@@ -925,27 +1027,6 @@ fn row_to_resource(row: &Row<'_>) -> rusqlite::Result<Result<StoredResource>> {
             first_seen: from_ms(first_seen),
             last_seen: from_ms(last_seen),
             present,
-        })
-    })())
-}
-
-fn row_to_change(row: &Row<'_>) -> rusqlite::Result<Result<Change>> {
-    let seq: i64 = row.get(0)?;
-    let ts: i64 = row.get(1)?;
-    let resource_id: String = row.get(2)?;
-    let kind: String = row.get(3)?;
-    let field: Option<String> = row.get(4)?;
-    let before: Option<String> = row.get(5)?;
-    let after: Option<String> = row.get(6)?;
-    Ok((|| {
-        Ok(Change {
-            seq,
-            ts: from_ms(ts),
-            resource_id,
-            kind: kind.parse().map_err(StoreError::Corrupt)?,
-            field,
-            before: parse_json(before)?,
-            after: parse_json(after)?,
         })
     })())
 }

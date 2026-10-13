@@ -447,23 +447,17 @@ async fn push(
     Json(batch): Json<NodeBatch>,
 ) -> Result<Json<IngestResult>, (StatusCode, String)> {
     let node = authorize(&hub, &headers).map_err(|s| (s, "unauthorized".into()))?;
-    let result = tokio::task::spawn_blocking(move || {
-        let ingested = hub.store.ingest_node(&node, &batch)?;
-        if let Err(e) = hub.store.sync_offline_hosts(chrono::Utc::now()) {
-            tracing::warn!(error = %e, "offline finding update failed");
-        }
-        Ok(ingested)
-    })
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    .map_err(|e| {
-        let code = if matches!(e, StoreError::Gap { .. }) {
-            StatusCode::CONFLICT
-        } else {
-            StatusCode::BAD_REQUEST
-        };
-        (code, e.to_string())
-    })?;
+    let result = tokio::task::spawn_blocking(move || hub.store.ingest_node(&node, &batch))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| {
+            let code = if matches!(e, StoreError::Gap { .. }) {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            (code, e.to_string())
+        })?;
     Ok(Json(result))
 }
 

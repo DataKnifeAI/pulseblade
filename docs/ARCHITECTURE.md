@@ -63,7 +63,7 @@ flowchart LR
 | Crate | Responsibility |
 |-------|----------------|
 | `pulseblade-core` | Schema types (`Resource`, `Sample`, `Change`, `Checkpoint`, `Finding`, `ActionSpec`, `ActionRun`, `Note`), label matching, duration parsing. Every type derives `JsonSchema`. |
-| `pulseblade-store` | SQLite (`rusqlite`, bundled, WAL). Resource state, append-only change journal, checkpoints, samples with retention and query-time downsampling, logs, notes, findings, action runs, and the hash-chained audit log. |
+| `pulseblade-store` | SQLite (`rusqlite`, bundled, WAL) on a node, Postgres on a hub that sets a database URL. Resource state, append-only change journal, checkpoints, samples with retention and query-time downsampling, logs, notes, findings, action runs, and the hash-chained audit log. |
 | `pulseblade-collect` | `Collector` trait plus host (`sysinfo`), systemd, user systemd and session, journald, and top processes. Docker (`bollard`) and Proxmox (REST) are Cargo features and degrade when the daemon or API is absent. Kubernetes is still later. |
 | `pulseblade-detect` | Threshold rules and EWMA anomaly detection. Findings carry recent changes and error lines for the resource, its parent, and its dependencies. |
 | `pulseblade-act` | Built-in action registry, node-local risk tiers, dry-run plans, approval gate, hash-chained audit. The node enforces its own policy. |
@@ -138,7 +138,7 @@ The test fails if the summary snapshot exceeds 600 tokens, the unchanged respons
 
 ## Hub
 
-`pulseblade hub` keeps one SQLite database for the fleet. Each enrolled node has a bearer token (`token_env` names the variable; the token is not written in config). Optional mTLS requires a client certificate signed by `client_ca`. Nodes open the connection: they push journal entries and samples after the hub's per-node cursor, then long-poll `/hub/v1/poll` for routed actions. A node that was offline keeps journaling locally and sends every seq after the cursor when it reconnects; a gap is rejected and the cursor stays put.
+`pulseblade hub` keeps the fleet journal in Postgres when `database_url_env` names a variable that holds the URL. An empty value keeps the hub on one SQLite file, which is also what every node uses. The hub writes that a push arrived before it commits the batch, then inserts changes, resources, samples, 5-minute buckets, and events in multi-row statements. Each enrolled node has a bearer token (`token_env` names the variable; the token is not written in config). Optional mTLS requires a client certificate signed by `client_ca`. Nodes open the connection: they push journal entries and samples after the hub's per-node cursor, then long-poll `/hub/v1/poll` for routed actions. A node that was offline keeps journaling locally and sends every seq after the cursor when it reconnects; a gap is rejected and the cursor stays put.
 
 The hub serves the same MCP tools as a node, plus `fleet_overview` (grouped by `role`, `cluster`, `criticality`, and host; unhealthy resources in full, the rest as counts). `action_plan`, `action_execute`, and `action_status` are forwarded to the node that owns the resource id. The node runs them through its own registry. Approve waits, deny never runs, and auto runs only when that node's tier says so.
 

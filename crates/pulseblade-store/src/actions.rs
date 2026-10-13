@@ -6,6 +6,7 @@ use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use crate::sql::{SqlExt, SqlVal};
 use crate::{from_ms, Store, StoreError};
 
 const GENESIS: &str = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -67,31 +68,23 @@ impl Store {
         limit: usize,
     ) -> crate::Result<Vec<ActionRun>> {
         let limit = limit.clamp(1, 100) as i64;
-        let conn = self.conn();
-        let mut out = Vec::new();
-        if let Some(id) = resource_id {
-            let mut stmt = conn.prepare(
+        let (sql_text, args) = if let Some(id) = resource_id {
+            (
                 "SELECT id, action, resource_id, params, idempotency_key, tier, status, dry_run,
                         output, created_at, updated_at, expires_at
                  FROM action_runs WHERE resource_id = ?1
                  ORDER BY created_at DESC LIMIT ?2",
-            )?;
-            let rows = stmt.query_map(params![id, limit], row_to_action)?;
-            for row in rows {
-                out.push(row??);
-            }
+                vec![SqlVal::text(id), SqlVal::Int(limit)],
+            )
         } else {
-            let mut stmt = conn.prepare(
+            (
                 "SELECT id, action, resource_id, params, idempotency_key, tier, status, dry_run,
                         output, created_at, updated_at, expires_at
                  FROM action_runs ORDER BY created_at DESC LIMIT ?1",
-            )?;
-            let rows = stmt.query_map([limit], row_to_action)?;
-            for row in rows {
-                out.push(row??);
-            }
-        }
-        Ok(out)
+                vec![SqlVal::Int(limit)],
+            )
+        };
+        self.with_sql(|sql| sql.query(sql_text, &args, map_action))
     }
 
     pub fn count_actions_since(&self, action: &str, since: DateTime<Utc>) -> crate::Result<u32> {
@@ -105,12 +98,13 @@ impl Store {
     }
 
     pub fn awaiting_action_count(&self) -> crate::Result<u64> {
-        let conn = self.conn();
-        let n: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM action_runs WHERE status = 'awaiting_approval'",
-            [],
-            |r| r.get(0),
-        )?;
+        let n = self.with_sql(|sql| {
+            sql.query_one(
+                "SELECT COUNT(*) FROM action_runs WHERE status = 'awaiting_approval'",
+                &[],
+                |row| row.int(0),
+            )
+        })?;
         Ok(u64::try_from(n).unwrap_or(0))
     }
 
@@ -357,6 +351,25 @@ fn parse_tier(s: &str) -> crate::Result<RiskTier> {
         "deny" => Ok(RiskTier::Deny),
         other => Err(StoreError::Corrupt(format!("unknown risk tier `{other}`"))),
     }
+}
+
+fn map_action(row: &dyn crate::sql::SqlRow) -> crate::Result<ActionRun> {
+    let status = row.text(6)?;
+    let tier = row.text(5)?;
+    let params = row.text(3)?;
+    Ok(ActionRun {
+        id: row.text(0)?,
+        action: row.text(1)?,
+        resource_id: row.text(2)?,
+        params: serde_json::from_str(&params)?,
+        idempotency_key: row.text(4)?,
+        tier: parse_tier(&tier)?,
+        status: status.parse().map_err(|e: String| StoreError::Corrupt(e))?,
+        created_at: from_ms(row.int(9)?),
+        dry_run: row.int(7)? != 0,
+        expires_at: row.opt_int(11)?.map(from_ms),
+        output: row.opt_text(8)?,
+    })
 }
 
 fn row_to_action(row: &rusqlite::Row<'_>) -> rusqlite::Result<crate::Result<ActionRun>> {

@@ -125,6 +125,18 @@ pub struct HubConfig {
     pub tls: HubTls,
     /// How long a routed action call waits for the node.
     pub action_wait_secs: u64,
+    /// Environment variable holding a `postgres://` URL. Empty keeps the hub on SQLite.
+    #[serde(default)]
+    pub database_url_env: String,
+    /// Environment variable holding the database user. Empty when the URL already has one.
+    #[serde(default)]
+    pub database_user_env: String,
+    /// Environment variable holding the database password.
+    #[serde(default)]
+    pub database_password_env: String,
+    /// Environment variable holding the server CA PEM. Empty uses a non-TLS connection.
+    #[serde(default)]
+    pub database_ca_env: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -165,8 +177,72 @@ impl Default for HubConfig {
             nodes: Vec::new(),
             tls: HubTls::default(),
             action_wait_secs: 20,
+            database_url_env: String::new(),
+            database_user_env: String::new(),
+            database_password_env: String::new(),
+            database_ca_env: String::new(),
         }
     }
+}
+
+/// Fill `user` and `password` into a URL that has no userinfo yet.
+/// A URL that already contains `@` is returned unchanged.
+pub(crate) fn inject_database_user(
+    url: &str,
+    user_env: &str,
+    password_env: &str,
+) -> anyhow::Result<String> {
+    if user_env.is_empty() && password_env.is_empty() {
+        return Ok(url.to_string());
+    }
+    if user_env.is_empty() || password_env.is_empty() {
+        anyhow::bail!("database_user_env and database_password_env must both be set");
+    }
+    let user = std::env::var(user_env).with_context(|| format!("reading {user_env}"))?;
+    let password =
+        std::env::var(password_env).with_context(|| format!("reading {password_env}"))?;
+    format_database_url(url, &user, &password)
+}
+
+fn format_database_url(url: &str, user: &str, password: &str) -> anyhow::Result<String> {
+    let rest = url
+        .strip_prefix("postgres://")
+        .or_else(|| url.strip_prefix("postgresql://"))
+        .context("database url must start with postgres://")?;
+    if rest.contains('@') {
+        return Ok(url.to_string());
+    }
+    let scheme = if url.starts_with("postgresql://") {
+        "postgresql"
+    } else {
+        "postgres"
+    };
+    Ok(format!(
+        "{scheme}://{}:{}@{rest}",
+        encode_userinfo(user),
+        encode_userinfo(password)
+    ))
+}
+
+pub(crate) fn optional_env(name: &str) -> anyhow::Result<Option<String>> {
+    if name.is_empty() {
+        return Ok(None);
+    }
+    let value = std::env::var(name).with_context(|| format!("reading {name}"))?;
+    Ok(Some(value))
+}
+
+fn encode_userinfo(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for b in value.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 impl HubTls {
@@ -336,6 +412,25 @@ pub fn default_db_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn database_userinfo_is_percent_encoded() {
+        let url = format_database_url(
+            "postgres://pulseblade-postgres-rw.pulseblade.svc:5432/pulseblade?sslmode=require",
+            "pulseblade",
+            "a/b c",
+        )
+        .unwrap();
+        assert_eq!(
+            url,
+            "postgres://pulseblade:a%2Fb%20c@pulseblade-postgres-rw.pulseblade.svc:5432/pulseblade?sslmode=require"
+        );
+        let existing = "postgres://already:set@db/pulseblade";
+        assert_eq!(
+            format_database_url(existing, "other", "x").unwrap(),
+            existing
+        );
+    }
 
     #[test]
     fn parses_readme_example() {

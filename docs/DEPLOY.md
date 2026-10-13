@@ -93,6 +93,8 @@ pulseblade hub
 
 `pulseblade hub` serves the same MCP tools for every node that pushes to it, plus `fleet_overview`. Point the pilot at the hub with `mcp_url`; the pilot does not change. An action the hub routes still runs only when the target node's own tier allows it.
 
+A hub that sets `database_url_env` stores the fleet journal in Postgres. Nodes stay on SQLite and push batches; the hub records the push, then commits multi-row inserts. The cluster manifests use a CloudNativePG cluster named `pulseblade-postgres`. Create `pulseblade-postgres-credentials` (keys `username` and `password`) before applying that cluster. The password stays out of git. Apply the hub ConfigMap only with an image that understands those keys.
+
 Manifests:
 
 - Image and units: `deploy/Dockerfile`, `deploy/pulseblade-hub.service`, `deploy/pulseblade-node.service`

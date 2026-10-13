@@ -5,6 +5,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, OptionalExtension};
 use serde::Serialize;
 
+use crate::sql::{SqlExt, SqlVal};
 use crate::{from_ms, Store, StoreError};
 
 /// One finished (or budget-stopped) pilot investigation.
@@ -72,17 +73,14 @@ impl Store {
 
     pub fn recent_pilot_runs(&self, limit: usize) -> crate::Result<Vec<PilotRunRow>> {
         let limit = limit.clamp(1, 50) as i64;
-        let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT id, ts, trigger, tier, endpoint, tool_calls, tokens, conclusion, proposed, status, detail
-             FROM pilot_runs ORDER BY ts DESC LIMIT ?1",
-        )?;
-        let rows = stmt.query_map([limit], row_to_pilot)?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row?);
-        }
-        Ok(out)
+        self.with_sql(|sql| {
+            sql.query(
+                "SELECT id, ts, trigger, tier, endpoint, tool_calls, tokens, conclusion, proposed, status, detail
+                 FROM pilot_runs ORDER BY ts DESC LIMIT ?1",
+                &[SqlVal::Int(limit)],
+                map_pilot,
+            )
+        })
     }
 }
 
@@ -103,23 +101,20 @@ fn fresh_pilot_id(conn: &rusqlite::Connection, ms: i64) -> crate::Result<String>
     ))
 }
 
-fn row_to_pilot(row: &rusqlite::Row<'_>) -> Result<PilotRunRow, rusqlite::Error> {
-    let proposed: String = row.get(8)?;
-    let proposed: Vec<String> = serde_json::from_str(&proposed).unwrap_or_default();
-    let calls: i64 = row.get(5)?;
-    let tokens: i64 = row.get(6)?;
+fn map_pilot(row: &dyn crate::sql::SqlRow) -> crate::Result<PilotRunRow> {
+    let proposed: Vec<String> = serde_json::from_str(&row.text(8)?).unwrap_or_default();
     Ok(PilotRunRow {
-        id: row.get(0)?,
-        ts: from_ms(row.get(1)?),
-        trigger: row.get(2)?,
-        tier: row.get(3)?,
-        endpoint: row.get(4)?,
-        tool_calls: u32::try_from(calls).unwrap_or(0),
-        tokens: u32::try_from(tokens).unwrap_or(0),
-        conclusion: row.get(7)?,
+        id: row.text(0)?,
+        ts: from_ms(row.int(1)?),
+        trigger: row.text(2)?,
+        tier: row.text(3)?,
+        endpoint: row.text(4)?,
+        tool_calls: u32::try_from(row.int(5)?).unwrap_or(0),
+        tokens: u32::try_from(row.int(6)?).unwrap_or(0),
+        conclusion: row.text(7)?,
         proposed,
-        status: row.get(9)?,
-        detail: row.get(10)?,
+        status: row.text(9)?,
+        detail: row.text(10)?,
     })
 }
 

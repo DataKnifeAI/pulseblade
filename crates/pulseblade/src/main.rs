@@ -176,6 +176,24 @@ fn parse_detail(s: &str) -> Result<query::Detail, String> {
         .map_err(|_| "expected summary, brief, or full".to_string())
 }
 
+fn open_hub_store(config: &Config, path: &Path) -> anyhow::Result<Arc<Store>> {
+    let url_env = config.hub.database_url_env.trim();
+    if url_env.is_empty() {
+        return open_store(path);
+    }
+    let url = std::env::var(url_env).with_context(|| format!("reading {url_env}"))?;
+    let url = config::inject_database_user(
+        &url,
+        config.hub.database_user_env.trim(),
+        config.hub.database_password_env.trim(),
+    )?;
+    let ca = config::optional_env(config.hub.database_ca_env.trim())?;
+    tracing::info!("hub journal is postgres");
+    Ok(Arc::new(
+        Store::open_postgres(&url, ca.as_deref()).context("opening the hub postgres database")?,
+    ))
+}
+
 fn open_store(path: &Path) -> anyhow::Result<Arc<Store>> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -498,7 +516,7 @@ async fn main() -> anyhow::Result<()> {
             served
         }
         Command::Hub => {
-            let store = open_store(&db)?;
+            let store = open_hub_store(&config, &db)?;
             let tokens = hub_tokens(&config)?;
             let addr: SocketAddr =
                 config.hub.listen.parse().with_context(|| {

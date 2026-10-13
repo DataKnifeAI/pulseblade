@@ -1,4 +1,10 @@
-# Hub on poc-apps. The journal lives on a PVC so a rollout keeps state.
+# Hub on poc-apps. The fleet journal is CloudNativePG (pulseblade-postgres).
+# The PVC is the previous SQLite file; leave it until the postgres hub has
+# caught up. Apply this ConfigMap only with an image that reads
+# database_url_env. Create the app secret before the cluster. The password
+# is not in git:
+#   kubectl -n pulseblade create secret generic pulseblade-postgres-credentials \
+#     --from-literal=username=pulseblade --from-literal=password="$(openssl rand -base64 24)"
 # Node tokens stay in the pulseblade-hub-tokens Secret (keys are node ids).
 # The ConfigMap pulseblade-hub holds pulseblade.toml; its allow-list must
 # include pulseblade-poc.dataknife.net or the Ingress returns 403.
@@ -22,6 +28,10 @@ data:
     [hub]
     listen = "0.0.0.0:7170"
     action_wait_secs = 20
+    database_url_env = "PULSEBLADE_DATABASE_URL"
+    database_user_env = "PULSEBLADE_DATABASE_USER"
+    database_password_env = "PULSEBLADE_DATABASE_PASSWORD"
+    database_ca_env = "PULSEBLADE_DATABASE_CA"
 
     [[hub.nodes]]
     id = "poc-apps-1"
@@ -63,6 +73,29 @@ data:
     id = "lee-cachy"
     token_env = "TOKEN_LEE_CACHY"
 ---
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: pulseblade-postgres
+  namespace: pulseblade
+spec:
+  instances: 2
+  imageName: ghcr.io/cloudnative-pg/postgresql:18.6-system-trixie
+  enableSuperuserAccess: false
+  enablePDB: true
+  storage:
+    size: 40Gi
+    storageClass: truenas-csi-nfs
+  bootstrap:
+    initdb:
+      database: pulseblade
+      owner: pulseblade
+      secret:
+        name: pulseblade-postgres-credentials
+  postgresql:
+    parameters:
+      ssl_min_protocol_version: "TLSv1.3"
+---
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -90,8 +123,7 @@ spec:
       labels:
         app: pulseblade-hub
     spec:
-      # NFS is root:root until fsGroup runs. The hub writes its sqlite
-      # journal as this user.
+      # The journal is Postgres. This user is the process identity.
       securityContext:
         runAsUser: 65532
         runAsGroup: 65532
@@ -108,6 +140,23 @@ spec:
           env:
             - name: XDG_STATE_HOME
               value: /var/lib/pulseblade
+            - name: PULSEBLADE_DATABASE_URL
+              value: postgres://pulseblade-postgres-rw.pulseblade.svc.cluster.local:5432/pulseblade?sslmode=require
+            - name: PULSEBLADE_DATABASE_USER
+              valueFrom:
+                secretKeyRef:
+                  name: pulseblade-postgres-credentials
+                  key: username
+            - name: PULSEBLADE_DATABASE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: pulseblade-postgres-credentials
+                  key: password
+            - name: PULSEBLADE_DATABASE_CA
+              valueFrom:
+                secretKeyRef:
+                  name: pulseblade-postgres-ca
+                  key: ca.crt
             - name: TOKEN_POC_APPS_1
               valueFrom:
                 secretKeyRef:

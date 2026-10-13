@@ -105,6 +105,12 @@ model = "local"
 [hub]
 listen = "127.0.0.1:7170"
 action_wait_secs = 20
+# Names of environment variables, never the values. Empty database_url_env
+# keeps this hub on its SQLite file. Nodes ignore this section.
+database_url_env = ""
+database_user_env = ""
+database_password_env = ""
+database_ca_env = ""
 
 [[hub.nodes]]
 id = "web1"

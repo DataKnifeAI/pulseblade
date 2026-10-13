@@ -9,6 +9,7 @@ use pulseblade_core::{Change, ChangeKind};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
+use crate::sql::{Sql, SqlExt, SqlVal, SqliteSql};
 use crate::{from_ms, Store};
 
 /// Width of a rolled-up metric bucket.
@@ -109,8 +110,9 @@ pub(crate) fn observe_sample(
             )
             .optional()?;
         if prev.is_some_and(|p| value > p) {
-            insert_event(
-                conn,
+            let mut sql = SqliteSql { conn };
+            insert_event_sql(
+                &mut sql,
                 ts_ms,
                 resource_id,
                 "restart",
@@ -134,6 +136,10 @@ pub(crate) fn observe_sample(
 }
 
 pub(crate) fn note_changes(conn: &Connection, changes: &[Change]) -> crate::Result<()> {
+    note_changes_sql(&mut SqliteSql { conn }, changes)
+}
+
+pub(crate) fn note_changes_sql(sql: &mut dyn Sql, changes: &[Change]) -> crate::Result<()> {
     for change in changes {
         let ms = change.ts.timestamp_millis();
         if change.kind == ChangeKind::Appeared {
@@ -143,18 +149,18 @@ pub(crate) fn note_changes(conn: &Connection, changes: &[Change]) -> crate::Resu
                 .and_then(|v| v.get("health"))
                 .and_then(|v| v.as_str())
             {
-                note_health(conn, ms, &change.resource_id, health)?;
+                note_health(sql, ms, &change.resource_id, health)?;
             }
         } else if change.field.as_deref() == Some("health") {
             if let Some(health) = json_str(change.after.as_ref()) {
-                note_health(conn, ms, &change.resource_id, health)?;
+                note_health(sql, ms, &change.resource_id, health)?;
             }
         } else if change.field.as_deref() == Some("attrs.restart_count") {
             let before = json_f64(change.before.as_ref()).unwrap_or(0.0);
             let after = json_f64(change.after.as_ref()).unwrap_or(0.0);
             if after > before {
-                insert_event(
-                    conn,
+                insert_event_sql(
+                    sql,
                     ms,
                     &change.resource_id,
                     "restart",
@@ -165,8 +171,8 @@ pub(crate) fn note_changes(conn: &Connection, changes: &[Change]) -> crate::Resu
         } else if change.field.as_deref() == Some("attrs.sub") {
             if let Some(sub) = json_str(change.after.as_ref()) {
                 if sub.to_ascii_lowercase().contains("restart") {
-                    insert_event(
-                        conn,
+                    insert_event_sql(
+                        sql,
                         ms,
                         &change.resource_id,
                         "restart",
@@ -180,14 +186,14 @@ pub(crate) fn note_changes(conn: &Connection, changes: &[Change]) -> crate::Resu
     Ok(())
 }
 
-fn note_health(conn: &Connection, ms: i64, resource_id: &str, health: &str) -> crate::Result<()> {
+fn note_health(sql: &mut dyn Sql, ms: i64, resource_id: &str, health: &str) -> crate::Result<()> {
     let severity = match health {
         "failed" => "critical",
         "degraded" => "warning",
         _ => return Ok(()),
     };
-    insert_event(
-        conn,
+    insert_event_sql(
+        sql,
         ms,
         resource_id,
         "failure",
@@ -206,44 +212,48 @@ pub(crate) fn note_error_log(
     if resource_id.is_empty() || message.is_empty() {
         return Ok(());
     }
-    insert_event(conn, ts_ms, resource_id, "error", "warning", message)
+    let mut sql = SqliteSql { conn };
+    insert_event_sql(&mut sql, ts_ms, resource_id, "error", "warning", message)
 }
 
-pub(crate) fn store_pushed(conn: &Connection, event: &StoredEvent) -> crate::Result<()> {
-    insert_event(
-        conn,
-        event.ts.timestamp_millis(),
-        &event.resource_id,
-        &event.kind,
-        &event.severity,
-        &event.message,
-    )
-}
-
-fn insert_event(
-    conn: &Connection,
+pub(crate) fn insert_event_sql(
+    sql: &mut dyn Sql,
     ts_ms: i64,
     resource_id: &str,
     kind: &str,
     severity: &str,
     message: &str,
 ) -> crate::Result<()> {
-    let wrote = conn.execute(
-        "INSERT OR IGNORE INTO events (ts, resource_id, kind, severity, message)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![ts_ms, resource_id, kind, severity, message],
+    let rows = sql.query(
+        "INSERT INTO events (ts, resource_id, kind, severity, message)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(resource_id, ts, kind, message) DO NOTHING
+         RETURNING id",
+        &[
+            SqlVal::Int(ts_ms),
+            SqlVal::text(resource_id),
+            SqlVal::text(kind),
+            SqlVal::text(severity),
+            SqlVal::text(message),
+        ],
+        |row| row.int(0),
     )?;
-    if wrote == 1 {
-        let id = conn.last_insert_rowid();
-        conn.execute(
-            "INSERT INTO events_fts(rowid, message, resource_id) VALUES (?1, ?2, ?3)",
-            params![id, message, resource_id],
-        )?;
+    if let Some(id) = rows.first().copied() {
+        if !sql.postgres() {
+            sql.execute(
+                "INSERT INTO events_fts(rowid, message, resource_id) VALUES (?1, ?2, ?3)",
+                &[
+                    SqlVal::Int(id),
+                    SqlVal::text(message),
+                    SqlVal::text(resource_id),
+                ],
+            )?;
+        }
     }
     Ok(())
 }
 
-fn is_restart_metric(metric: &str) -> bool {
+pub(crate) fn is_restart_metric(metric: &str) -> bool {
     metric == "k8s.restarts" || metric.ends_with(".restarts")
 }
 
@@ -281,63 +291,78 @@ impl Store {
         limit: usize,
     ) -> crate::Result<Vec<MetricBucket>> {
         let limit = limit.clamp(1, 5_000) as i64;
-        let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT resource_id, metric, bucket_ms, n, vmin, vmax, vsum
-             FROM sample_buckets
-             WHERE bucket_ms > ?1 AND bucket_ms < ?2
-             ORDER BY bucket_ms LIMIT ?3",
-        )?;
-        let rows = stmt.query_map(params![after_ms, open_ms, limit], row_bucket)?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+        self.with_sql(|sql| {
+            sql.query(
+                "SELECT resource_id, metric, bucket_ms, n, vmin, vmax, vsum
+                 FROM sample_buckets
+                 WHERE bucket_ms > ?1 AND bucket_ms < ?2
+                 ORDER BY bucket_ms LIMIT ?3",
+                &[
+                    SqlVal::Int(after_ms),
+                    SqlVal::Int(open_ms),
+                    SqlVal::Int(limit),
+                ],
+                map_bucket,
+            )
+        })
     }
 
     /// Replace a bucket when the incoming row has at least as many samples.
     pub fn upsert_buckets(&self, buckets: &[MetricBucket]) -> crate::Result<()> {
-        let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "INSERT INTO sample_buckets (resource_id, metric, bucket_ms, n, vmin, vmax, vsum)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT(resource_id, metric, bucket_ms) DO UPDATE SET
-                n = excluded.n, vmin = excluded.vmin, vmax = excluded.vmax, vsum = excluded.vsum
-             WHERE excluded.n >= sample_buckets.n",
-        )?;
-        for b in buckets {
-            if b.n == 0 || !b.min.is_finite() || !b.max.is_finite() || !b.sum.is_finite() {
-                continue;
+        self.with_sql(|sql| {
+            for b in buckets {
+                if b.n == 0 || !b.min.is_finite() || !b.max.is_finite() || !b.sum.is_finite() {
+                    continue;
+                }
+                sql.execute(
+                    "INSERT INTO sample_buckets (resource_id, metric, bucket_ms, n, vmin, vmax, vsum)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                     ON CONFLICT(resource_id, metric, bucket_ms) DO UPDATE SET
+                        n = excluded.n, vmin = excluded.vmin, vmax = excluded.vmax, vsum = excluded.vsum
+                     WHERE excluded.n >= sample_buckets.n",
+                    &[
+                        SqlVal::text(&b.resource_id),
+                        SqlVal::text(&b.metric),
+                        SqlVal::Int(b.bucket_ms),
+                        SqlVal::Int(b.n as i64),
+                        SqlVal::Float(b.min),
+                        SqlVal::Float(b.max),
+                        SqlVal::Float(b.sum),
+                    ],
+                )?;
             }
-            stmt.execute(params![
-                b.resource_id,
-                b.metric,
-                b.bucket_ms,
-                b.n as i64,
-                b.min,
-                b.max,
-                b.sum
-            ])?;
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     pub fn events_after(&self, after_id: i64, limit: usize) -> crate::Result<Vec<StoredEvent>> {
         let limit = limit.clamp(1, 5_000) as i64;
-        let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT id, ts, resource_id, kind, severity, message FROM events
-             WHERE id > ?1 ORDER BY id LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![after_id, limit], row_event)?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+        self.with_sql(|sql| {
+            sql.query(
+                "SELECT id, ts, resource_id, kind, severity, message FROM events
+                 WHERE id > ?1 ORDER BY id LIMIT ?2",
+                &[SqlVal::Int(after_id), SqlVal::Int(limit)],
+                map_event,
+            )
+        })
     }
 
     pub fn insert_events(&self, events: &[StoredEvent]) -> crate::Result<i64> {
         let mut max_id = 0i64;
-        let conn = self.conn();
-        for event in events {
-            max_id = max_id.max(event.id);
-            note_error_or_stored(&conn, event)?;
-        }
-        Ok(max_id)
+        self.with_sql(|sql| {
+            for event in events {
+                max_id = max_id.max(event.id);
+                insert_event_sql(
+                    sql,
+                    event.ts.timestamp_millis(),
+                    &event.resource_id,
+                    &event.kind,
+                    &event.severity,
+                    &event.message,
+                )?;
+            }
+            Ok(max_id)
+        })
     }
 
     /// Points from raw samples when they cover `from`, otherwise from buckets.
@@ -351,16 +376,14 @@ impl Store {
         step_ms: i64,
     ) -> crate::Result<(i64, Vec<pulseblade_core::Point>)> {
         let from_ms = from.timestamp_millis();
-        let oldest: Option<i64> = self
-            .conn()
-            .query_row(
+        let oldest = self.with_sql(|sql| {
+            sql.query_opt(
                 "SELECT MIN(ts) FROM samples WHERE resource_id = ?1 AND metric = ?2",
-                params![id, metric],
-                |r| r.get(0),
+                &[SqlVal::text(id), SqlVal::text(metric)],
+                |row| row.opt_int(0),
             )
-            .optional()?
-            .flatten();
-        let raw_covers = oldest.is_some_and(|min| min <= from_ms);
+        })?;
+        let raw_covers = oldest.flatten().is_some_and(|min| min <= from_ms);
         if raw_covers {
             let points = self.series(
                 id,
@@ -373,23 +396,35 @@ impl Store {
             return Ok((step_ms, points));
         }
         let step = step_ms.max(BUCKET_MS);
-        let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT (bucket_ms / ?1) * ?1 AS b, SUM(vsum) / SUM(n)
-             FROM sample_buckets
-             WHERE resource_id = ?2 AND metric = ?3 AND bucket_ms BETWEEN ?4 AND ?5
-             GROUP BY b ORDER BY b",
-        )?;
-        let rows = stmt.query_map(
-            params![step, id, metric, from_ms, to.timestamp_millis()],
-            |r| {
-                Ok(pulseblade_core::Point {
-                    ts: crate::from_ms(r.get(0)?),
-                    value: r.get(1)?,
-                })
-            },
-        )?;
-        Ok((step, rows.collect::<rusqlite::Result<_>>()?))
+        let points = self.with_sql(|sql| {
+            let ratio = if sql.postgres() {
+                "SUM(vsum)::float8 / NULLIF(SUM(n), 0)::float8"
+            } else {
+                "SUM(vsum) / SUM(n)"
+            };
+            sql.query(
+                &format!(
+                    "SELECT (bucket_ms / ?1) * ?1 AS b, {ratio}
+                     FROM sample_buckets
+                     WHERE resource_id = ?2 AND metric = ?3 AND bucket_ms BETWEEN ?4 AND ?5
+                     GROUP BY b ORDER BY b"
+                ),
+                &[
+                    SqlVal::Int(step),
+                    SqlVal::text(id),
+                    SqlVal::text(metric),
+                    SqlVal::Int(from_ms),
+                    SqlVal::Int(to.timestamp_millis()),
+                ],
+                |row| {
+                    Ok(pulseblade_core::Point {
+                        ts: crate::from_ms(row.int(0)?),
+                        value: row.float(1)?,
+                    })
+                },
+            )
+        })?;
+        Ok((step, points))
     }
 
     /// Newest matches first. `before_id` is 0 for the first page.
@@ -406,23 +441,43 @@ impl Store {
         };
         let resource = resource.unwrap_or("");
         let limit = limit.clamp(1, 50) as i64;
-        let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT e.id, e.ts, e.resource_id, e.kind, e.severity, e.message
-             FROM events_fts
-             JOIN events e ON e.id = events_fts.rowid
-             WHERE events_fts MATCH ?1
-               AND e.ts >= ?2
-               AND (?3 = '' OR e.resource_id = ?3)
-               AND (?4 = 0 OR e.id < ?4)
-             ORDER BY e.ts DESC, e.id DESC
-             LIMIT ?5",
-        )?;
-        let rows = stmt.query_map(
-            params![query, since_ms, resource, before_id, limit],
-            row_event,
-        )?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+        self.with_sql(|sql| {
+            let statement = if sql.postgres() {
+                "SELECT id, ts, resource_id, kind, severity, message FROM events
+                 WHERE ts >= ?2
+                   AND (?3 = '' OR resource_id = ?3)
+                   AND (?4 = 0 OR id < ?4)
+                   AND message ILIKE ?1
+                 ORDER BY ts DESC, id DESC
+                 LIMIT ?5"
+            } else {
+                "SELECT e.id, e.ts, e.resource_id, e.kind, e.severity, e.message
+                 FROM events_fts
+                 JOIN events e ON e.id = events_fts.rowid
+                 WHERE events_fts MATCH ?1
+                   AND e.ts >= ?2
+                   AND (?3 = '' OR e.resource_id = ?3)
+                   AND (?4 = 0 OR e.id < ?4)
+                 ORDER BY e.ts DESC, e.id DESC
+                 LIMIT ?5"
+            };
+            let pattern = if sql.postgres() {
+                like_words(&query)
+            } else {
+                query.clone()
+            };
+            sql.query(
+                statement,
+                &[
+                    SqlVal::text(pattern),
+                    SqlVal::Int(since_ms),
+                    SqlVal::text(resource),
+                    SqlVal::Int(before_id),
+                    SqlVal::Int(limit),
+                ],
+                map_event,
+            )
+        })
     }
 
     /// Error events for `ids`, newest first. Used when the logs table has no copy.
@@ -435,47 +490,64 @@ impl Store {
             return Ok(Vec::new());
         }
         let placeholders = vec!["?"; ids.len()].join(",");
-        let conn = self.conn();
-        let mut stmt = conn.prepare(&format!(
-            "SELECT ts, resource_id, message FROM events
-             WHERE kind = 'error' AND resource_id IN ({placeholders})
-             ORDER BY ts DESC LIMIT {limit}"
-        ))?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(ids.iter()), |r| {
-            Ok(pulseblade_core::LogLine {
-                ts: from_ms(r.get(0)?),
-                resource_id: r.get(1)?,
-                message: r.get(2)?,
-            })
-        })?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+        let args: Vec<SqlVal> = ids.iter().cloned().map(SqlVal::text).collect();
+        self.with_sql(|sql| {
+            sql.query(
+                &format!(
+                    "SELECT ts, resource_id, message FROM events
+                     WHERE kind = 'error' AND resource_id IN ({placeholders})
+                     ORDER BY ts DESC LIMIT {limit}"
+                ),
+                &args,
+                |row| {
+                    Ok(pulseblade_core::LogLine {
+                        ts: from_ms(row.int(0)?),
+                        resource_id: row.text(1)?,
+                        message: row.text(2)?,
+                    })
+                },
+            )
+        })
     }
 }
 
-fn note_error_or_stored(conn: &Connection, event: &StoredEvent) -> crate::Result<()> {
-    store_pushed(conn, event)
+fn like_words(fts: &str) -> String {
+    let words: Vec<String> = fts
+        .split_whitespace()
+        .map(|word| {
+            word.trim_matches('"')
+                .replace('%', "\\%")
+                .replace('_', "\\_")
+        })
+        .filter(|word| !word.is_empty())
+        .collect();
+    if words.is_empty() {
+        "%".into()
+    } else {
+        format!("%{}%", words.join("%"))
+    }
 }
 
-fn row_bucket(r: &rusqlite::Row<'_>) -> rusqlite::Result<MetricBucket> {
+fn map_bucket(row: &dyn crate::sql::SqlRow) -> crate::Result<MetricBucket> {
     Ok(MetricBucket {
-        resource_id: r.get(0)?,
-        metric: r.get(1)?,
-        bucket_ms: r.get(2)?,
-        n: r.get::<_, i64>(3)? as u64,
-        min: r.get(4)?,
-        max: r.get(5)?,
-        sum: r.get(6)?,
+        resource_id: row.text(0)?,
+        metric: row.text(1)?,
+        bucket_ms: row.int(2)?,
+        n: row.int(3)? as u64,
+        min: row.float(4)?,
+        max: row.float(5)?,
+        sum: row.float(6)?,
     })
 }
 
-fn row_event(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredEvent> {
+fn map_event(row: &dyn crate::sql::SqlRow) -> crate::Result<StoredEvent> {
     Ok(StoredEvent {
-        id: r.get(0)?,
-        ts: from_ms(r.get(1)?),
-        resource_id: r.get(2)?,
-        kind: r.get(3)?,
-        severity: r.get(4)?,
-        message: r.get(5)?,
+        id: row.int(0)?,
+        ts: from_ms(row.int(1)?),
+        resource_id: row.text(2)?,
+        kind: row.text(3)?,
+        severity: row.text(4)?,
+        message: row.text(5)?,
     })
 }
 

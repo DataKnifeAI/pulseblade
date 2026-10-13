@@ -1,10 +1,9 @@
 //! Findings, notes, and journal lines persisted beside resource state.
 
+use crate::sql::{Sql, SqlExt, SqlVal};
+use crate::{from_ms, Store, StoreError};
 use chrono::{DateTime, Utc};
 use pulseblade_core::{Change, Finding, FindingStatus, LogLine, Note, Severity};
-use rusqlite::{params, OptionalExtension};
-
-use crate::{from_ms, Store, StoreError};
 
 /// A finding the detector wants open, before the store assigns an id.
 #[derive(Debug, Clone)]
@@ -35,13 +34,18 @@ struct FindingRow {
 impl Store {
     /// Raw samples for one series, oldest first, at most `limit` (the newest ones).
     pub fn recent_samples(&self, id: &str, metric: &str, limit: usize) -> crate::Result<Vec<f64>> {
-        let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT value FROM samples WHERE resource_id = ?1 AND metric = ?2
-             ORDER BY ts DESC LIMIT ?3",
-        )?;
-        let rows = stmt.query_map(params![id, metric, limit as i64], |r| r.get::<_, f64>(0))?;
-        let mut values: Vec<f64> = rows.collect::<rusqlite::Result<_>>()?;
+        let mut values = self.with_sql(|sql| {
+            sql.query(
+                "SELECT value FROM samples WHERE resource_id = ?1 AND metric = ?2
+                 ORDER BY ts DESC LIMIT ?3",
+                &[
+                    SqlVal::text(id),
+                    SqlVal::text(metric),
+                    SqlVal::Int(limit as i64),
+                ],
+                |row| row.float(0),
+            )
+        })?;
         values.reverse();
         Ok(values)
     }
@@ -75,53 +79,56 @@ impl Store {
             .collect::<Vec<_>>()
             .join(",");
         let limit_slot = ids.len() + 2;
-        let mut bound: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::with_capacity(ids.len() + 1);
-        bound.push(Box::new(since_ms));
+        let mut args = Vec::with_capacity(ids.len() + 1);
+        args.push(SqlVal::Int(since_ms));
         for id in ids {
-            bound.push(Box::new(id.clone()));
+            args.push(SqlVal::text(id));
         }
-        let conn = self.conn();
-        let total: i64 = conn.query_row(
-            &format!("SELECT COUNT(*) FROM logs WHERE ts >= ?1 AND resource_id IN ({in_list})"),
-            rusqlite::params_from_iter(bound.iter().map(|b| b.as_ref())),
-            |r| r.get(0),
-        )?;
-        bound.push(Box::new(limit as i64));
-        let mut stmt = conn.prepare(&format!(
-            "SELECT ts, resource_id, message FROM logs
-             WHERE ts >= ?1 AND resource_id IN ({in_list})
-             ORDER BY ts DESC LIMIT ?{limit_slot}"
-        ))?;
-        let rows = stmt.query_map(
-            rusqlite::params_from_iter(bound.iter().map(|b| b.as_ref())),
-            |r| {
-                Ok(LogLine {
-                    ts: from_ms(r.get(0)?),
-                    resource_id: r.get(1)?,
-                    message: r.get(2)?,
-                })
-            },
-        )?;
-        Ok((rows.collect::<rusqlite::Result<_>>()?, total as usize))
+        self.with_sql(|sql| {
+            let total = sql.query_one(
+                &format!("SELECT COUNT(*) FROM logs WHERE ts >= ?1 AND resource_id IN ({in_list})"),
+                &args,
+                |row| row.int(0),
+            )?;
+            args.push(SqlVal::Int(limit as i64));
+            let lines = sql.query(
+                &format!(
+                    "SELECT ts, resource_id, message FROM logs
+                     WHERE ts >= ?1 AND resource_id IN ({in_list})
+                     ORDER BY ts DESC LIMIT ?{limit_slot}"
+                ),
+                &args,
+                |row| {
+                    Ok(LogLine {
+                        ts: from_ms(row.int(0)?),
+                        resource_id: row.text(1)?,
+                        message: row.text(2)?,
+                    })
+                },
+            )?;
+            Ok((lines, total as usize))
+        })
     }
 
     pub fn open_finding_count(&self) -> crate::Result<u64> {
-        Ok(self.conn().query_row(
-            "SELECT COUNT(*) FROM findings WHERE status = 'open'",
-            [],
-            |r| r.get::<_, i64>(0),
-        )? as u64)
+        self.with_sql(|sql| {
+            Ok(sql.query_one(
+                "SELECT COUNT(*) FROM findings WHERE status = 'open'",
+                &[],
+                |row| row.int(0),
+            )? as u64)
+        })
     }
 
     /// Milliseconds of the newest finding write, or 0. Moves on open, ack, and resolve.
     pub fn findings_token(&self) -> crate::Result<i64> {
-        self.conn()
-            .query_row(
+        self.with_sql(|sql| {
+            sql.query_one(
                 "SELECT COALESCE(MAX(updated_at), 0) FROM findings",
-                [],
-                |r| r.get(0),
+                &[],
+                |row| row.int(0),
             )
-            .map_err(Into::into)
+        })
     }
 
     pub fn findings(
@@ -129,52 +136,54 @@ impl Store {
         filter: &FindingFilter,
         limit: usize,
     ) -> crate::Result<(Vec<Finding>, usize)> {
-        let status = filter.status.map(FindingStatus::as_str);
-        let severity = filter.severity.map(Severity::as_str);
-        let conn = self.conn();
-        let total: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM findings
-             WHERE (?1 IS NULL OR status = ?1)
-               AND (?2 IS NULL OR severity = ?2)
-               AND (?3 IS NULL OR resource_id = ?3)",
-            params![status, severity, filter.resource_id],
-            |r| r.get(0),
-        )?;
-        let mut stmt = conn.prepare(
-            "SELECT id, dedupe_key, resource_id, rule, severity, status, summary,
-                    opened_at, context, logs
-             FROM findings
-             WHERE (?1 IS NULL OR status = ?1)
-               AND (?2 IS NULL OR severity = ?2)
-               AND (?3 IS NULL OR resource_id = ?3)
-             ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END,
-                      opened_at DESC
-             LIMIT ?4",
-        )?;
-        let rows = stmt.query_map(
-            params![status, severity, filter.resource_id, limit as i64],
-            row_to_finding,
-        )?;
-        let mut findings = Vec::new();
-        for row in rows {
-            findings.push(row??.finding);
-        }
-        Ok((findings, total as usize))
+        let args = [
+            SqlVal::opt_text(filter.status.map(|s| s.as_str().to_string())),
+            SqlVal::opt_text(filter.severity.map(|s| s.as_str().to_string())),
+            SqlVal::opt_text(filter.resource_id.clone()),
+        ];
+        self.with_sql(|sql| {
+            let total = sql.query_one(
+                "SELECT COUNT(*) FROM findings
+                 WHERE (?1 IS NULL OR status = ?1)
+                   AND (?2 IS NULL OR severity = ?2)
+                   AND (?3 IS NULL OR resource_id = ?3)",
+                &args,
+                |row| row.int(0),
+            )?;
+            let mut listed = args.to_vec();
+            listed.push(SqlVal::Int(limit as i64));
+            let rows = sql.query(
+                "SELECT id, dedupe_key, resource_id, rule, severity, status, summary,
+                        opened_at, context, logs
+                 FROM findings
+                 WHERE (?1 IS NULL OR status = ?1)
+                   AND (?2 IS NULL OR severity = ?2)
+                   AND (?3 IS NULL OR resource_id = ?3)
+                 ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END,
+                          opened_at DESC
+                 LIMIT ?4",
+                &listed,
+                map_finding,
+            )?;
+            Ok((
+                rows.into_iter().map(|row| row.finding).collect(),
+                total as usize,
+            ))
+        })
     }
 
     pub fn finding(&self, id: &str) -> crate::Result<Option<Finding>> {
-        Ok(self
-            .conn()
-            .query_row(
-                "SELECT id, dedupe_key, resource_id, rule, severity, status, summary,
-                        opened_at, context, logs
-                 FROM findings WHERE id = ?1",
-                [id],
-                row_to_finding,
-            )
-            .optional()?
-            .transpose()?
-            .map(|row| row.finding))
+        self.with_sql(|sql| {
+            Ok(sql
+                .query_opt(
+                    "SELECT id, dedupe_key, resource_id, rule, severity, status, summary,
+                            opened_at, context, logs
+                     FROM findings WHERE id = ?1",
+                    &[SqlVal::text(id)],
+                    map_finding,
+                )?
+                .map(|row| row.finding))
+        })
     }
 
     /// Open `drafts` and resolve any open or acked finding whose condition cleared.
@@ -205,84 +214,78 @@ impl Store {
         rule: Option<&str>,
     ) -> crate::Result<Vec<Finding>> {
         let ms = now.timestamp_millis();
-        let mut conn = self.conn();
-        let tx = conn.transaction()?;
-        let mut open: Vec<FindingRow> = {
-            let mut stmt = tx.prepare(
+        let rule_arg = SqlVal::opt_text(rule.map(|s| s.to_string()));
+        self.transaction(|sql| {
+            let mut open = sql.query(
                 "SELECT id, dedupe_key, resource_id, rule, severity, status, summary,
                         opened_at, context, logs
                  FROM findings WHERE status IN ('open', 'acked')
                    AND (?1 IS NULL OR rule = ?1)",
+                &[rule_arg],
+                map_finding,
             )?;
-            let rows = stmt.query_map(params![rule], row_to_finding)?;
-            let mut out = Vec::new();
-            for row in rows {
-                out.push(row??);
-            }
-            out
-        };
-        let mut created = Vec::new();
-        for draft in drafts {
-            if rule.is_some_and(|rule| draft.rule != rule) {
-                continue;
-            }
-            let context = serde_json::to_string(&draft.context)?;
-            let logs = serde_json::to_string(&draft.logs)?;
-            if let Some(idx) = open.iter().position(|r| r.dedupe_key == draft.dedupe_key) {
-                let row = open.remove(idx);
-                tx.execute(
-                    "UPDATE findings
-                     SET severity = ?1, summary = ?2, context = ?3, logs = ?4, updated_at = ?5
-                     WHERE id = ?6",
-                    params![
-                        draft.severity.as_str(),
-                        draft.summary,
-                        context,
-                        logs,
-                        ms,
-                        row.finding.id
-                    ],
-                )?;
-            } else {
-                let id = fresh_finding_id(&tx, &draft.dedupe_key, ms)?;
-                tx.execute(
-                    "INSERT INTO findings
-                        (id, dedupe_key, resource_id, rule, severity, status, summary,
-                         opened_at, updated_at, context, logs)
-                     VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6, ?7, ?7, ?8, ?9)",
-                    params![
+            let mut created = Vec::new();
+            for draft in drafts {
+                if rule.is_some_and(|rule| draft.rule != rule) {
+                    continue;
+                }
+                let context = serde_json::to_string(&draft.context)?;
+                let logs = serde_json::to_string(&draft.logs)?;
+                if let Some(idx) = open.iter().position(|r| r.dedupe_key == draft.dedupe_key) {
+                    let row = open.remove(idx);
+                    sql.execute(
+                        "UPDATE findings
+                         SET severity = ?1, summary = ?2, context = ?3, logs = ?4, updated_at = ?5
+                         WHERE id = ?6",
+                        &[
+                            SqlVal::text(draft.severity.as_str()),
+                            SqlVal::text(&draft.summary),
+                            SqlVal::text(context),
+                            SqlVal::text(logs),
+                            SqlVal::Int(ms),
+                            SqlVal::text(&row.finding.id),
+                        ],
+                    )?;
+                } else {
+                    let id = fresh_finding_id(sql, &draft.dedupe_key, ms)?;
+                    sql.execute(
+                        "INSERT INTO findings
+                            (id, dedupe_key, resource_id, rule, severity, status, summary,
+                             opened_at, updated_at, context, logs)
+                         VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6, ?7, ?7, ?8, ?9)",
+                        &[
+                            SqlVal::text(&id),
+                            SqlVal::text(&draft.dedupe_key),
+                            SqlVal::text(&draft.resource_id),
+                            SqlVal::text(&draft.rule),
+                            SqlVal::text(draft.severity.as_str()),
+                            SqlVal::text(&draft.summary),
+                            SqlVal::Int(ms),
+                            SqlVal::text(context),
+                            SqlVal::text(logs),
+                        ],
+                    )?;
+                    created.push(Finding {
                         id,
-                        draft.dedupe_key,
-                        draft.resource_id,
-                        draft.rule,
-                        draft.severity.as_str(),
-                        draft.summary,
-                        ms,
-                        context,
-                        logs,
-                    ],
-                )?;
-                created.push(Finding {
-                    id,
-                    resource_id: draft.resource_id.clone(),
-                    rule: draft.rule.clone(),
-                    severity: draft.severity,
-                    status: FindingStatus::Open,
-                    summary: draft.summary.clone(),
-                    opened_at: from_ms(ms),
-                    context: draft.context.clone(),
-                    logs: draft.logs.clone(),
-                });
+                        resource_id: draft.resource_id.clone(),
+                        rule: draft.rule.clone(),
+                        severity: draft.severity,
+                        status: FindingStatus::Open,
+                        summary: draft.summary.clone(),
+                        opened_at: from_ms(ms),
+                        context: draft.context.clone(),
+                        logs: draft.logs.clone(),
+                    });
+                }
             }
-        }
-        for row in open {
-            tx.execute(
-                "UPDATE findings SET status = 'resolved', updated_at = ?1 WHERE id = ?2",
-                params![ms, row.finding.id],
-            )?;
-        }
-        tx.commit()?;
-        Ok(created)
+            for row in open {
+                sql.execute(
+                    "UPDATE findings SET status = 'resolved', updated_at = ?1 WHERE id = ?2",
+                    &[SqlVal::Int(ms), SqlVal::text(row.finding.id)],
+                )?;
+            }
+            Ok(created)
+        })
     }
 
     /// Mark an open or already-acked finding acked. Resolved findings are rejected.
@@ -293,10 +296,13 @@ impl Store {
         if finding.status == FindingStatus::Resolved {
             return Err(StoreError::Invalid(format!("finding `{id}` is resolved")));
         }
-        self.conn().execute(
-            "UPDATE findings SET status = 'acked', updated_at = ?1 WHERE id = ?2",
-            params![now.timestamp_millis(), id],
-        )?;
+        self.with_sql(|sql| {
+            sql.execute(
+                "UPDATE findings SET status = 'acked', updated_at = ?1 WHERE id = ?2",
+                &[SqlVal::Int(now.timestamp_millis()), SqlVal::text(id)],
+            )?;
+            Ok(())
+        })?;
         finding.status = FindingStatus::Acked;
         Ok(finding)
     }
@@ -308,12 +314,18 @@ impl Store {
         text: &str,
         now: DateTime<Utc>,
     ) -> crate::Result<Note> {
-        let conn = self.conn();
-        conn.execute(
-            "INSERT INTO notes (resource_id, author, text, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![resource_id, author, text, now.timestamp_millis()],
-        )?;
-        let id = conn.last_insert_rowid();
+        let id = self.with_sql(|sql| {
+            sql.execute(
+                "INSERT INTO notes (resource_id, author, text, created_at) VALUES (?1, ?2, ?3, ?4)",
+                &[
+                    SqlVal::text(resource_id),
+                    SqlVal::text(author),
+                    SqlVal::text(text),
+                    SqlVal::Int(now.timestamp_millis()),
+                ],
+            )?;
+            sql.last_id()
+        })?;
         Ok(Note {
             id: format!("n{id}"),
             resource_id: resource_id.to_string(),
@@ -324,47 +336,48 @@ impl Store {
     }
 
     pub fn notes_for(&self, resource_id: &str, limit: usize) -> crate::Result<Vec<Note>> {
-        let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT id, resource_id, author, text, created_at FROM notes
-             WHERE resource_id = ?1 ORDER BY created_at DESC LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![resource_id, limit as i64], row_to_note)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        self.with_sql(|sql| {
+            sql.query(
+                "SELECT id, resource_id, author, text, created_at FROM notes
+                 WHERE resource_id = ?1 ORDER BY created_at DESC LIMIT ?2",
+                &[SqlVal::text(resource_id), SqlVal::Int(limit as i64)],
+                map_note,
+            )
+        })
     }
 
     /// Case-insensitive substring match on note text or resource id, newest first.
     pub fn search_notes(&self, query: &str, limit: usize) -> crate::Result<(Vec<Note>, usize)> {
         let pattern = like_contains(query);
-        let conn = self.conn();
-        let total: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM notes
-             WHERE text LIKE ?1 ESCAPE '\\' OR resource_id LIKE ?1 ESCAPE '\\'",
-            [&pattern],
-            |r| r.get(0),
-        )?;
-        let mut stmt = conn.prepare(
-            "SELECT id, resource_id, author, text, created_at FROM notes
-             WHERE text LIKE ?1 ESCAPE '\\' OR resource_id LIKE ?1 ESCAPE '\\'
-             ORDER BY created_at DESC LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![pattern, limit as i64], row_to_note)?;
-        Ok((rows.collect::<rusqlite::Result<_>>()?, total as usize))
+        self.with_sql(|sql| {
+            let total = sql.query_one(
+                "SELECT COUNT(*) FROM notes
+                 WHERE text LIKE ?1 ESCAPE '\\' OR resource_id LIKE ?1 ESCAPE '\\'",
+                &[SqlVal::text(&pattern)],
+                |row| row.int(0),
+            )?;
+            let notes = sql.query(
+                "SELECT id, resource_id, author, text, created_at FROM notes
+                 WHERE text LIKE ?1 ESCAPE '\\' OR resource_id LIKE ?1 ESCAPE '\\'
+                 ORDER BY created_at DESC LIMIT ?2",
+                &[SqlVal::text(pattern), SqlVal::Int(limit as i64)],
+                map_note,
+            )?;
+            Ok((notes, total as usize))
+        })
     }
 }
 
 /// Ids include the millisecond, so a condition that clears and returns inside
 /// the same millisecond needs a fresh suffix.
-fn fresh_finding_id(
-    conn: &rusqlite::Connection,
-    dedupe_key: &str,
-    ms: i64,
-) -> crate::Result<String> {
+fn fresh_finding_id(sql: &mut dyn Sql, dedupe_key: &str, ms: i64) -> crate::Result<String> {
     for n in 0..64 {
         let id = format!("f{:08x}{ms:x}{n}", fnv(dedupe_key) as u32);
-        let taken: Option<i64> = conn
-            .query_row("SELECT 1 FROM findings WHERE id = ?1", [&id], |r| r.get(0))
-            .optional()?;
+        let taken = sql.query_opt(
+            "SELECT 1 FROM findings WHERE id = ?1",
+            &[SqlVal::text(&id)],
+            |row| row.int(0),
+        )?;
         if taken.is_none() {
             return Ok(id);
         }
@@ -395,43 +408,34 @@ fn like_contains(query: &str) -> String {
     out
 }
 
-fn row_to_finding(row: &rusqlite::Row<'_>) -> rusqlite::Result<crate::Result<FindingRow>> {
-    let id: String = row.get(0)?;
-    let dedupe_key: String = row.get(1)?;
-    let resource_id: String = row.get(2)?;
-    let rule: String = row.get(3)?;
-    let severity: String = row.get(4)?;
-    let status: String = row.get(5)?;
-    let summary: String = row.get(6)?;
-    let opened_at: i64 = row.get(7)?;
-    let context: String = row.get(8)?;
-    let logs: String = row.get(9)?;
-    Ok((|| {
-        Ok(FindingRow {
-            finding: Finding {
-                id,
-                resource_id,
-                rule,
-                severity: severity.parse().map_err(StoreError::Corrupt)?,
-                status: status.parse().map_err(StoreError::Corrupt)?,
-                summary,
-                opened_at: from_ms(opened_at),
-                context: serde_json::from_str(&context)?,
-                logs: serde_json::from_str(&logs)?,
-            },
-            dedupe_key,
-        })
-    })())
+fn map_finding(row: &dyn crate::sql::SqlRow) -> crate::Result<FindingRow> {
+    let severity = row.text(4)?;
+    let status = row.text(5)?;
+    let context = row.text(8)?;
+    let logs = row.text(9)?;
+    Ok(FindingRow {
+        finding: Finding {
+            id: row.text(0)?,
+            resource_id: row.text(2)?,
+            rule: row.text(3)?,
+            severity: severity.parse().map_err(StoreError::Corrupt)?,
+            status: status.parse().map_err(StoreError::Corrupt)?,
+            summary: row.text(6)?,
+            opened_at: from_ms(row.int(7)?),
+            context: serde_json::from_str(&context)?,
+            logs: serde_json::from_str(&logs)?,
+        },
+        dedupe_key: row.text(1)?,
+    })
 }
 
-fn row_to_note(row: &rusqlite::Row<'_>) -> rusqlite::Result<Note> {
-    let id: i64 = row.get(0)?;
+fn map_note(row: &dyn crate::sql::SqlRow) -> crate::Result<Note> {
     Ok(Note {
-        id: format!("n{id}"),
-        resource_id: row.get(1)?,
-        author: row.get(2)?,
-        text: row.get(3)?,
-        created_at: from_ms(row.get(4)?),
+        id: format!("n{}", row.int(0)?),
+        resource_id: row.text(1)?,
+        author: row.text(2)?,
+        text: row.text(3)?,
+        created_at: from_ms(row.int(4)?),
     })
 }
 
