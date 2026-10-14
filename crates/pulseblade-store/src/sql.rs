@@ -810,8 +810,12 @@ pub(crate) mod tests {
             .local_addr()
             .expect("read the free port")
             .port();
+        // Parallel tests share a process id and can start in the same
+        // millisecond. A shared name makes the loser `docker rm` the winner.
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let name = format!(
-            "pb-pg-{}-{}",
+            "pb-pg-{}-{}-{n}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
