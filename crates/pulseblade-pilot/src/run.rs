@@ -15,7 +15,10 @@ You are the Pulseblade pilot. Investigate one incident using the tools. \
 The digest already includes the finding, recent changes, and prior notes. \
 Use state_snapshot with no arguments or detail=brief, short metrics_query ranges, \
 and one resource_explain. Write a short conclusion with memory_note on the resource. \
-Propose remediation with action_plan. Never approve an action. \
+Propose remediation with action_plan and pass that finding's id as finding_id. \
+Call action_status to read a run. It says whether that finding is resolved, still open, \
+or the approval is still waiting. After an auto execute, a later action_status shows that outcome. \
+Never approve an action. \
 Call action_execute only when a previous tool result says tier is auto and auto execution is enabled. \
 Call escalate when a stronger model should take over. \
 The node enforces risk tiers; you cannot override approve or deny.";
@@ -115,7 +118,7 @@ impl Session {
         };
         let notes = prior_notes(tools, &focus);
         let digest = digest(&focus, &change_list, &notes, seq);
-        let run = investigate(&self.config, tools, chat, &trigger, &digest);
+        let run = investigate(&self.config, tools, chat, &trigger, &digest, &focus);
         for finding in &open {
             self.seen.insert(finding.id.clone());
         }
@@ -130,6 +133,7 @@ fn investigate<T: Tools, C: Chat>(
     chat: &mut C,
     trigger: &str,
     digest: &str,
+    focus: &[OpenFinding],
 ) -> PilotRun {
     let started = Instant::now();
     let wall = Duration::from_secs(config.budget.max_wall_secs);
@@ -226,15 +230,14 @@ fn investigate<T: Tools, C: Chat>(
                 tier_calls += 1;
                 run.tool_calls += 1;
                 names.push(call.name.clone());
-                let result = apply_tool(
-                    tools,
-                    &call.name,
-                    &call.arguments,
-                    config.execute_auto,
-                    &mut plans,
-                    &mut run.proposed,
-                    &mut note,
-                );
+                let mut state = ToolState {
+                    execute_auto: config.execute_auto,
+                    focus,
+                    plans: &mut plans,
+                    proposed: &mut run.proposed,
+                    note: &mut note,
+                };
+                let result = apply_tool(tools, &call.name, &call.arguments, &mut state);
                 executed.push(json!({
                     "id": call.id,
                     "type": "function",
@@ -301,30 +304,36 @@ fn empty_content(content: &str) -> Value {
     }
 }
 
+struct ToolState<'a> {
+    execute_auto: bool,
+    focus: &'a [OpenFinding],
+    plans: &'a mut BTreeMap<String, String>,
+    proposed: &'a mut Vec<String>,
+    note: &'a mut String,
+}
+
 fn apply_tool<T: Tools>(
     tools: &mut T,
     name: &str,
     args: &Value,
-    execute_auto: bool,
-    plans: &mut BTreeMap<String, String>,
-    proposed: &mut Vec<String>,
-    note: &mut String,
+    state: &mut ToolState<'_>,
 ) -> Value {
     if name == "action_execute" {
-        return guard_execute(tools, args, execute_auto, plans);
+        return guard_execute(tools, args, state.execute_auto, state.plans);
     }
     if !allowed(name) {
         return json!({"error": format!("tool `{name}` is not available to the pilot")});
     }
-    let args = clamp(name, args.clone());
+    let mut args = clamp(name, args.clone());
     if name == "memory_note" {
         if let Some(text) = args.get("text").and_then(|t| t.as_str()) {
-            *note = text.to_string();
+            *state.note = text.to_string();
         }
     }
     if name == "action_plan" {
+        args = bind_finding(args, state.focus);
         if let Some(action) = args.get("action").and_then(|a| a.as_str()) {
-            proposed.push(action.to_string());
+            state.proposed.push(action.to_string());
         }
     }
     match tools.call(name, args) {
@@ -334,7 +343,7 @@ fn apply_tool<T: Tools>(
                     v.get("plan_id").and_then(|s| s.as_str()),
                     v.get("tier").and_then(|s| s.as_str()),
                 ) {
-                    plans.insert(id.to_string(), tier.to_string());
+                    state.plans.insert(id.to_string(), tier.to_string());
                 }
             }
             v
@@ -379,7 +388,29 @@ fn allowed(name: &str) -> bool {
             | "memory_note"
             | "actions_list"
             | "action_plan"
+            | "action_status"
     )
+}
+
+/// The model can pass `finding_id`. When it does not, use the open finding on
+/// that resource, or the only finding this investigation is about.
+fn bind_finding(mut args: Value, focus: &[OpenFinding]) -> Value {
+    let supplied = args
+        .get("finding_id")
+        .and_then(|v| v.as_str())
+        .is_some_and(|id| !id.is_empty());
+    if supplied {
+        return args;
+    }
+    let resource = args.get("resource_id").and_then(|v| v.as_str());
+    let matched = focus
+        .iter()
+        .find(|f| resource.is_some_and(|id| id == f.resource_id));
+    let chosen = matched.or_else(|| (focus.len() == 1).then(|| &focus[0]));
+    if let Some(finding) = chosen {
+        args["finding_id"] = json!(finding.id);
+    }
+    args
 }
 
 fn clamp(name: &str, mut args: Value) -> Value {
@@ -573,8 +604,13 @@ fn tool_defs(execute_auto: bool) -> Value {
         ),
         tool(
             "action_plan",
-            "Plan a remediation. Does not run it.",
-            json!({"type":"object","properties":{"action":{"type":"string"},"params":{"type":"object"},"resource_id":{"type":"string"}},"required":["action"]}),
+            "Plan a remediation. Does not run it. Pass finding_id from the digest.",
+            json!({"type":"object","properties":{"action":{"type":"string"},"params":{"type":"object"},"resource_id":{"type":"string"},"finding_id":{"type":"string"}},"required":["action"]}),
+        ),
+        tool(
+            "action_status",
+            "Read one run. Says whether its finding is resolved, still open, or the approval is still waiting.",
+            json!({"type":"object","properties":{"run_id":{"type":"string"}},"required":["run_id"]}),
         ),
         tool(
             "escalate",
@@ -614,6 +650,7 @@ mod tests {
         changes: Value,
         calls: Vec<String>,
         plan_tier: &'static str,
+        plan_args: Vec<Value>,
     }
 
     impl Tools for FakeTools {
@@ -626,13 +663,22 @@ mod tests {
                 "memory_note" => Ok(
                     json!({"id": "n1", "text": args.get("text").cloned().unwrap_or(Value::Null)}),
                 ),
-                "action_plan" => Ok(json!({
-                    "plan_id": "p1",
-                    "run_id": "p1",
-                    "tier": self.plan_tier,
-                    "status": "planned"
-                })),
+                "action_plan" => {
+                    self.plan_args.push(args);
+                    Ok(json!({
+                        "plan_id": "p1",
+                        "run_id": "p1",
+                        "tier": self.plan_tier,
+                        "status": "planned"
+                    }))
+                }
                 "action_execute" => Ok(json!({"status": "succeeded", "id": "p1"})),
+                "action_status" => Ok(json!({
+                    "id": "p1",
+                    "status": "succeeded",
+                    "finding_id": "f1",
+                    "finding_outcome": "still_open"
+                })),
                 "resource_explain" => {
                     Ok(json!({"id": "unit:web1:sshd.service", "health": "failed"}))
                 }
@@ -720,6 +766,7 @@ mod tests {
             changes: json!({"as_of_seq": 1, "changes": []}),
             calls: Vec::new(),
             plan_tier: "approve",
+            plan_args: Vec::new(),
         };
         let mut chat = ScriptChat {
             rounds: vec![],
@@ -739,6 +786,7 @@ mod tests {
             changes: empty_changes(),
             calls: Vec::new(),
             plan_tier: "approve",
+            plan_args: Vec::new(),
         };
         let mut chat = ScriptChat {
             rounds: vec![
@@ -802,6 +850,7 @@ mod tests {
             changes: empty_changes(),
             calls: Vec::new(),
             plan_tier: "approve",
+            plan_args: Vec::new(),
         };
         let mut chat = ScriptChat {
             rounds: vec![
@@ -840,6 +889,7 @@ mod tests {
             changes: empty_changes(),
             calls: Vec::new(),
             plan_tier: "auto",
+            plan_args: Vec::new(),
         };
         let mut chat = ScriptChat {
             rounds: vec![
@@ -877,6 +927,7 @@ mod tests {
             changes: empty_changes(),
             calls: Vec::new(),
             plan_tier: "approve",
+            plan_args: Vec::new(),
         };
         let forever = completion(
             json!([call(
@@ -910,6 +961,7 @@ mod tests {
             changes: empty_changes(),
             calls: Vec::new(),
             plan_tier: "approve",
+            plan_args: Vec::new(),
         };
         let mut chat = ScriptChat {
             rounds: vec![],
@@ -944,6 +996,7 @@ mod tests {
             changes: empty_changes(),
             calls: Vec::new(),
             plan_tier: "approve",
+            plan_args: Vec::new(),
         };
         let mut chat = ScriptChat {
             rounds: vec![completion(json!([]), "quiet")],
@@ -970,6 +1023,7 @@ mod tests {
             changes: empty_changes(),
             calls: Vec::new(),
             plan_tier: "approve",
+            plan_args: Vec::new(),
         };
         let round = completion(json!([]), "seen");
         let mut chat = ScriptChat {
@@ -988,5 +1042,117 @@ mod tests {
         let later = start + Duration::from_secs(11);
         let run = session.tick(&mut tools, &mut chat, later).unwrap().unwrap();
         assert_eq!(run.trigger, "heartbeat");
+    }
+
+    #[test]
+    fn follow_up_reads_the_outcome_after_auto_execute() {
+        let mut config = local_config();
+        config.execute_auto = true;
+        config.heartbeat_secs = 10;
+        let start = Instant::now();
+        let mut session = Session::new(config, start);
+        let mut tools = FakeTools {
+            findings: finding_page(),
+            changes: empty_changes(),
+            calls: Vec::new(),
+            plan_tier: "auto",
+            plan_args: Vec::new(),
+        };
+        let mut chat = ScriptChat {
+            rounds: vec![
+                completion(
+                    json!([
+                        call(
+                            "1",
+                            "action_plan",
+                            json!({
+                                "action": "script.run",
+                                "params": {"script": "/usr/local/lib/pulseblade/hook"},
+                                "resource_id": "unit:web1:sshd.service"
+                            })
+                        ),
+                        call("2", "action_execute", json!({"plan_id": "p1"}))
+                    ]),
+                    "",
+                ),
+                completion(json!([]), "ran"),
+                completion(
+                    json!([call("3", "action_status", json!({"run_id": "p1"}))]),
+                    "",
+                ),
+                completion(json!([]), "finding still open"),
+            ],
+            n: 0,
+            urls: vec![],
+        };
+        let first = session.tick(&mut tools, &mut chat, start).unwrap().unwrap();
+        assert_eq!(first.status, "ok");
+        assert!(tools.calls.iter().any(|c| c == "action_execute"));
+        assert_eq!(
+            tools.plan_args[0]
+                .get("finding_id")
+                .and_then(|v| v.as_str()),
+            Some("f1")
+        );
+        let later = start + Duration::from_secs(11);
+        let second = session.tick(&mut tools, &mut chat, later).unwrap().unwrap();
+        assert_eq!(second.trigger, "heartbeat");
+        assert_eq!(second.status, "ok");
+        assert!(tools.calls.iter().any(|c| c == "action_status"));
+        assert_eq!(
+            tools
+                .calls
+                .iter()
+                .filter(|c| *c == "action_execute")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn action_status_is_available_when_auto_execute_is_off() {
+        let mut session = Session::new(local_config(), Instant::now());
+        let mut tools = FakeTools {
+            findings: finding_page(),
+            changes: empty_changes(),
+            calls: Vec::new(),
+            plan_tier: "approve",
+            plan_args: Vec::new(),
+        };
+        let mut chat = ScriptChat {
+            rounds: vec![
+                completion(
+                    json!([
+                        call(
+                            "1",
+                            "action_plan",
+                            json!({
+                                "action": "systemd.restart",
+                                "resource_id": "unit:web1:sshd.service",
+                                "finding_id": "f-kept"
+                            })
+                        ),
+                        call("2", "action_status", json!({"run_id": "p1"}))
+                    ]),
+                    "",
+                ),
+                completion(json!([]), "waiting"),
+            ],
+            n: 0,
+            urls: vec![],
+        };
+        let run = session
+            .tick(&mut tools, &mut chat, Instant::now())
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.status, "ok");
+        assert!(tools.calls.iter().any(|c| c == "action_status"));
+        assert!(!tools.calls.iter().any(|c| c == "action_execute"));
+        assert_eq!(
+            tools.plan_args[0]
+                .get("finding_id")
+                .and_then(|v| v.as_str()),
+            Some("f-kept")
+        );
     }
 }

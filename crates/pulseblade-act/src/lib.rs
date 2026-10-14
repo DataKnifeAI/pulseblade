@@ -111,6 +111,9 @@ pub struct PlanParams {
     /// Record the run without invoking the command.
     #[serde(default)]
     pub dry_run: bool,
+    /// Finding this plan is for. The run stays tied to it.
+    #[serde(default)]
+    pub finding_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -124,6 +127,9 @@ pub struct PlanResult {
     pub dry_run: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<DateTime<Utc>>,
+    /// Echo of the finding id the caller supplied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -261,6 +267,10 @@ impl Registry {
             Some(id) => clean_resource_id(&id)?,
             None => derived,
         };
+        let finding_id = match req.finding_id {
+            Some(id) => clean_finding_id(&id)?,
+            None => None,
+        };
         let key = match req.idempotency_key {
             Some(k) => clean_key(&k)?,
             None => default_key(&req.action, &params),
@@ -286,6 +296,7 @@ impl Registry {
                 idempotency_key: key,
                 tier,
                 dry_run: req.dry_run,
+                finding_id,
             },
             Utc::now(),
         )?;
@@ -519,6 +530,7 @@ fn plan_of(run: &ActionRun) -> PlanResult {
         status: run.status,
         dry_run: run.dry_run,
         expires_at: run.expires_at,
+        finding_id: run.finding_id.clone(),
     }
 }
 
@@ -918,6 +930,24 @@ fn clean_resource_id(id: &str) -> Result<String, ActError> {
     Ok(id.to_string())
 }
 
+fn clean_finding_id(id: &str) -> Result<Option<String>, ActError> {
+    let id = id.trim();
+    if id.is_empty() {
+        return Ok(None);
+    }
+    let ok = (1..=128).contains(&id.len())
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '-'));
+    if ok {
+        Ok(Some(id.to_string()))
+    } else {
+        Err(ActError::Invalid(
+            "finding_id must be 1-128 characters of [A-Za-z0-9_.:-]".into(),
+        ))
+    }
+}
+
 fn clean_key(key: &str) -> Result<String, ActError> {
     let ok = (1..=128).contains(&key.len())
         && key
@@ -1010,6 +1040,7 @@ mod tests {
                 resource_id: Some("host:h".into()),
                 idempotency_key: None,
                 dry_run,
+                finding_id: None,
             },
         )
         .unwrap()
@@ -1048,6 +1079,7 @@ mod tests {
                     resource_id: Some("unit:h:a.service".into()),
                     idempotency_key: Some("restart-a".into()),
                     dry_run: false,
+                    finding_id: None,
                 },
             )
             .unwrap();
@@ -1128,6 +1160,7 @@ mod tests {
                     resource_id: None,
                     idempotency_key: None,
                     dry_run: false,
+                    finding_id: None,
                 },
             )
             .unwrap();
@@ -1169,6 +1202,7 @@ mod tests {
                     resource_id: None,
                     idempotency_key: None,
                     dry_run: false,
+                    finding_id: None,
                 },
             )
             .unwrap();
@@ -1188,6 +1222,7 @@ mod tests {
                 resource_id: None,
                 idempotency_key: None,
                 dry_run: false,
+                finding_id: None,
             },
         );
         assert!(outside.is_err());
@@ -1242,6 +1277,7 @@ mod tests {
                     resource_id: None,
                     idempotency_key: None,
                     dry_run: false,
+                    finding_id: None,
                 },
             )
             .unwrap();
@@ -1271,6 +1307,7 @@ mod tests {
                     resource_id: None,
                     idempotency_key: None,
                     dry_run: false,
+                    finding_id: None,
                 },
             )
             .unwrap_err();
@@ -1333,6 +1370,7 @@ mod tests {
                     resource_id: None,
                     idempotency_key: None,
                     dry_run: false,
+                    finding_id: None,
                 },
             )
             .unwrap();
@@ -1362,6 +1400,7 @@ mod tests {
                     resource_id: None,
                     idempotency_key: None,
                     dry_run: false,
+                    finding_id: None,
                 },
             )
             .unwrap_err();
@@ -1393,6 +1432,7 @@ mod tests {
                     resource_id: None,
                     idempotency_key: None,
                     dry_run: false,
+                    finding_id: None,
                 },
             )
             .unwrap();
@@ -1405,6 +1445,71 @@ mod tests {
             hits.lock().unwrap().as_slice(),
             ["/apis/apps/v1/namespaces/demo/deployments/api"]
         );
+    }
+
+    #[test]
+    fn plan_keeps_the_finding_and_status_reports_it() {
+        let reg = auto_script(Arc::new(FakeRunner::ok()));
+        let store = Store::open_in_memory().unwrap();
+        let planned = reg
+            .plan(
+                &store,
+                PlanParams {
+                    action: "script.run".into(),
+                    params: json!({"script": "/usr/local/lib/pulseblade/hook"}),
+                    resource_id: Some("host:h".into()),
+                    idempotency_key: Some("tied-f1".into()),
+                    dry_run: true,
+                    finding_id: Some("f1".into()),
+                },
+            )
+            .unwrap();
+        assert_eq!(planned.finding_id.as_deref(), Some("f1"));
+        let done = reg.execute(&store, &planned.plan_id).unwrap();
+        assert_eq!(done.status, ActionRunStatus::Succeeded);
+        assert_eq!(
+            done.finding_outcome,
+            Some(pulseblade_core::FindingOutcome::StillOpen)
+        );
+        let again = reg.status(&store, &done.id).unwrap();
+        assert_eq!(again.finding_id.as_deref(), Some("f1"));
+        assert_eq!(
+            again.finding_outcome,
+            Some(pulseblade_core::FindingOutcome::StillOpen)
+        );
+
+        let waiting = reg
+            .plan(
+                &store,
+                PlanParams {
+                    action: "systemd.restart".into(),
+                    params: json!({"unit": "a.service"}),
+                    resource_id: Some("unit:h:a.service".into()),
+                    idempotency_key: Some("tied-wait".into()),
+                    dry_run: false,
+                    finding_id: Some("f1".into()),
+                },
+            )
+            .unwrap();
+        let held = reg.execute(&store, &waiting.plan_id).unwrap();
+        assert_eq!(held.status, ActionRunStatus::AwaitingApproval);
+        assert_eq!(
+            held.finding_outcome,
+            Some(pulseblade_core::FindingOutcome::Waiting)
+        );
+
+        let bad = reg.plan(
+            &store,
+            PlanParams {
+                action: "script.run".into(),
+                params: json!({"script": "/usr/local/lib/pulseblade/hook"}),
+                resource_id: Some("host:h".into()),
+                idempotency_key: Some("bad-finding".into()),
+                dry_run: true,
+                finding_id: Some("not a finding".into()),
+            },
+        );
+        assert!(bad.is_err());
     }
 
     #[test]

@@ -1,7 +1,9 @@
 //! Action runs and the hash-chained audit log (M3).
 
 use chrono::{DateTime, Utc};
-use pulseblade_core::{ActionRun, ActionRunStatus, RiskTier};
+use pulseblade_core::{
+    ActionRun, ActionRunStatus, FindingOutcome, FindingStatus, Health, RiskTier,
+};
 use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -10,6 +12,9 @@ use crate::sql::{SqlExt, SqlVal};
 use crate::{from_ms, Store, StoreError};
 
 const GENESIS: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+const ACTION_COLS: &str = "id, action, resource_id, params, idempotency_key, tier, status, dry_run,
+                    output, created_at, updated_at, expires_at, finding_id";
 
 /// Status change applied together with one audit event.
 pub struct ActionTransition<'a> {
@@ -28,19 +33,19 @@ pub struct NewAction {
     pub idempotency_key: String,
     pub tier: RiskTier,
     pub dry_run: bool,
+    pub finding_id: Option<String>,
 }
 
 impl Store {
     /// An in-flight run with this idempotency key, if one exists.
     pub fn open_action_by_key(&self, key: &str) -> crate::Result<Option<ActionRun>> {
         let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT id, action, resource_id, params, idempotency_key, tier, status, dry_run,
-                    output, created_at, updated_at, expires_at
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {ACTION_COLS}
              FROM action_runs
              WHERE idempotency_key = ?1 AND status IN ('planned', 'awaiting_approval', 'running')
-             ORDER BY created_at DESC LIMIT 1",
-        )?;
+             ORDER BY created_at DESC LIMIT 1"
+        ))?;
         let mut rows = stmt.query([key])?;
         match rows.next()? {
             Some(row) => Ok(Some(row_to_action(row)??)),
@@ -49,16 +54,17 @@ impl Store {
     }
 
     pub fn action(&self, id: &str) -> crate::Result<Option<ActionRun>> {
-        let conn = self.conn();
-        conn.query_row(
-            "SELECT id, action, resource_id, params, idempotency_key, tier, status, dry_run,
-                    output, created_at, updated_at, expires_at
-             FROM action_runs WHERE id = ?1",
-            [id],
-            row_to_action,
-        )
-        .optional()?
-        .transpose()
+        let run = {
+            let conn = self.conn();
+            conn.query_row(
+                &format!("SELECT {ACTION_COLS} FROM action_runs WHERE id = ?1"),
+                [id],
+                row_to_action,
+            )
+            .optional()?
+            .transpose()?
+        };
+        run.map(|run| self.attach_finding_outcome(run)).transpose()
     }
 
     /// Recent runs, newest first. `resource_id` limits the list to one resource.
@@ -70,21 +76,23 @@ impl Store {
         let limit = limit.clamp(1, 100) as i64;
         let (sql_text, args) = if let Some(id) = resource_id {
             (
-                "SELECT id, action, resource_id, params, idempotency_key, tier, status, dry_run,
-                        output, created_at, updated_at, expires_at
+                format!(
+                    "SELECT {ACTION_COLS}
                  FROM action_runs WHERE resource_id = ?1
-                 ORDER BY created_at DESC LIMIT ?2",
+                 ORDER BY created_at DESC LIMIT ?2"
+                ),
                 vec![SqlVal::text(id), SqlVal::Int(limit)],
             )
         } else {
             (
-                "SELECT id, action, resource_id, params, idempotency_key, tier, status, dry_run,
-                        output, created_at, updated_at, expires_at
-                 FROM action_runs ORDER BY created_at DESC LIMIT ?1",
+                format!("SELECT {ACTION_COLS} FROM action_runs ORDER BY created_at DESC LIMIT ?1"),
                 vec![SqlVal::Int(limit)],
             )
         };
-        self.with_sql(|sql| sql.query(sql_text, &args, map_action))
+        let runs = self.with_sql(|sql| sql.query(&sql_text, &args, map_action))?;
+        runs.into_iter()
+            .map(|run| self.attach_finding_outcome(run))
+            .collect()
     }
 
     pub fn count_actions_since(&self, action: &str, since: DateTime<Utc>) -> crate::Result<u32> {
@@ -119,8 +127,8 @@ impl Store {
             tx.execute(
                 "INSERT INTO action_runs
                 (id, action, resource_id, params, idempotency_key, tier, status, dry_run,
-                 output, created_at, updated_at, expires_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'planned', ?7, NULL, ?8, ?8, NULL)",
+                 output, created_at, updated_at, expires_at, finding_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'planned', ?7, NULL, ?8, ?8, NULL, ?9)",
                 params![
                     id,
                     draft.action,
@@ -130,6 +138,7 @@ impl Store {
                     tier_str(draft.tier),
                     i64::from(draft.dry_run),
                     ms,
+                    draft.finding_id,
                 ],
             )?;
             let payload = json!({
@@ -137,6 +146,7 @@ impl Store {
                 "run_id": id,
                 "action": draft.action,
                 "resource_id": draft.resource_id,
+                "finding_id": draft.finding_id,
                 "status": "planned",
                 "tier": tier_str(draft.tier),
                 "dry_run": draft.dry_run,
@@ -266,9 +276,7 @@ impl Store {
 
 fn load_in(conn: &rusqlite::Connection, id: &str) -> crate::Result<ActionRun> {
     conn.query_row(
-        "SELECT id, action, resource_id, params, idempotency_key, tier, status, dry_run,
-                output, created_at, updated_at, expires_at
-         FROM action_runs WHERE id = ?1",
+        &format!("SELECT {ACTION_COLS} FROM action_runs WHERE id = ?1"),
         [id],
         row_to_action,
     )
@@ -369,6 +377,8 @@ fn map_action(row: &dyn crate::sql::SqlRow) -> crate::Result<ActionRun> {
         dry_run: row.int(7)? != 0,
         expires_at: row.opt_int(11)?.map(from_ms),
         output: row.opt_text(8)?,
+        finding_id: row.opt_text(12)?,
+        finding_outcome: None,
     })
 }
 
@@ -391,8 +401,67 @@ fn row_to_action(row: &rusqlite::Row<'_>) -> rusqlite::Result<crate::Result<Acti
             dry_run: row.get::<_, i64>(7)? != 0,
             expires_at: expires.map(from_ms),
             output: row.get(8)?,
+            finding_id: row.get(12)?,
+            finding_outcome: None,
         })
     })())
+}
+
+impl Store {
+    /// Recent runs on one resource, including plans the hub routed elsewhere.
+    pub fn actions_for_resource(
+        &self,
+        resource_id: &str,
+        limit: usize,
+    ) -> crate::Result<Vec<ActionRun>> {
+        let mut runs = self.recent_actions(Some(resource_id), limit)?;
+        for mut run in self.routed_actions(resource_id)? {
+            if runs.iter().any(|have| have.id == run.id) {
+                continue;
+            }
+            // The cached body is from execute time. Recompute against current health.
+            run.finding_outcome = None;
+            runs.push(self.attach_finding_outcome(run)?);
+        }
+        runs.truncate(limit);
+        Ok(runs)
+    }
+
+    /// Fill `finding_outcome` from the finding row, or from resource health when
+    /// this store does not have that finding (a hub reading a node-opened id).
+    pub fn attach_finding_outcome(&self, mut run: ActionRun) -> crate::Result<ActionRun> {
+        let Some(fid) = run.finding_id.clone().filter(|id| !id.is_empty()) else {
+            run.finding_outcome = None;
+            return Ok(run);
+        };
+        run.finding_outcome = Some(self.outcome_for(&fid, &run.resource_id, run.status)?);
+        Ok(run)
+    }
+
+    fn outcome_for(
+        &self,
+        finding_id: &str,
+        resource_id: &str,
+        status: ActionRunStatus,
+    ) -> crate::Result<FindingOutcome> {
+        if status == ActionRunStatus::AwaitingApproval {
+            return Ok(FindingOutcome::Waiting);
+        }
+        if let Some(finding) = self.finding(finding_id)? {
+            return Ok(match finding.status {
+                FindingStatus::Resolved => FindingOutcome::Resolved,
+                FindingStatus::Open | FindingStatus::Acked => FindingOutcome::StillOpen,
+            });
+        }
+        let Some(row) = self.resource(resource_id)? else {
+            return Ok(FindingOutcome::StillOpen);
+        };
+        if !row.present || row.resource.health == Health::Ok {
+            Ok(FindingOutcome::Resolved)
+        } else {
+            Ok(FindingOutcome::StillOpen)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -408,6 +477,7 @@ mod tests {
             idempotency_key: key.into(),
             tier: RiskTier::Auto,
             dry_run: false,
+            finding_id: None,
         }
     }
 
@@ -438,5 +508,107 @@ mod tests {
             )
             .unwrap();
         assert!(store.verify_audit().is_err());
+    }
+
+    #[test]
+    fn outcome_is_waiting_then_open_then_resolved() {
+        use pulseblade_core::{Health, Observation, Resource, ResourceKind, Severity};
+
+        let store = Store::open_in_memory().unwrap();
+        let now = Utc::now();
+        let opened = store
+            .reconcile_findings(
+                &[crate::FindingDraft {
+                    dedupe_key: "health\u{0}unit:h:a.service".into(),
+                    resource_id: "unit:h:a.service".into(),
+                    rule: "health".into(),
+                    severity: Severity::Critical,
+                    summary: "a.service is failed".into(),
+                    context: vec![],
+                    logs: vec![],
+                }],
+                now,
+            )
+            .unwrap();
+        let finding_id = opened[0].id.clone();
+        let mut tied = draft("tied");
+        tied.finding_id = Some(finding_id.clone());
+        tied.resource_id = "unit:h:a.service".into();
+        let run = store.insert_action(&tied, now).unwrap();
+        assert_eq!(run.finding_id.as_deref(), Some(finding_id.as_str()));
+        assert_eq!(run.finding_outcome, Some(FindingOutcome::StillOpen));
+
+        let waiting = store
+            .transition_action(
+                &run.id,
+                ActionTransition {
+                    from: ActionRunStatus::Planned,
+                    to: ActionRunStatus::AwaitingApproval,
+                    output: None,
+                    expires_at: Some(now + chrono::Duration::hours(1)),
+                    event: "execute",
+                },
+            )
+            .unwrap();
+        assert_eq!(waiting.finding_outcome, Some(FindingOutcome::Waiting));
+
+        let done = store
+            .transition_action(
+                &run.id,
+                ActionTransition {
+                    from: ActionRunStatus::AwaitingApproval,
+                    to: ActionRunStatus::Succeeded,
+                    output: Some("ok"),
+                    expires_at: None,
+                    event: "finish",
+                },
+            )
+            .unwrap();
+        assert_eq!(done.finding_outcome, Some(FindingOutcome::StillOpen));
+
+        store.reconcile_findings(&[], now).unwrap();
+        let later = store.action(&run.id).unwrap().unwrap();
+        assert_eq!(later.finding_outcome, Some(FindingOutcome::Resolved));
+
+        store
+            .apply(
+                "k8s",
+                now,
+                &Observation {
+                    resources: vec![Resource::new(
+                        "workload:demo:ns:deployment:api",
+                        ResourceKind::Workload,
+                        "api",
+                    )
+                    .health(Health::Failed)],
+                    samples: vec![],
+                    logs: vec![],
+                },
+            )
+            .unwrap();
+        let mut other = draft("health-only");
+        other.finding_id = Some("f-missing".into());
+        other.resource_id = "workload:demo:ns:deployment:api".into();
+        other.idempotency_key = "health-only".into();
+        let proxied = store.insert_action(&other, now).unwrap();
+        assert_eq!(proxied.finding_outcome, Some(FindingOutcome::StillOpen));
+        store
+            .apply(
+                "k8s",
+                now,
+                &Observation {
+                    resources: vec![Resource::new(
+                        "workload:demo:ns:deployment:api",
+                        ResourceKind::Workload,
+                        "api",
+                    )
+                    .health(Health::Ok)],
+                    samples: vec![],
+                    logs: vec![],
+                },
+            )
+            .unwrap();
+        let cleared = store.action(&proxied.id).unwrap().unwrap();
+        assert_eq!(cleared.finding_outcome, Some(FindingOutcome::Resolved));
     }
 }

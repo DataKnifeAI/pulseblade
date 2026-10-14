@@ -488,7 +488,8 @@ impl Store {
         };
         store.with_sql(|sql| {
             sql.batch(PG_SCHEMA)?;
-            crate::ensure_sample_count(sql)
+            crate::ensure_sample_count(sql)?;
+            crate::ensure_later_columns(sql)
         })?;
         Ok(store)
     }
@@ -649,7 +650,8 @@ CREATE TABLE IF NOT EXISTS action_runs (
     output           TEXT,
     created_at       BIGINT NOT NULL,
     updated_at       BIGINT NOT NULL,
-    expires_at       BIGINT
+    expires_at       BIGINT,
+    finding_id       TEXT
 );
 CREATE INDEX IF NOT EXISTS action_runs_key ON action_runs(idempotency_key, status);
 CREATE INDEX IF NOT EXISTS action_runs_resource ON action_runs(resource_id, created_at);
@@ -701,9 +703,12 @@ CREATE TABLE IF NOT EXISTS route_rpc (
 CREATE INDEX IF NOT EXISTS route_rpc_node ON route_rpc(node_id, status);
 
 CREATE TABLE IF NOT EXISTS route_plans (
-    plan_id TEXT PRIMARY KEY,
-    node_id TEXT NOT NULL
+    plan_id     TEXT PRIMARY KEY,
+    node_id     TEXT NOT NULL,
+    finding_id  TEXT,
+    resource_id TEXT
 );
+CREATE INDEX IF NOT EXISTS route_plans_resource ON route_plans(resource_id);
 
 CREATE TABLE IF NOT EXISTS route_results (
     id      TEXT PRIMARY KEY,

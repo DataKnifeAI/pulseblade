@@ -498,6 +498,18 @@ impl FromStr for ActionRunStatus {
     }
 }
 
+/// What a later read of an action run can say about the finding it was planned for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FindingOutcome {
+    /// The finding has been resolved.
+    Resolved,
+    /// The finding is still open (or acknowledged, but not cleared).
+    StillOpen,
+    /// Execute left the run waiting for a human.
+    Waiting,
+}
+
 /// One planned or executed action, recorded in the audit chain (M3).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ActionRun {
@@ -515,6 +527,12 @@ pub struct ActionRun {
     pub expires_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<String>,
+    /// Set when the caller planned this run for a finding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id: Option<String>,
+    /// Resolved, still open, or waiting on approval. Absent when no finding was supplied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_outcome: Option<FindingOutcome>,
 }
 
 /// Free-form memory attached to a resource by an agent or human (M2).

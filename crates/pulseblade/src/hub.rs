@@ -77,6 +77,18 @@ impl HubInner {
             }
         }
     }
+
+    fn annotate_run(
+        &self,
+        run: pulseblade_core::ActionRun,
+    ) -> Result<pulseblade_core::ActionRun, StoreError> {
+        let remembered = self.store.plan_finding(&run.id)?;
+        let run = remember_finding(run, remembered);
+        if run.finding_outcome.is_some() {
+            return Ok(run);
+        }
+        self.store.attach_finding_outcome(run)
+    }
 }
 
 impl ActionRoute for HubInner {
@@ -84,16 +96,26 @@ impl ActionRoute for HubInner {
         &self,
         params: pulseblade_act::PlanParams,
     ) -> Result<pulseblade_act::PlanResult, String> {
-        let node = route_node(params.resource_id.as_deref(), &self.tokens)?;
+        let finding_id = params.finding_id.clone();
+        let resource_id = params.resource_id.clone();
+        let node = route_node(&self.store, params.resource_id.as_deref(), &self.tokens)?;
         let value = self.call(
             &node,
             "plan",
             serde_json::to_value(&params).map_err(|e| e.to_string())?,
         )?;
-        let planned: pulseblade_act::PlanResult =
+        let mut planned: pulseblade_act::PlanResult =
             serde_json::from_value(value).map_err(|e| e.to_string())?;
+        if planned.finding_id.is_none() {
+            planned.finding_id = finding_id;
+        }
         self.store
-            .remember_plan(&planned.plan_id, &node)
+            .remember_plan(
+                &planned.plan_id,
+                &node,
+                planned.finding_id.as_deref(),
+                resource_id.as_deref(),
+            )
             .map_err(|e| e.to_string())?;
         Ok(planned)
     }
@@ -113,9 +135,11 @@ impl ActionRoute for HubInner {
             serde_json::to_value(&params).map_err(|e| e.to_string())?,
         )?;
         let run: pulseblade_core::ActionRun =
-            serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+            serde_json::from_value(value).map_err(|e| e.to_string())?;
+        let run = self.annotate_run(run).map_err(|e| e.to_string())?;
+        let body = serde_json::to_value(&run).map_err(|e| e.to_string())?;
         self.store
-            .cache_run(&run.id, &node, &value)
+            .cache_run(&run.id, &node, &body)
             .map_err(|e| e.to_string())?;
         Ok(run)
     }
@@ -124,34 +148,109 @@ impl ActionRoute for HubInner {
         &self,
         params: pulseblade_act::StatusParams,
     ) -> Result<pulseblade_core::ActionRun, String> {
-        if let Some((_, body)) = self
+        let tied = self
             .store
-            .cached_run(&params.run_id)
-            .map_err(|e| e.to_string())?
-        {
-            return serde_json::from_value(body).map_err(|e| e.to_string());
+            .plan_finding(&params.run_id)
+            .map_err(|e| e.to_string())?;
+        // A finished run's output does not change. A finding tied to it does:
+        // approval can still be waiting, then the finding can clear.
+        if tied.is_none() {
+            if let Some((_, body)) = self
+                .store
+                .cached_run(&params.run_id)
+                .map_err(|e| e.to_string())?
+            {
+                return serde_json::from_value(body).map_err(|e| e.to_string());
+            }
         }
         let node = self
             .store
             .plan_node(&params.run_id)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("unknown run {}", params.run_id))?;
-        let value = self.call(
+        match self.call(
             &node,
             "status",
             serde_json::to_value(&params).map_err(|e| e.to_string())?,
-        )?;
-        serde_json::from_value(value).map_err(|e| e.to_string())
+        ) {
+            Ok(value) => {
+                let run: pulseblade_core::ActionRun =
+                    serde_json::from_value(value).map_err(|e| e.to_string())?;
+                let run = self.annotate_run(run).map_err(|e| e.to_string())?;
+                let body = serde_json::to_value(&run).map_err(|e| e.to_string())?;
+                self.store
+                    .cache_run(&run.id, &node, &body)
+                    .map_err(|e| e.to_string())?;
+                Ok(run)
+            }
+            Err(err) => {
+                if let Some((_, body)) = self
+                    .store
+                    .cached_run(&params.run_id)
+                    .map_err(|e| e.to_string())?
+                {
+                    let run: pulseblade_core::ActionRun =
+                        serde_json::from_value(body).map_err(|e| e.to_string())?;
+                    let mut run = remember_finding(run, tied);
+                    run.finding_outcome = None;
+                    return self
+                        .store
+                        .attach_finding_outcome(run)
+                        .map_err(|e| e.to_string());
+                }
+                Err(err)
+            }
+        }
     }
 }
 
-fn route_node(resource_id: Option<&str>, tokens: &[(String, String)]) -> Result<String, String> {
+/// Keep a node-computed outcome. Fill the finding id the hub remembered, and
+/// compute the outcome here when the node did not (an older node drops the field).
+fn remember_finding(
+    mut run: pulseblade_core::ActionRun,
+    finding_id: Option<String>,
+) -> pulseblade_core::ActionRun {
+    if run.finding_id.as_ref().is_none_or(|id| id.is_empty()) {
+        run.finding_id = finding_id.filter(|id| !id.is_empty());
+    }
+    run
+}
+
+fn route_node(
+    store: &Store,
+    resource_id: Option<&str>,
+    tokens: &[(String, String)],
+) -> Result<String, String> {
     let id = resource_id.ok_or("resource_id is required so the hub can route to a node")?;
-    let host = host_of_id(id).ok_or_else(|| format!("resource id `{id}` has no host"))?;
-    if tokens.iter().any(|(node, _)| node == host) {
-        Ok(host.to_string())
+    let host = host_of_id(id).unwrap_or("");
+    // `unit:<node>:…` puts the enrolled node in the second segment.
+    // `workload:<cluster>:…` and `pod:<cluster>:…` put the cluster there.
+    if !host.is_empty() && tokens.iter().any(|(node, _)| node == host) {
+        return Ok(host.to_string());
+    }
+    let row = store.resource(id).map_err(|e| e.to_string())?;
+    if let Some(owner) = row.as_ref().and_then(|row| owner_node(&row.source)) {
+        if tokens.iter().any(|(node, _)| node == owner) {
+            return Ok(owner.to_string());
+        }
+        return Err(format!(
+            "resource `{id}` was reported by {owner}, which is not enrolled"
+        ));
+    }
+    if host.is_empty() {
+        Err(format!("resource id `{id}` has no host"))
     } else {
         Err(format!("no enrolled node named {host}"))
+    }
+}
+
+/// Hub ingest records the pusher as `node:<id>`.
+fn owner_node(source: &str) -> Option<&str> {
+    let id = source.strip_prefix("node:")?;
+    if id.is_empty() {
+        None
+    } else {
+        Some(id)
     }
 }
 
@@ -853,6 +952,43 @@ mod tests {
     use std::thread::JoinHandle;
 
     #[test]
+    fn workload_routes_to_the_node_that_reported_it() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .ingest_node(
+                "web1",
+                &NodeBatch {
+                    changes: vec![pulseblade_core::Change {
+                        seq: 1,
+                        ts: chrono::Utc::now(),
+                        resource_id: "workload:demo:ns:deployment:api".into(),
+                        kind: pulseblade_core::ChangeKind::Appeared,
+                        field: None,
+                        before: None,
+                        after: None,
+                    }],
+                    resources: vec![Resource::new(
+                        "workload:demo:ns:deployment:api",
+                        ResourceKind::Workload,
+                        "api",
+                    )
+                    .health(Health::Failed)],
+                    ..NodeBatch::default()
+                },
+            )
+            .unwrap();
+        let tokens = [("web1".to_string(), "t".to_string())];
+        let node = route_node(&store, Some("workload:demo:ns:deployment:api"), &tokens).unwrap();
+        assert_eq!(node, "web1");
+        let pod = route_node(&store, Some("pod:demo:ns:api-0"), &tokens);
+        assert!(pod.unwrap_err().contains("no enrolled node named demo"));
+        assert_eq!(
+            route_node(&store, Some("unit:web1:sshd.service"), &tokens).unwrap(),
+            "web1"
+        );
+    }
+
+    #[test]
     fn hub_client_timeout_outlasts_the_long_poll() {
         // Nodes poll every 5s. The old deadline was poll_secs + 5 (10s), which
         // expired while a push sat in the hub SQLite queue.
@@ -1094,6 +1230,7 @@ mod tests {
                 resource_id: Some("unit:web1:sshd.service".into()),
                 idempotency_key: None,
                 dry_run: false,
+                finding_id: None,
             })
             .unwrap();
         assert_eq!(waiting.tier, RiskTier::Approve);
@@ -1112,6 +1249,7 @@ mod tests {
                 resource_id: Some("unit:web2:sshd.service".into()),
                 idempotency_key: None,
                 dry_run: false,
+                finding_id: None,
             })
             .unwrap();
         assert_eq!(go.tier, RiskTier::Auto);

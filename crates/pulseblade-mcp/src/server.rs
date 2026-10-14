@@ -62,7 +62,9 @@ memory_search for notes on a resource.
 5. actions_list shows node-local remediation and its risk tier. action_plan does not run \
 anything. action_execute runs `auto` immediately, leaves `approve` waiting for a human \
 (`pulseblade ctl approve` or POST /api/v1/actions/{id}/approve), and rejects `deny`. \
-action_status reads the run. Pass dry_run to plan when you only want the audit record. \
+action_status reads the run and says whether its finding is resolved, still open, \
+or the approval is still waiting. Pass finding_id to action_plan to tie the run to one. \
+Pass dry_run to plan when you only want the audit record. \
 On a hub, those action calls are routed to the node that owns the resource; that node \
 applies its own tier. fleet_overview groups the fleet by role, cluster, criticality, and \
 host: unhealthy resources in full, everything else as counts.
@@ -305,7 +307,7 @@ impl PulsebladeServer {
     }
 
     #[tool(
-        description = "Plan a remediation. Returns plan_id (also the run_id) and the risk tier. Does not run the command. dry_run records a plan that execute will not invoke. Repeating an idempotency key returns the in-flight run.",
+        description = "Plan a remediation. Returns plan_id (also the run_id) and the risk tier. Does not run the command. Pass finding_id to tie the run to a finding. dry_run records a plan that execute will not invoke. Repeating an idempotency key returns the in-flight run.",
         annotations(
             title = "Plan action",
             read_only_hint = false,
@@ -362,7 +364,7 @@ impl PulsebladeServer {
     }
 
     #[tool(
-        description = "Status of one action run, including output when it has finished. Expired approvals are marked here.",
+        description = "Status of one action run, including output when it has finished. When the plan carried a finding_id, also says whether that finding is resolved, still open, or the approval is still waiting. Expired approvals are marked here.",
         annotations(title = "Action status", read_only_hint = true)
     )]
     async fn action_status(
@@ -1041,6 +1043,7 @@ mod tests {
                     resource_id: Some("host:h".into()),
                     idempotency_key: None,
                     dry_run: true,
+                    finding_id: None,
                 },
             )
             .unwrap();
@@ -1061,6 +1064,7 @@ mod tests {
                     resource_id: Some("unit:h:a.service".into()),
                     idempotency_key: Some("restart-a".into()),
                     dry_run: false,
+                    finding_id: None,
                 },
             )
             .unwrap();

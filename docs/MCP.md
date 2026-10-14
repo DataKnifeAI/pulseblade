@@ -19,9 +19,9 @@ The cheap agent loop is: summary snapshot, remember `as_of_seq`, poll `changes_s
 | `memory_note` / `memory_search` | Attach a short note, or search notes by substring |
 | `logs_query` | Recent error lines for one resource (default 1h, capped) |
 | `actions_list` | Built-in remediations with risk tier, parameter schema, preconditions, and rate limit |
-| `action_plan` | Plan a run. Returns `plan_id` (same as `run_id`) and the tier. Does not execute |
+| `action_plan` | Plan a run. Optional `finding_id` ties it to a finding. Returns `plan_id` (same as `run_id`) and the tier. Does not execute |
 | `action_execute` | `auto` runs now; `approve` waits; `deny` is rejected. A finished run is not repeated |
-| `action_status` | One run, including output when it has finished |
+| `action_status` | One run, including output when it has finished, and whether its finding is resolved, still open, or the approval is still waiting |
 
 MCP resources `pulseblade://state` and `pulseblade://findings` notify subscribers when the journal or the open-findings set changes.
 

@@ -809,14 +809,66 @@ impl Store {
         Ok(n == 1)
     }
 
-    pub fn remember_plan(&self, plan_id: &str, node_id: &str) -> crate::Result<()> {
+    pub fn remember_plan(
+        &self,
+        plan_id: &str,
+        node_id: &str,
+        finding_id: Option<&str>,
+        resource_id: Option<&str>,
+    ) -> crate::Result<()> {
         self.with_sql(|sql| {
             sql.execute(
-                "INSERT INTO route_plans (plan_id, node_id) VALUES (?1, ?2)
-                 ON CONFLICT(plan_id) DO UPDATE SET node_id = excluded.node_id",
-                &[SqlVal::text(plan_id), SqlVal::text(node_id)],
+                "INSERT INTO route_plans (plan_id, node_id, finding_id, resource_id)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(plan_id) DO UPDATE SET
+                    node_id = excluded.node_id,
+                    finding_id = COALESCE(excluded.finding_id, route_plans.finding_id),
+                    resource_id = COALESCE(excluded.resource_id, route_plans.resource_id)",
+                &[
+                    SqlVal::text(plan_id),
+                    SqlVal::text(node_id),
+                    SqlVal::opt_text(finding_id.map(str::to_string)),
+                    SqlVal::opt_text(resource_id.map(str::to_string)),
+                ],
             )?;
             Ok(())
+        })
+    }
+
+    /// Finding id the hub stored for a routed plan, if the caller supplied one.
+    pub fn plan_finding(&self, plan_id: &str) -> crate::Result<Option<String>> {
+        let id = self.with_sql(|sql| {
+            sql.query_opt(
+                "SELECT finding_id FROM route_plans WHERE plan_id = ?1",
+                &[SqlVal::text(plan_id)],
+                |row| row.opt_text(0),
+            )
+        })?;
+        Ok(id.flatten().filter(|s| !s.is_empty()))
+    }
+
+    /// Cached runs the hub routed for one resource. Outcome is left as stored.
+    pub fn routed_actions(
+        &self,
+        resource_id: &str,
+    ) -> crate::Result<Vec<pulseblade_core::ActionRun>> {
+        self.with_sql(|sql| {
+            let rows = sql.query(
+                "SELECT r.body, p.finding_id FROM route_results r
+                 JOIN route_plans p ON p.plan_id = r.id
+                 WHERE p.resource_id = ?1",
+                &[SqlVal::text(resource_id)],
+                |row| Ok((row.text(0)?, row.opt_text(1)?)),
+            )?;
+            let mut out = Vec::new();
+            for (body, finding_id) in rows {
+                let mut run: pulseblade_core::ActionRun = serde_json::from_str(&body)?;
+                if run.finding_id.as_ref().is_none_or(|id| id.is_empty()) {
+                    run.finding_id = finding_id.filter(|id| !id.is_empty());
+                }
+                out.push(run);
+            }
+            Ok(out)
         })
     }
 

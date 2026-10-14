@@ -174,7 +174,8 @@ CREATE TABLE IF NOT EXISTS action_runs (
     output           TEXT,
     created_at       INTEGER NOT NULL,
     updated_at       INTEGER NOT NULL,
-    expires_at       INTEGER
+    expires_at       INTEGER,
+    finding_id       TEXT
 );
 CREATE INDEX IF NOT EXISTS action_runs_key ON action_runs(idempotency_key, status);
 CREATE INDEX IF NOT EXISTS action_runs_resource ON action_runs(resource_id, created_at);
@@ -226,9 +227,12 @@ CREATE TABLE IF NOT EXISTS route_rpc (
 CREATE INDEX IF NOT EXISTS route_rpc_node ON route_rpc(node_id, status);
 
 CREATE TABLE IF NOT EXISTS route_plans (
-    plan_id TEXT PRIMARY KEY,
-    node_id TEXT NOT NULL
+    plan_id     TEXT PRIMARY KEY,
+    node_id     TEXT NOT NULL,
+    finding_id  TEXT,
+    resource_id TEXT
 );
+CREATE INDEX IF NOT EXISTS route_plans_resource ON route_plans(resource_id);
 
 CREATE TABLE IF NOT EXISTS route_results (
     id      TEXT PRIMARY KEY,
@@ -333,6 +337,7 @@ impl Store {
         {
             let mut sql = sql::SqliteSql { conn: &conn };
             ensure_sample_count(&mut sql)?;
+            ensure_later_columns(&mut sql)?;
         }
         Ok(Self {
             backend: sql::Backend::Sqlite {
@@ -362,6 +367,42 @@ fn ensure_cursor_columns(conn: &Connection) -> Result<()> {
                 [],
             )?;
         }
+    }
+    Ok(())
+}
+
+/// Columns added after the first schema. `CREATE TABLE IF NOT EXISTS` does not
+/// alter a table that already exists.
+pub(crate) fn ensure_later_columns(sql: &mut dyn sql::Sql) -> Result<()> {
+    ensure_column(sql, "action_runs", "finding_id", "TEXT")?;
+    ensure_column(sql, "route_plans", "finding_id", "TEXT")?;
+    ensure_column(sql, "route_plans", "resource_id", "TEXT")?;
+    sql.execute(
+        "CREATE INDEX IF NOT EXISTS route_plans_resource ON route_plans(resource_id)",
+        &[],
+    )?;
+    Ok(())
+}
+
+fn ensure_column(sql: &mut dyn sql::Sql, table: &str, column: &str, ddl: &str) -> Result<()> {
+    let present = if sql.postgres() {
+        sql.query_one(
+            "SELECT COUNT(*) FROM information_schema.columns
+             WHERE table_schema = current_schema() AND table_name = ?1 AND column_name = ?2",
+            &[SqlVal::text(table), SqlVal::text(column)],
+            |row| row.int(0),
+        )? > 0
+    } else {
+        let names = sql.query(&format!("PRAGMA table_info({table})"), &[], |row| {
+            row.text(1)
+        })?;
+        names.iter().any(|name| name == column)
+    };
+    if !present {
+        sql.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {ddl}"),
+            &[],
+        )?;
     }
     Ok(())
 }

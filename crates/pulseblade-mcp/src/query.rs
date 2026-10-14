@@ -641,7 +641,7 @@ pub fn explain(store: &Store, p: ExplainParams) -> Result<Explanation> {
         .take(5)
         .map(|f| finding_view(f, true))
         .collect();
-    let actions = store.recent_actions(Some(&p.id), 8)?;
+    let actions = store.actions_for_resource(&p.id, 8)?;
 
     Ok(Explanation {
         as_of_seq,
