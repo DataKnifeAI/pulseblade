@@ -1138,6 +1138,43 @@ mod tests {
     }
 
     #[test]
+    fn old_route_plans_gain_finding_columns() {
+        let path = std::env::temp_dir().join(format!(
+            "pulseblade-plans-migrate-{}-{}.db",
+            std::process::id(),
+            Utc::now().timestamp_millis()
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE route_plans (
+                    plan_id TEXT PRIMARY KEY,
+                    node_id TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        store
+            .remember_plan(
+                "p1",
+                "web1",
+                Some("f1"),
+                Some("workload:demo:ns:deployment:api"),
+            )
+            .unwrap();
+        assert_eq!(store.plan_node("p1").unwrap().as_deref(), Some("web1"));
+        assert_eq!(store.plan_finding("p1").unwrap().as_deref(), Some("f1"));
+        drop(store);
+        for suffix in ["", "-wal", "-shm"] {
+            let mut sidecar = path.clone().into_os_string();
+            sidecar.push(suffix);
+            let _ = std::fs::remove_file(sidecar);
+        }
+    }
+
+    #[test]
     fn old_cursor_table_gains_last_push() {
         let path = std::env::temp_dir().join(format!(
             "pulseblade-cursor-migrate-{}-{}.db",

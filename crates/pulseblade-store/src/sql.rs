@@ -708,7 +708,6 @@ CREATE TABLE IF NOT EXISTS route_plans (
     finding_id  TEXT,
     resource_id TEXT
 );
-CREATE INDEX IF NOT EXISTS route_plans_resource ON route_plans(resource_id);
 
 CREATE TABLE IF NOT EXISTS route_results (
     id      TEXT PRIMARY KEY,
