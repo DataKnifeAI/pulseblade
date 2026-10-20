@@ -7,8 +7,7 @@
 #     --from-literal=username=pulseblade --from-literal=password="$(openssl rand -base64 24)"
 # Node tokens stay in the pulseblade-hub-tokens Secret (keys are node ids).
 # This file has token env names only. Do not commit secret values.
-# Image is the redesigned dashboard digest, retagged off :poc so prod does
-# not follow the POC tag.
+# Image is digest-pinned off :poc so prod does not follow the POC tag.
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -234,7 +233,7 @@ spec:
         fsGroup: 65532
       containers:
         - name: pulseblade
-          image: harbor.dataknife.net/library/pulseblade:0.1.0@sha256:108d7c67cea5f94d39ce77c7c72ccbf90fdf7c01192d7d29e67604863a4701cb
+          image: harbor.dataknife.net/library/pulseblade:0.1.0@sha256:ce5a6cf5198d17d93726c2bdc3b5d1f0beeca8188035d786b783fd35f7d4482d
           imagePullPolicy: IfNotPresent
           command:
             - pulseblade
