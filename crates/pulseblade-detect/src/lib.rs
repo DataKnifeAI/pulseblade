@@ -215,6 +215,8 @@ fn health_incident(resource: &Resource, severity: Severity) -> Incident {
 }
 
 /// Absolute floor so a tiny, low-variance series does not page on jitter.
+/// `proc.cpu_pct` is not a default anomaly metric; the floor still applies
+/// when a config opts that one-core sample back in.
 fn ewma_floor(metric: &str) -> f64 {
     match metric {
         "cpu.used_pct" | "proc.cpu_pct" => 70.0,
@@ -500,6 +502,52 @@ mod tests {
                 .unwrap();
         }
         assert!(sync(&quiet, &cfg, Utc::now()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn default_anomalies_ignore_one_core_process_cpu() {
+        assert!(!DetectConfig::default()
+            .ewma_metrics
+            .iter()
+            .any(|m| m == "proc.cpu_pct"));
+        assert!(DetectConfig::default()
+            .ewma_metrics
+            .iter()
+            .any(|m| m == "cpu.used_pct"));
+
+        let store = Store::open_in_memory().unwrap();
+        let start = Utc::now() - chrono::Duration::minutes(30);
+        for i in 0..25 {
+            let value = if i == 24 {
+                400.0
+            } else {
+                10.0 + (i % 2) as f64 * 0.2
+            };
+            store
+                .apply(
+                    "processes",
+                    start + chrono::Duration::seconds(i * 15),
+                    &Observation {
+                        resources: vec![Resource::new("proc:h:9", ResourceKind::Process, "game")
+                            .parent("host:h")
+                            .health(Health::Ok)],
+                        samples: vec![Sample::new("proc:h:9", "proc.cpu_pct", value)],
+                        logs: vec![],
+                    },
+                )
+                .unwrap();
+        }
+        assert!(sync(&store, &DetectConfig::default(), Utc::now())
+            .unwrap()
+            .is_empty());
+
+        let opted = DetectConfig {
+            ewma_metrics: vec!["proc.cpu_pct".into()],
+            ewma_min_points: 20,
+            ..DetectConfig::default()
+        };
+        let flagged = sync(&store, &opted, Utc::now()).unwrap();
+        assert!(flagged.iter().any(|f| f.rule == "ewma:proc.cpu_pct"));
     }
 
     #[test]

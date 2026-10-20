@@ -90,7 +90,6 @@ impl Default for DetectConfig {
                 "cpu.used_pct".into(),
                 "mem.used_pct".into(),
                 "disk.used_pct".into(),
-                "proc.cpu_pct".into(),
                 "journal.errors".into(),
             ],
             webhook: String::new(),

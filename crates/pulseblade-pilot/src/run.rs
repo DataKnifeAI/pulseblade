@@ -84,7 +84,12 @@ impl Session {
         let change_list = changes
             .get("changes")
             .and_then(|c| c.as_array())
-            .cloned()
+            .map(|list| {
+                list.iter()
+                    .filter(|c| wakes_pilot(c))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default();
         let elapsed = now
             .checked_duration_since(self.heartbeat_at)
@@ -525,6 +530,31 @@ fn digest(focus: &[OpenFinding], changes: &[Value], notes: &[String], seq: i64) 
         text = text.chars().take(4000).collect();
     }
     text
+}
+
+/// Process start/stop does not wake the pilot, and neither does any process
+/// journal line other than a stored health change. The 50–90% host-share
+/// band is display-only, so it never becomes a health line. Failed and
+/// degraded (memory) still wake, and so does a finding.
+fn wakes_pilot(change: &Value) -> bool {
+    let id = change
+        .get("resource_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if !id.starts_with("proc:") {
+        return true;
+    }
+    let kind = change.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+    if kind == "appeared" || kind == "disappeared" {
+        return false;
+    }
+    if change.get("field").and_then(|v| v.as_str()) != Some("health") {
+        return false;
+    }
+    matches!(
+        change.get("after").and_then(|v| v.as_str()),
+        Some("failed" | "degraded")
+    )
 }
 
 fn seq_of(v: &Value) -> i64 {
@@ -1154,5 +1184,138 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("f-kept")
         );
+    }
+
+    fn quiet_tools(findings: Value, changes: Value) -> FakeTools {
+        FakeTools {
+            findings,
+            changes,
+            calls: Vec::new(),
+            plan_tier: "approve",
+            plan_args: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn process_churn_and_busy_band_do_not_wake() {
+        assert!(!PilotConfig::default().execute_auto);
+        let start = Instant::now();
+        let mut config = local_config();
+        config.heartbeat_secs = 10;
+        assert!(!config.execute_auto);
+        let mut session = Session::new(config, start);
+        let changes = json!({
+            "as_of_seq": 8,
+            "changes": [
+                {"resource_id": "proc:h:1", "kind": "appeared", "after": {"health": "ok"}},
+                {"resource_id": "proc:h:2", "kind": "disappeared"},
+                {"resource_id": "proc:h:3", "kind": "changed", "field": "health", "before": "ok", "after": "ok"},
+                {"resource_id": "proc:h:4", "kind": "changed", "field": "attrs.cmd", "before": "a", "after": "game"}
+            ]
+        });
+        let mut tools = quiet_tools(json!({"as_of_seq": 8, "findings": []}), changes);
+        let mut chat = ScriptChat {
+            rounds: vec![],
+            n: 0,
+            urls: vec![],
+        };
+        assert!(session
+            .tick(&mut tools, &mut chat, start)
+            .unwrap()
+            .is_none());
+        assert!(session
+            .tick(&mut tools, &mut chat, start + Duration::from_secs(11))
+            .unwrap()
+            .is_none());
+        assert!(chat.urls.is_empty());
+        assert!(!tools.calls.iter().any(|c| c == "action_execute"));
+    }
+
+    #[test]
+    fn process_health_failed_still_wakes_without_executing() {
+        let mut session = Session::new(local_config(), Instant::now());
+        let mut tools = quiet_tools(
+            json!({"as_of_seq": 9, "findings": []}),
+            json!({
+                "as_of_seq": 9,
+                "changes": [
+                    {"resource_id": "proc:h:1", "kind": "appeared"},
+                    {
+                        "resource_id": "proc:h:9",
+                        "kind": "changed",
+                        "field": "health",
+                        "before": "ok",
+                        "after": "failed"
+                    }
+                ]
+            }),
+        );
+        let mut chat = ScriptChat {
+            rounds: vec![completion(json!([]), "process is using the host")],
+            n: 0,
+            urls: vec![],
+        };
+        let run = session
+            .tick(&mut tools, &mut chat, Instant::now())
+            .unwrap()
+            .expect("failed process health should wake");
+        assert_eq!(run.trigger, "changes");
+        assert!(!tools.calls.iter().any(|c| c == "action_execute"));
+        assert!(!chat.urls.is_empty());
+    }
+
+    #[test]
+    fn process_memory_degraded_still_wakes() {
+        let mut session = Session::new(local_config(), Instant::now());
+        let mut tools = quiet_tools(
+            json!({"as_of_seq": 3, "findings": []}),
+            json!({
+                "as_of_seq": 3,
+                "changes": [{
+                    "resource_id": "proc:h:4",
+                    "kind": "changed",
+                    "field": "health",
+                    "before": "ok",
+                    "after": "degraded"
+                }]
+            }),
+        );
+        let mut chat = ScriptChat {
+            rounds: vec![completion(json!([]), "memory")],
+            n: 0,
+            urls: vec![],
+        };
+        let run = session
+            .tick(&mut tools, &mut chat, Instant::now())
+            .unwrap()
+            .expect("degraded process memory should wake");
+        assert_eq!(run.trigger, "changes");
+        assert!(!tools.calls.iter().any(|c| c == "action_execute"));
+    }
+
+    #[test]
+    fn finding_wakes_when_the_journal_is_only_process_churn() {
+        let mut session = Session::new(local_config(), Instant::now());
+        let mut tools = quiet_tools(
+            finding_page(),
+            json!({
+                "as_of_seq": 4,
+                "changes": [
+                    {"resource_id": "proc:h:1", "kind": "appeared"},
+                    {"resource_id": "proc:h:1", "kind": "disappeared"}
+                ]
+            }),
+        );
+        let mut chat = ScriptChat {
+            rounds: vec![completion(json!([]), "finding")],
+            n: 0,
+            urls: vec![],
+        };
+        let run = session
+            .tick(&mut tools, &mut chat, Instant::now())
+            .unwrap()
+            .expect("an open finding should wake");
+        assert_eq!(run.trigger, "finding:f1");
+        assert!(!tools.calls.iter().any(|c| c == "action_execute"));
     }
 }

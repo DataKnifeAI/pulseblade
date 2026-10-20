@@ -509,7 +509,16 @@ function reason(r) {
     case "disk": return `${fmt("disk.used_pct", m["disk.used_pct"])} full · ${bytes(m["disk.available_bytes"])} free`;
     case "storage": return `${fmt("storage.used_pct", m["storage.used_pct"])} full${a.kind ? " · " + a.kind : ""}${a.active === false ? " · inactive" : ""}`;
     case "vm": case "container": { const p = r.id.split(":")[0]; return a.status && a.status !== "running" ? a.status : `cpu ${fmt("x_pct", m[p + ".cpu_pct"])} · ${bytes(m[p + ".mem_bytes"])}`; }
-    case "process": return (m["proc.cpu_pct"] > 50 ? `cpu ${fmt("proc.cpu_pct", m["proc.cpu_pct"])}` : `mem ${fmt("proc.mem_pct", m["proc.mem_pct"])} · ${bytes(m["proc.rss_bytes"])}`);
+    case "process": {
+      const share = m["proc.host_cpu_pct"];
+      if (share == null || Number.isNaN(Number(share))) {
+        return m["proc.cpu_pct"] > 50 ? `cpu ${fmt("proc.cpu_pct", m["proc.cpu_pct"])}` : `mem ${fmt("proc.mem_pct", m["proc.mem_pct"])} · ${bytes(m["proc.rss_bytes"])}`;
+      }
+      let text = `${fmt("x_pct", share)} of host`;
+      if (share >= 50 && share < 90 && r.health === "ok") text = `busy · ${text}`;
+      if (m["proc.mem_pct"] >= 25) text += ` · mem ${fmt("proc.mem_pct", m["proc.mem_pct"])}`;
+      return text;
+    }
     case "service": return [a.active, a.sub, a.result].filter(Boolean).join(" · ");
     case "net_iface": return (a.addresses && !a.addresses.length) ? "no address" : `rx ${fmt("net.rx_bytes_per_s", m["net.rx_bytes_per_s"])}`;
     case "host": return `cpu ${fmt("cpu.used_pct", m["cpu.used_pct"])} · mem ${fmt("mem.used_pct", m["mem.used_pct"])}`;
@@ -818,8 +827,9 @@ function recentFor(pred, n, id) {
 function rrow(r) {
   const selId = state.sel && state.sel.t === "res" ? state.sel.id : null;
   const docker = DOCKERISH.test(r.name) || r.id.startsWith("ctr:") ? " " + ic("docker", "", "Docker") : "";
+  const tone = bad(r) ? r.health : procBusy(r) ? "degraded" : "";
   return `<div class="rrow ${bad(r) ? "u" : ""} ${r.id === selId ? "sel" : ""}" data-res="${esc(r.id)}">${dot(r.health)}
-    <span class="nm" title="${esc(r.id)}">${esc(r.label || r.name)}${docker}</span><span class="sm ${bad(r) ? "t-" + r.health : ""}">${esc(reason(r))}</span></div>`;
+    <span class="nm" title="${esc(r.id)}">${esc(r.label || r.name)}${docker}</span><span class="sm ${tone ? "t-" + tone : ""}">${esc(reason(r))}</span></div>`;
 }
 function dedupeDisks(list) {
   const groups = new Map();
@@ -833,15 +843,21 @@ function dedupeDisks(list) {
     return g.length > 1 ? Object.assign({}, g[0], { label: `${g[0].name}  +${g.length - 1} mounts` }) : g[0];
   });
 }
+function procBusy(r) {
+  if (!r || r.kind !== "process" || r.health !== "ok") return false;
+  const share = r.metrics && r.metrics["proc.host_cpu_pct"];
+  return share != null && share >= 50 && share < 90;
+}
 function fold(key, title, count, list, inner) {
   const f = list.filter((r) => r.health === "failed").length, dg = list.filter((r) => r.health === "degraded").length;
-  const unk = list.filter((r) => r.health === "unknown").length, open = state.open[key] ?? (f + dg > 0);
-  const st = f || dg ? `<span class="st">${issues({ failed: f, degraded: dg })}</span>` : `<span class="st faint">${unk ? `${unk} unknown` : "ok"}</span>`;
+  const unk = list.filter((r) => r.health === "unknown").length, busyN = list.filter(procBusy).length;
+  const open = state.open[key] ?? (f + dg + busyN > 0);
+  const st = f || dg ? `<span class="st">${issues({ failed: f, degraded: dg })}</span>` : busyN ? `<span class="st"><span class="t-degraded">${busyN} busy</span></span>` : `<span class="st faint">${unk ? `${unk} unknown` : "ok"}</span>`;
   return `<div class="kind"><button type="button" data-kind="${esc(key)}" aria-expanded="${open}"><span class="caret">${open ? "▾" : "▸"}</span>
     ${title} <span class="cnt">${count}</span>${st}</button>${open ? `<div class="body">${inner()}</div>` : ""}</div>`;
 }
 function rowsWithOk(key, list) {
-  const hot = list.filter(bad), rest = list.filter((r) => !bad(r)), showAll = state.showOk[key] || !hot.length;
+  const hot = list.filter((r) => bad(r) || procBusy(r)), rest = list.filter((r) => !bad(r) && !procBusy(r)), showAll = state.showOk[key] || !hot.length;
   return (showAll ? hot.concat(rest.slice(0, 40)) : hot).map(rrow).join("") +
     (!showAll && rest.length ? `<button type="button" class="linkish" data-showok="${esc(key)}">show ${rest.length} ok</button>` : "") +
     (showAll && rest.length > 40 ? `<div class="faint small">+${rest.length - 40} more · use find</div>` : "");
