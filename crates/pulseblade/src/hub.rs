@@ -280,8 +280,16 @@ fn authorize(hub: &HubInner, headers: &HeaderMap) -> Result<String, StatusCode> 
 }
 
 /// Changes, present resources, and samples the node has past `cursor`.
+///
+/// When the hub cursor is ahead of this database, the journal was replaced
+/// (the DaemonSet keeps SQLite on an emptyDir, so a rollout starts seq at 1).
+/// Replaying from the stored cursor would drop every new change, and the
+/// resource bodies that travel with those changes, while samples still move.
 pub fn batch_since(store: &Store, cursor: NodeCursor) -> Result<NodeBatch, StoreError> {
-    let (changes, _) = store.changes_after(cursor.seq, &ChangeFilter::default(), 2_000)?;
+    let local_seq = store.current_seq()?;
+    let journal_reset = cursor.seq > local_seq;
+    let change_after = if journal_reset { 0 } else { cursor.seq };
+    let (changes, _) = store.changes_after(change_after, &ChangeFilter::default(), 2_000)?;
     let mut seen = std::collections::BTreeSet::new();
     let mut resources = Vec::new();
     for change in &changes {
@@ -306,6 +314,7 @@ pub fn batch_since(store: &Store, cursor: NodeCursor) -> Result<NodeBatch, Store
         samples,
         buckets,
         events,
+        journal_reset,
         ..NodeBatch::default()
     })
 }
@@ -699,7 +708,8 @@ impl HubClient {
         let cursor = self.cursor()?;
         let mut batch = batch_since(store, cursor)?;
         batch.interval_secs = self.interval_secs;
-        if batch.changes.is_empty()
+        if !batch.journal_reset
+            && batch.changes.is_empty()
             && batch.samples.is_empty()
             && batch.buckets.is_empty()
             && batch.events.is_empty()
@@ -986,6 +996,106 @@ mod tests {
             route_node(&store, Some("unit:web1:sshd.service"), &tokens).unwrap(),
             "web1"
         );
+    }
+
+    fn workload(ready: &str, health: Health) -> Resource {
+        Resource::new(
+            "workload:poc-apps:pulseblade:daemonset:pulseblade-prod",
+            ResourceKind::Workload,
+            "pulseblade-prod",
+        )
+        .health(health)
+        .attr("kind", "daemonset")
+        .attr("ready", ready)
+    }
+
+    fn apply_workload(store: &Store, ready: &str, health: Health) {
+        store
+            .apply(
+                "k8s",
+                chrono::Utc::now(),
+                &Observation {
+                    resources: vec![workload(ready, health)],
+                    samples: vec![
+                        pulseblade_core::Sample::new(
+                            "workload:poc-apps:pulseblade:daemonset:pulseblade-prod",
+                            "k8s.ready",
+                            ready.split('/').next().unwrap().parse().unwrap(),
+                        ),
+                        pulseblade_core::Sample::new(
+                            "workload:poc-apps:pulseblade:daemonset:pulseblade-prod",
+                            "k8s.replicas",
+                            9.0,
+                        ),
+                    ],
+                    logs: vec![],
+                },
+            )
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rewound_journal_republishes_the_recovered_workload() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = CancellationToken::new();
+        let hub = new_hub(
+            store.clone(),
+            vec![("poc-apps-2".into(), "token".into())],
+            Duration::from_secs(2),
+        );
+        let stop_serve = shutdown.clone();
+        let served = hub.clone();
+        tokio::spawn(async move {
+            serve(
+                listener,
+                served,
+                vec!["127.0.0.1".into()],
+                stop_serve,
+                Arc::new(Registry::builtin()),
+                None,
+            )
+            .await
+            .ok();
+        });
+        let client = HubClient::plain(format!("http://{addr}"), "token");
+
+        let previous = Store::open_in_memory().unwrap();
+        apply_workload(&previous, "9/9", Health::Ok);
+        apply_workload(&previous, "8/9", Health::Degraded);
+        client.push_store(&previous).unwrap();
+        let id = "workload:poc-apps:pulseblade:daemonset:pulseblade-prod";
+        let dipped = store.resource(id).unwrap().unwrap();
+        assert_eq!(dipped.resource.health, Health::Degraded);
+        assert_eq!(dipped.resource.attrs["ready"].as_str(), Some("8/9"));
+        let stuck_cursor = client.cursor().unwrap().seq;
+        assert!(stuck_cursor > 1, "{stuck_cursor}");
+
+        // Rollout replaced the pod. The new emptyDir journal starts at seq 1
+        // already healthy, which is below the hub cursor from the old process.
+        let restarted = Store::open_in_memory().unwrap();
+        apply_workload(&restarted, "9/9", Health::Ok);
+        assert!(stuck_cursor > restarted.current_seq().unwrap());
+        client.push_store(&restarted).unwrap();
+        let healed = store.resource(id).unwrap().unwrap();
+        assert_eq!(healed.resource.health, Health::Ok);
+        assert_eq!(healed.resource.attrs["ready"].as_str(), Some("9/9"));
+        assert_eq!(
+            client.cursor().unwrap().seq,
+            restarted.current_seq().unwrap()
+        );
+
+        apply_workload(&restarted, "7/9", Health::Degraded);
+        client.push_store(&restarted).unwrap();
+        let followed = store.resource(id).unwrap().unwrap();
+        assert_eq!(followed.resource.health, Health::Degraded);
+        assert_eq!(followed.resource.attrs["ready"].as_str(), Some("7/9"));
+        assert_eq!(
+            client.cursor().unwrap().seq,
+            restarted.current_seq().unwrap()
+        );
+        shutdown.cancel();
     }
 
     #[test]

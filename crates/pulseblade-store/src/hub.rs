@@ -53,6 +53,11 @@ pub struct NodeBatch {
     /// Set on the last push before a requested shutdown. A crash leaves this false.
     #[serde(default)]
     pub shutting_down: bool,
+    /// The node database was replaced and its journal seq restarted below the
+    /// hub cursor. Apply `changes` as a new journal instead of treating every
+    /// seq at or below the stored cursor as already ingested.
+    #[serde(default)]
+    pub journal_reset: bool,
 }
 
 /// Highest node journal seq and sample timestamp the hub has applied.
@@ -130,11 +135,22 @@ fn ingest_batch(
     } else {
         "SELECT seq, sample_ms, bucket_ms, event_id FROM node_cursors WHERE node_id = ?1"
     };
-    let (mut cursor, mut sample_ms, mut bucket_ms, mut event_id) = sql
+    let (stored_seq, mut sample_ms, mut bucket_ms, mut event_id) = sql
         .query_opt(select, &[SqlVal::text(node_id)], |row| {
             Ok((row.int(0)?, row.int(1)?, row.int(2)?, row.int(3)?))
         })?
         .unwrap_or((0, 0, 0, 0));
+    // A replaced node database (emptyDir, new file) starts seq over at 1.
+    // The previous cursor would skip those rows and, because resource bodies
+    // ride along with changes, would leave the last snapshot in place while
+    // newer samples still land. Accept this batch from the seq it actually
+    // starts at. Sample, bucket, and event cursors stay; those keys do not
+    // rewind with the journal.
+    let mut cursor = if batch.journal_reset {
+        changes.first().map(|c| c.seq - 1).unwrap_or(0).max(0)
+    } else {
+        stored_seq
+    };
     let have = cursor;
     let mut applied = 0usize;
     let mut accepted = Vec::new();
@@ -999,6 +1015,111 @@ mod tests {
     #[test]
     fn catch_up_is_contiguous_and_a_gap_does_not_advance() {
         assert_contiguous_catch_up(&Store::open_in_memory().unwrap());
+    }
+
+    #[test]
+    fn journal_reset_replaces_a_rewound_cursor() {
+        let store = Store::open_in_memory().unwrap();
+        let id = "workload:poc-apps:pulseblade:daemonset:pulseblade-prod";
+        let degraded = Resource::new(id, ResourceKind::Workload, "pulseblade-prod")
+            .health(Health::Degraded)
+            .attr("ready", "8/9");
+        let ready = Resource::new(id, ResourceKind::Workload, "pulseblade-prod")
+            .health(Health::Ok)
+            .attr("ready", "9/9");
+        store
+            .ingest_node(
+                "poc-apps-2",
+                &NodeBatch {
+                    changes: vec![
+                        change(1, id, ChangeKind::Appeared),
+                        change(2, id, ChangeKind::Changed),
+                        change(3, id, ChangeKind::Changed),
+                    ],
+                    resources: vec![degraded],
+                    ..NodeBatch::default()
+                },
+            )
+            .unwrap();
+        // The new process reused seq 1. Those changes are skipped, and a push
+        // that only has samples (the resource rides with changes the node
+        // still considers unsent) leaves the 8/9 snapshot in place.
+        let ignored = store
+            .ingest_node(
+                "poc-apps-2",
+                &NodeBatch {
+                    changes: vec![change(1, id, ChangeKind::Appeared)],
+                    samples: vec![StampedSample {
+                        resource_id: id.into(),
+                        metric: "k8s.ready".into(),
+                        ts: Utc::now(),
+                        value: 9.0,
+                    }],
+                    ..NodeBatch::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(ignored.applied, 0);
+        assert_eq!(ignored.cursor, 3);
+        let stuck = store.resource(id).unwrap().unwrap();
+        assert_eq!(stuck.resource.health, Health::Degraded);
+        assert_eq!(
+            stuck.resource.attrs.get("ready").and_then(|v| v.as_str()),
+            Some("8/9")
+        );
+        assert_eq!(
+            store.latest(id).unwrap().get("k8s.ready").unwrap().value,
+            9.0
+        );
+
+        let reset = store
+            .ingest_node(
+                "poc-apps-2",
+                &NodeBatch {
+                    changes: vec![change(1, id, ChangeKind::Appeared)],
+                    resources: vec![ready],
+                    journal_reset: true,
+                    ..NodeBatch::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(reset.applied, 1);
+        assert_eq!(reset.cursor, 1);
+        let healed = store.resource(id).unwrap().unwrap();
+        assert_eq!(healed.resource.health, Health::Ok);
+        assert_eq!(
+            healed.resource.attrs.get("ready").and_then(|v| v.as_str()),
+            Some("9/9")
+        );
+
+        // The cursor moved with the new journal, so the next seq is applied.
+        let later = Resource::new(id, ResourceKind::Workload, "pulseblade-prod")
+            .health(Health::Ok)
+            .attr("ready", "9/9")
+            .attr("generation", "2");
+        let next = store
+            .ingest_node(
+                "poc-apps-2",
+                &NodeBatch {
+                    changes: vec![change(2, id, ChangeKind::Changed)],
+                    resources: vec![later],
+                    ..NodeBatch::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(next.applied, 1);
+        assert_eq!(next.cursor, 2);
+        assert_eq!(
+            store
+                .resource(id)
+                .unwrap()
+                .unwrap()
+                .resource
+                .attrs
+                .get("generation")
+                .and_then(|v| v.as_str()),
+            Some("2")
+        );
     }
 
     #[test]
