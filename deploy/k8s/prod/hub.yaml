@@ -233,7 +233,7 @@ spec:
         fsGroup: 65532
       containers:
         - name: pulseblade
-          image: harbor.dataknife.net/library/pulseblade:0.1.0@sha256:ce5a6cf5198d17d93726c2bdc3b5d1f0beeca8188035d786b783fd35f7d4482d
+          image: harbor.dataknife.net/library/pulseblade:0.1.0@sha256:b8907d46c28875d96961ae3158ad9ea687d493c89e216fee7f918ba6bba2d55e
           imagePullPolicy: IfNotPresent
           command:
             - pulseblade
