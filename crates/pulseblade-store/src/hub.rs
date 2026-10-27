@@ -669,10 +669,18 @@ impl Store {
         } else {
             result
         };
-        // A push can be the first time this journal sees the resource healthy.
-        // Health findings are not part of the node batch, so close them here.
+        // Only resources in this batch. An empty push must not close a health
+        // finding the caller opened against a resource that is already ok.
         if result.is_ok() {
-            self.resolve_recovered_health(Utc::now())?;
+            let now = Utc::now();
+            for id in batch
+                .resources
+                .iter()
+                .filter(|res| res.health == Health::Ok)
+                .map(|res| res.id.as_str())
+            {
+                self.resolve_recovered_health_for(id, now)?;
+            }
         }
         result
     }
@@ -680,17 +688,41 @@ impl Store {
     /// Close health findings whose resource is present and healthy.
     ///
     /// Node detection does not push findings. A health finding copied onto the
-    /// hub would otherwise stay open after the workload recovers.
+    /// hub would otherwise stay open after the workload recovers. The maintain
+    /// loop calls this for the whole journal. A push calls
+    /// [`resolve_recovered_health_for`](Self::resolve_recovered_health_for)
+    /// for the resources it just reported.
     pub fn resolve_recovered_health(&self, now: DateTime<Utc>) -> crate::Result<usize> {
+        self.resolve_recovered_health_for_id(now, None)
+    }
+
+    /// Close the health finding for one resource when that resource is healthy.
+    pub fn resolve_recovered_health_for(
+        &self,
+        resource_id: &str,
+        now: DateTime<Utc>,
+    ) -> crate::Result<usize> {
+        self.resolve_recovered_health_for_id(now, Some(resource_id))
+    }
+
+    fn resolve_recovered_health_for_id(
+        &self,
+        now: DateTime<Utc>,
+        resource_id: Option<&str>,
+    ) -> crate::Result<usize> {
         self.with_sql(|sql| {
             sql.execute(
                 "UPDATE findings SET status = 'resolved', updated_at = ?1
                  WHERE status IN ('open', 'acked')
                    AND rule = 'health'
+                   AND (CAST(?2 AS TEXT) IS NULL OR resource_id = ?2)
                    AND resource_id IN (
                      SELECT id FROM resources WHERE present = 1 AND health = 'ok'
                    )",
-                &[SqlVal::Int(now.timestamp_millis())],
+                &[
+                    SqlVal::Int(now.timestamp_millis()),
+                    SqlVal::opt_text(resource_id.map(str::to_string)),
+                ],
             )
         })
     }
