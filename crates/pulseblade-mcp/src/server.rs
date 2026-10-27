@@ -1167,7 +1167,7 @@ mod tests {
         policy.script_run.allow = vec!["/usr/local/lib/pulseblade/hook".into()];
         let reg = pulseblade_act::Registry::new(policy, Arc::new(Nop)).unwrap();
         let catalog = reg.list();
-        assert_eq!(catalog.actions.len(), 9);
+        assert_eq!(catalog.actions.len(), 10);
         assert_matches_output_schema(&server, "actions_list", &catalog);
         let planned = reg
             .plan(
