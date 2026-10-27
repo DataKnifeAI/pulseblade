@@ -3,7 +3,8 @@
 use pulseblade_core::RiskTier;
 use serde::{Deserialize, Serialize};
 
-/// How long an approve-tier run waits for a human (`30s`, `15m`, `1h`, `1d`).
+/// Backstop for an abandoned approval (`30s`, `15m`, `1h`, or `1d`).
+/// A still-valid request stays until the finding clears or the workload changes.
 pub fn parse_ttl(raw: &str) -> Result<chrono::Duration, String> {
     let s = raw.trim();
     let (num, mult) = if let Some(n) = s.strip_suffix('d') {
@@ -86,7 +87,7 @@ pub struct ActionsConfig {
 impl Default for ActionsConfig {
     fn default() -> Self {
         Self {
-            approval_ttl: "1h".into(),
+            approval_ttl: "1d".into(),
             approve_token: String::new(),
             systemd_restart: TierLimit::default(),
             docker_restart: TierLimit::default(),

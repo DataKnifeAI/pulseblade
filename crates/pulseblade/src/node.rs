@@ -149,6 +149,8 @@ pub fn spawn_collector(
     let sample_retention = chrono::Duration::hours(config.retention_hours as i64);
     let change_retention = chrono::Duration::days(config.change_retention_days as i64);
     let history_retention = chrono::Duration::days(config.history_days.max(1) as i64);
+    let backstop = pulseblade_act::parse_ttl(&config.actions.approval_ttl)
+        .unwrap_or_else(|_| chrono::Duration::days(1));
     let opts = config.collector_opts();
     let gate = std::sync::Arc::new(HealthGate::new(config.health.clone()));
     let fallback = config.health.clone();
@@ -172,7 +174,7 @@ pub fn spawn_collector(
             let started = Instant::now();
             let n = collect_once(&store, &mut collectors, &labels, Some(interval.as_secs()));
             detect_pass(&store, &detect);
-            if let Err(e) = store.expire_actions(Utc::now()) {
+            if let Err(e) = store.expire_actions(Utc::now(), backstop) {
                 tracing::warn!(error = %e, "expiring actions failed");
             }
             tracing::debug!(

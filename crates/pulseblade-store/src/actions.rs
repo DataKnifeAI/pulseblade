@@ -2,7 +2,7 @@
 
 use chrono::{DateTime, Utc};
 use pulseblade_core::{
-    ActionRun, ActionRunStatus, FindingOutcome, FindingStatus, Health, RiskTier,
+    resource_fields, ActionRun, ActionRunStatus, FindingOutcome, FindingStatus, Health, RiskTier,
 };
 use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
@@ -260,31 +260,241 @@ impl Store {
             .ok_or_else(|| StoreError::Corrupt(format!("missing action {id}")))
     }
 
-    /// Mark awaiting runs whose approval window has closed. Returns how many expired.
-    pub fn expire_actions(&self, now: DateTime<Utc>) -> crate::Result<usize> {
-        let ms = now.timestamp_millis();
-        let ids: Vec<String> = {
-            let conn = self.conn();
-            let mut stmt = conn.prepare(
-                "SELECT id FROM action_runs
-                 WHERE status = 'awaiting_approval' AND expires_at IS NOT NULL AND expires_at <= ?1",
-            )?;
-            let rows = stmt.query_map([ms], |r| r.get(0))?;
-            rows.collect::<Result<Vec<_>, _>>()?
-        };
-        for id in &ids {
+    /// End waiting runs that are no longer valid, and abandoned runs past `backstop`.
+    ///
+    /// A still-open finding on an unchanged resource stays waiting until
+    /// `created_at + backstop`. An earlier `expires_at` does not drop it.
+    /// Returns how many runs moved to `expired`.
+    pub fn expire_actions(
+        &self,
+        now: DateTime<Utc>,
+        backstop: chrono::Duration,
+    ) -> crate::Result<usize> {
+        let ids = self.with_sql(|sql| {
+            sql.query(
+                "SELECT id FROM action_runs WHERE status = 'awaiting_approval'",
+                &[],
+                |row| row.text(0),
+            )
+        })?;
+        let mut n = 0;
+        for id in ids {
+            let Some(run) = self.action(&id)? else {
+                continue;
+            };
+            if run.status != ActionRunStatus::AwaitingApproval {
+                continue;
+            }
+            let output = if let Some(why) = self.approval_block(&run)? {
+                why
+            } else if backstop_due(&run, now, backstop) {
+                "approval window elapsed"
+            } else {
+                continue;
+            };
             self.transition_action(
-                id,
+                &id,
                 ActionTransition {
                     from: ActionRunStatus::AwaitingApproval,
                     to: ActionRunStatus::Expired,
-                    output: Some("approval window elapsed"),
+                    output: Some(output),
                     expires_at: None,
                     event: "expire",
                 },
             )?;
+            n += 1;
         }
-        Ok(ids.len())
+        Ok(n)
+    }
+
+    /// `finding resolved` or `resource changed` when this run should not stay waiting.
+    pub fn approval_block(&self, run: &ActionRun) -> crate::Result<Option<&'static str>> {
+        if self.finding_resolved(run)? {
+            return Ok(Some("finding resolved"));
+        }
+        if self.resource_changed(run)? {
+            return Ok(Some("resource changed"));
+        }
+        Ok(None)
+    }
+
+    /// The finding is still open, or this run was not tied to one.
+    pub fn finding_still_open(&self, run: &ActionRun) -> crate::Result<bool> {
+        let Some(id) = run.finding_id.as_deref().filter(|id| !id.is_empty()) else {
+            return Ok(true);
+        };
+        Ok(match self.finding(id)? {
+            Some(finding) => finding.status != FindingStatus::Resolved,
+            None => true,
+        })
+    }
+
+    /// Snapshot health and ready count so a later pass can see a real change.
+    pub fn record_basis(&self, id: &str) -> crate::Result<()> {
+        let run = self
+            .action(id)?
+            .ok_or_else(|| StoreError::UnknownAction(id.to_string()))?;
+        let basis = match self.resource(&run.resource_id)? {
+            Some(row) if row.present => {
+                let ready = row
+                    .resource
+                    .attrs
+                    .get("ready")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                json!({
+                    "present": true,
+                    "health": row.resource.health.as_str(),
+                    "ready": ready,
+                })
+            }
+            _ => json!({"present": false}),
+        };
+        let text = serde_json::to_string(&basis)?;
+        self.with_sql(|sql| {
+            sql.execute(
+                "UPDATE action_runs SET basis = ?1 WHERE id = ?2",
+                &[SqlVal::text(text), SqlVal::text(id)],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Put an expired run back to waiting with a fresh backstop. Output is cleared.
+    pub fn reopen_approval(&self, id: &str, expires_at: DateTime<Utc>) -> crate::Result<ActionRun> {
+        let now = Utc::now();
+        let ms = now.timestamp_millis();
+        let exp = expires_at.timestamp_millis();
+        {
+            let mut conn = self.conn();
+            let tx = conn.transaction()?;
+            let current = load_in(&tx, id)?;
+            if current.status != ActionRunStatus::Expired {
+                return Ok(current);
+            }
+            let n = tx.execute(
+                "UPDATE action_runs
+                 SET status = 'awaiting_approval', output = NULL, expires_at = ?1, updated_at = ?2
+                 WHERE id = ?3 AND status = 'expired'",
+                params![exp, ms, id],
+            )?;
+            if n == 0 {
+                return load_in(&tx, id);
+            }
+            let payload = json!({
+                "event": "recheck",
+                "run_id": id,
+                "action": current.action,
+                "resource_id": current.resource_id,
+                "status": "awaiting_approval",
+                "tier": tier_str(current.tier),
+                "dry_run": current.dry_run,
+                "ts": ms,
+            })
+            .to_string();
+            append_audit(&tx, ms, id, "recheck", &payload)?;
+            tx.commit()?;
+        }
+        self.action(id)?
+            .ok_or_else(|| StoreError::Corrupt(format!("missing action {id}")))
+    }
+
+    /// Remember a deny for this resource and this action name only.
+    pub fn record_rejection(
+        &self,
+        resource_id: &str,
+        action: &str,
+        reason: &str,
+    ) -> crate::Result<()> {
+        let now = Utc::now().timestamp_millis();
+        self.with_sql(|sql| {
+            sql.execute(
+                "INSERT INTO action_rejections (resource_id, action, reason, created_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(resource_id, action) DO UPDATE SET
+                    reason = excluded.reason,
+                    created_at = excluded.created_at",
+                &[
+                    SqlVal::text(resource_id),
+                    SqlVal::text(action),
+                    SqlVal::text(reason),
+                    SqlVal::Int(now),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn rejection(&self, resource_id: &str, action: &str) -> crate::Result<Option<String>> {
+        self.with_sql(|sql| {
+            sql.query_opt(
+                "SELECT reason FROM action_rejections WHERE resource_id = ?1 AND action = ?2",
+                &[SqlVal::text(resource_id), SqlVal::text(action)],
+                |row| row.text(0),
+            )
+        })
+    }
+
+    pub fn rejections_for(&self, resource_id: &str) -> crate::Result<Vec<(String, String)>> {
+        self.with_sql(|sql| {
+            sql.query(
+                "SELECT action, reason FROM action_rejections
+                 WHERE resource_id = ?1 ORDER BY action",
+                &[SqlVal::text(resource_id)],
+                |row| Ok((row.text(0)?, row.text(1)?)),
+            )
+        })
+    }
+
+    fn finding_resolved(&self, run: &ActionRun) -> crate::Result<bool> {
+        let Some(id) = run.finding_id.as_deref().filter(|id| !id.is_empty()) else {
+            return Ok(false);
+        };
+        Ok(match self.finding(id)? {
+            Some(finding) => finding.status == FindingStatus::Resolved,
+            None => false,
+        })
+    }
+
+    fn resource_changed(&self, run: &ActionRun) -> crate::Result<bool> {
+        let Some(basis) = self.load_basis(&run.id)? else {
+            return Ok(false);
+        };
+        let present = basis
+            .get("present")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let Some(row) = self.resource(&run.resource_id)? else {
+            return Ok(present);
+        };
+        if !row.present {
+            return Ok(present);
+        }
+        if !present {
+            return Ok(true);
+        }
+        let health = basis.get("health").and_then(|v| v.as_str()).unwrap_or("");
+        if health != row.resource.health.as_str() {
+            return Ok(true);
+        }
+        if basis_ready(&basis) != attr_ready(&row.resource.attrs) {
+            return Ok(true);
+        }
+        Ok(!params_match(&run.resource_id, &row.resource, &run.params))
+    }
+
+    fn load_basis(&self, id: &str) -> crate::Result<Option<Value>> {
+        let text = self.with_sql(|sql| {
+            sql.query_opt(
+                "SELECT basis FROM action_runs WHERE id = ?1",
+                &[SqlVal::text(id)],
+                |row| row.opt_text(0),
+            )
+        })?;
+        match text.flatten() {
+            Some(text) if !text.is_empty() => Ok(Some(serde_json::from_str(&text)?)),
+            _ => Ok(None),
+        }
     }
 
     /// Recompute every audit hash. Errors when a row was altered or reordered.
@@ -318,6 +528,64 @@ impl Store {
         }
         Ok(())
     }
+}
+
+fn backstop_due(run: &ActionRun, now: DateTime<Utc>, backstop: chrono::Duration) -> bool {
+    let from_create = run.created_at + backstop;
+    let stored = run.expires_at.unwrap_or(from_create);
+    let deadline = if stored > from_create {
+        stored
+    } else {
+        from_create
+    };
+    now >= deadline
+}
+
+fn basis_ready(basis: &Value) -> Option<String> {
+    match basis.get("ready") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(text)) if text.is_empty() => None,
+        Some(Value::String(text)) => Some(text.clone()),
+        Some(other) => Some(other.to_string()),
+    }
+}
+
+fn attr_ready(attrs: &std::collections::BTreeMap<String, Value>) -> Option<String> {
+    match attrs.get("ready") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(text)) if text.is_empty() => None,
+        Some(Value::String(text)) => Some(text.clone()),
+        Some(other) => Some(other.to_string()),
+    }
+}
+
+/// Plan params still name this resource. A field or attribute that moved does not.
+fn params_match(resource_id: &str, resource: &pulseblade_core::Resource, params: &Value) -> bool {
+    let fields = resource_fields(resource_id);
+    let Some(obj) = params.as_object() else {
+        return true;
+    };
+    for (key, value) in obj {
+        let Some(text) = value.as_str() else {
+            continue;
+        };
+        if let Some(field) = fields.get(key) {
+            if field != text {
+                return false;
+            }
+        }
+        if let Some(attr) = resource.attrs.get(key).and_then(|v| v.as_str()) {
+            if attr != text {
+                return false;
+            }
+        }
+        if let Some(label) = resource.labels.get(key) {
+            if label != text {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn load_in(conn: &rusqlite::Connection, id: &str) -> crate::Result<ActionRun> {

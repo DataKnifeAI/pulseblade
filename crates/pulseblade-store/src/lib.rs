@@ -22,7 +22,7 @@ pub use history::{MetricBucket, StoredEvent, BUCKET_MS, DEFAULT_HISTORY_DAYS, HU
 pub use hub::{IngestResult, NodeBatch, NodeCursor, NodePush, RouteJob, StampedSample};
 pub use memory::{FindingDraft, FindingFilter};
 pub use pilot::{NewPilotRun, PilotRunRow};
-pub use remedies::{RemedyPage, RemedyRow};
+pub use remedies::{ActionRejection, RemedyPage, RemedyRow};
 
 use pulseblade_core::{
     Aggregation, Change, ChangeKind, Checkpoint, CollectorRun, Health, HealthThresholds,
@@ -177,7 +177,8 @@ CREATE TABLE IF NOT EXISTS action_runs (
     created_at       INTEGER NOT NULL,
     updated_at       INTEGER NOT NULL,
     expires_at       INTEGER,
-    finding_id       TEXT
+    finding_id       TEXT,
+    basis            TEXT
 );
 CREATE INDEX IF NOT EXISTS action_runs_key ON action_runs(idempotency_key, status);
 CREATE INDEX IF NOT EXISTS action_runs_resource ON action_runs(resource_id, created_at);
@@ -191,6 +192,14 @@ CREATE TABLE IF NOT EXISTS remedies (
     outcome    TEXT NOT NULL,
     updated_at INTEGER NOT NULL,
     PRIMARY KEY (rule, kind, action)
+);
+
+CREATE TABLE IF NOT EXISTS action_rejections (
+    resource_id TEXT NOT NULL,
+    action      TEXT NOT NULL,
+    reason      TEXT NOT NULL,
+    created_at  INTEGER NOT NULL,
+    PRIMARY KEY (resource_id, action)
 );
 
 CREATE TABLE IF NOT EXISTS audit (
@@ -392,10 +401,21 @@ fn ensure_cursor_columns(conn: &Connection) -> Result<()> {
 /// alter a table that already exists.
 pub(crate) fn ensure_later_columns(sql: &mut dyn sql::Sql) -> Result<()> {
     ensure_column(sql, "action_runs", "finding_id", "TEXT")?;
+    ensure_column(sql, "action_runs", "basis", "TEXT")?;
     ensure_column(sql, "route_plans", "finding_id", "TEXT")?;
     ensure_column(sql, "route_plans", "resource_id", "TEXT")?;
     sql.execute(
         "CREATE INDEX IF NOT EXISTS route_plans_resource ON route_plans(resource_id)",
+        &[],
+    )?;
+    sql.execute(
+        "CREATE TABLE IF NOT EXISTS action_rejections (
+            resource_id TEXT NOT NULL,
+            action      TEXT NOT NULL,
+            reason      TEXT NOT NULL,
+            created_at  BIGINT NOT NULL,
+            PRIMARY KEY (resource_id, action)
+        )",
         &[],
     )?;
     Ok(())

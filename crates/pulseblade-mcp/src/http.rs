@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use axum::extract::rejection::QueryRejection;
+use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{Path, Query, Request, State};
 use axum::http::HeaderMap;
 use axum::http::{header, uri::Authority, StatusCode};
@@ -105,6 +105,8 @@ pub fn router_with_journal(
         .route("/actions", get(actions_list))
         .route("/actions/{id}/approve", post(approve_action))
         .route("/actions/{id}/deny", post(deny_action))
+        .route("/actions/{id}/dismiss", post(dismiss_action))
+        .route("/actions/{id}/recheck", post(recheck_action))
         .route("/portal", get(portal_get).put(portal_put))
         .fallback(|| async { ApiError::not_found("no such API endpoint") });
     Router::new()
@@ -432,7 +434,15 @@ async fn actions_list(State(st): State<AppState>) -> ApiResult {
 
 enum Decision {
     Approve,
-    Deny,
+    Deny(String),
+    Dismiss,
+    Recheck,
+}
+
+#[derive(Debug, Deserialize)]
+struct DenyBody {
+    #[serde(default)]
+    reason: String,
 }
 
 async fn approve_action(
@@ -447,8 +457,35 @@ async fn deny_action(
     State(st): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
+    body: Result<Json<DenyBody>, JsonRejection>,
 ) -> ApiResult {
-    decide_action(st, id, headers, Decision::Deny).await
+    let reason = match body {
+        Ok(Json(body)) => body.reason,
+        Err(_) => String::new(),
+    };
+    if reason.trim().is_empty() {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "deny requires a reason".into(),
+        ));
+    }
+    decide_action(st, id, headers, Decision::Deny(reason)).await
+}
+
+async fn dismiss_action(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult {
+    decide_action(st, id, headers, Decision::Dismiss).await
+}
+
+async fn recheck_action(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult {
+    decide_action(st, id, headers, Decision::Recheck).await
 }
 
 async fn decide_action(
@@ -500,7 +537,9 @@ async fn decide_action(
             let run_id = id.clone();
             let run = tokio::task::spawn_blocking(move || match decision {
                 Decision::Approve => route.approve(&run_id),
-                Decision::Deny => route.deny(&run_id),
+                Decision::Deny(reason) => route.deny(&run_id, &reason),
+                Decision::Dismiss => route.dismiss(&run_id),
+                Decision::Recheck => route.recheck(&run_id),
             })
             .await
             .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
@@ -519,7 +558,9 @@ async fn decide_action(
         };
         let result = match decision {
             Decision::Approve => actions.approve(&store, &id),
-            Decision::Deny => actions.deny(&store, &id),
+            Decision::Deny(reason) => actions.deny(&store, &id, &reason),
+            Decision::Dismiss => actions.dismiss(&store, &id),
+            Decision::Recheck => actions.recheck(&store, &id),
         };
         match result {
             Ok(run) => Ok(run),
@@ -1094,8 +1135,14 @@ mod tests {
     fn dashboard_approve_posts_to_the_action_route() {
         assert!(DASHBOARD.contains(">Approve</button>"));
         assert!(DASHBOARD.contains(">Deny</button>"));
+        assert!(DASHBOARD.contains(">Dismiss</button>"));
+        assert!(DASHBOARD.contains(">Recheck</button>"));
+        assert!(DASHBOARD.contains("Reason"));
         assert!(DASHBOARD.contains("data-approve"));
         assert!(DASHBOARD.contains("data-deny"));
+        assert!(DASHBOARD.contains("data-dismiss"));
+        assert!(DASHBOARD.contains("data-recheck"));
+        assert!(DASHBOARD.contains("data-reason"));
         assert!(DASHBOARD.contains("/api/v1/actions/"));
         assert!(DASHBOARD.contains("method: \"POST\""));
         assert!(!DASHBOARD.contains("read-only"));

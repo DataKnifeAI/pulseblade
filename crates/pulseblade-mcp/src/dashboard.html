@@ -214,7 +214,9 @@
   .chip { background: var(--tint); border-radius: 999px; padding: 2px 10px; font-size: 12px; color: var(--muted); }
   .chip b { font-family: var(--mono); font-weight: 600; color: var(--text); }
   .chip.on { background: var(--amber-dim); color: var(--amber-ink); }
-  .approve { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
+  .approve { display: flex; gap: 8px; align-items: center; margin-top: 8px; flex-wrap: wrap; }
+  .approve label { display: flex; gap: 6px; align-items: center; font-size: 12px; color: var(--muted); }
+  .approve input { min-width: 12em; }
   svg.spark { width: 100%; height: 64px; display: block; }
   .sparkmeta { display: flex; justify-content: space-between; color: var(--muted); font-size: 12px; }
   .kind > button { width: 100%; display: flex; align-items: center; gap: 8px; background: none; border: 0; border-radius: 6px; padding: 6px 2px; text-align: left; font-size: 14px; color: var(--text); }
@@ -615,21 +617,39 @@ function sinceOf(id) {
 const isChurn = (c) => (String(c.resource_id).startsWith("proc:") && c.kind !== "changed") || (String(c.resource_id).startsWith("net:") && c.field === "attrs.mac");
 const unhealthy = () => D.all.filter(bad);
 const pending = () => ((D.actions && D.actions.runs) || []).filter((a) => a.status === "awaiting_approval");
-function decisionControl(id) {
+function decisionControl(run) {
+  if (!run || !run.id) return "";
+  const waiting = run.status === "awaiting_approval";
+  const stalled = run.status === "expired" && run.finding_outcome === "still_open";
+  if (!waiting && !stalled) return "";
+  const id = run.id;
   const busy = state.deciding === id;
   const err = state.decideErr && state.decideErr.id === id ? `<span class="small t-failed">${esc(state.decideErr.msg)}</span>` : "";
   const dis = busy ? "disabled" : "";
-  return `<div class="approve"><button type="button" data-approve="${esc(id)}" ${dis}>Approve</button><button type="button" data-deny="${esc(id)}" ${dis}>Deny</button>${err}</div>`;
+  const approve = waiting ? `<button type="button" data-approve="${esc(id)}" ${dis}>Approve</button><label>Reason <input data-reason="${esc(id)}" ${dis} required></label><button type="button" data-deny="${esc(id)}" ${dis}>Deny</button>` : "";
+  return `<div class="approve">${approve}<button type="button" data-dismiss="${esc(id)}" ${dis}>Dismiss</button><button type="button" data-recheck="${esc(id)}" ${dis}>Recheck</button>${err}</div>`;
 }
 async function decideRun(id, op) {
-  if (!id || state.deciding || (op !== "approve" && op !== "deny")) return;
+  if (!id || state.deciding || (op !== "approve" && op !== "deny" && op !== "dismiss" && op !== "recheck")) return;
+  let payload = null;
+  if (op === "deny") {
+    const field = document.querySelector('[data-reason="' + (window.CSS && CSS.escape ? CSS.escape(id) : id) + '"]');
+    const reason = field ? field.value.trim() : "";
+    if (!reason) {
+      state.decideErr = { id, msg: "Reason is required" };
+      render();
+      return;
+    }
+    payload = JSON.stringify({ reason });
+  }
   state.deciding = id;
   state.decideErr = null;
   render();
   try {
     const r = await fetch("/api/v1/actions/" + encodeURIComponent(id) + "/" + op, {
       method: "POST",
-      headers: { accept: "application/json" },
+      headers: { accept: "application/json", "content-type": "application/json" },
+      body: payload,
     });
     const body = await r.json().catch(() => ({ error: r.statusText }));
     if (!r.ok) throw new Error(body.error || (op + " failed"));
@@ -875,8 +895,12 @@ function changesView() {
       ${churn.length ? `<div class="note">${state.churn ? "Showing routine changes too. " : "Process start/stop and veth MAC changes are hidden. "}<button type="button" class="linkish" data-churn>${state.churn ? "hide routine" : "show them"}</button></div>` : ""}</section>`;
 }
 
+function actionable(a) {
+  return a.status === "awaiting_approval" || (a.status === "expired" && a.finding_outcome === "still_open");
+}
 function actionsView() {
-  const wait = pending(), rest = ((D.actions && D.actions.runs) || []).filter((a) => a.status !== "awaiting_approval");
+  const runs = (D.actions && D.actions.runs) || [];
+  const wait = runs.filter(actionable), rest = runs.filter((a) => !actionable(a));
   const tone = { succeeded: "ok", failed: "failed", rejected: "unknown", expired: "unknown", running: "degraded", planned: "unknown" };
   const card = (a) => {
     const r = byId.get(a.resource_id), f = (D.findings.findings || []).find((x) => x.resource_id === a.resource_id);
@@ -886,7 +910,7 @@ function actionsView() {
       <div class="small muted">${esc(scopeText(scopeOf(r)))} · requested ${agoTs(a.created_at)} ago · tier ${esc(a.tier)} · <span class="mono">${esc(a.id)}</span></div>
       ${f ? `<div class="small">Because: <span class="t-failed">${esc(f.summary)}</span></div>` : ""}
       ${a.params && Object.keys(a.params).length ? `<div class="mono muted">${esc(JSON.stringify(a.params))}</div>` : ""}
-      ${decisionControl(a.id)}</div>`;
+      ${decisionControl(a)}</div>`;
   };
   return `<section class="card"><h2>Waiting for approval<span class="right faint">${wait.length || "none"}</span></h2>
       ${wait.length ? wait.map(card).join("") : `<div class="empty">Nothing is waiting for a human.</div>`}</section>
@@ -1045,16 +1069,16 @@ function resourceView(id) {
     <div class="mono faint">${esc(r.id)}</div>
     ${r.health !== "ok" ? `<div class="why-line t-${esc(r.health)}">${esc(reason(r))} · since ${esc(sinceOf(id))}</div>` : ""}
     ${f.map((x) => {
-      const wait = acts.find((a) => a.status === "awaiting_approval" && a.finding_id === x.id);
+      const wait = acts.find((a) => a.finding_id === x.id && actionable(a));
       return `<div class="callout finding"><div class="lbl">Finding · ${esc(x.severity)}</div><div>${esc(x.summary)}</div>
-      <div class="muted">${esc(x.rule)} · opened ${agoTs(x.opened_at)} ago</div>${(x.logs || []).length ? `<pre>${x.logs.slice(0, 3).map((l) => esc(l.message)).join("\n")}</pre>` : ""}${wait ? decisionControl(wait.id) : ""}</div>`;
+      <div class="muted">${esc(x.rule)} · opened ${agoTs(x.opened_at)} ago</div>${(x.logs || []).length ? `<pre>${x.logs.slice(0, 3).map((l) => esc(l.message)).join("\n")}</pre>` : ""}${decisionControl(wait)}</div>`;
     }).join("")}
-    ${acts.filter((a) => a.status === "awaiting_approval").map((a) => `<div class="callout approval"><div class="lbl">Waiting for approval</div><div class="mono">${esc(a.action)}</div>
-      <div class="muted">requested ${agoTs(a.created_at)} ago${a.expires_at ? ` · expires in ${ago((Date.parse(a.expires_at) - Date.now()) / 1000)}` : ""}</div>${decisionControl(a.id)}</div>`).join("")}
+    ${acts.filter(actionable).map((a) => `<div class="callout approval"><div class="lbl">${a.status === "awaiting_approval" ? "Waiting for approval" : "Approval expired"}</div><div class="mono">${esc(a.action)}</div>
+      <div class="muted">requested ${agoTs(a.created_at)} ago${a.expires_at ? ` · expires in ${ago((Date.parse(a.expires_at) - Date.now()) / 1000)}` : ""}</div>${decisionControl(a)}</div>`).join("")}
     ${r.kind === "workload" ? `<h3>Pods</h3>${podsOf(r).sort((a, b) => (RANK[a.health] ?? 9) - (RANK[b.health] ?? 9)).map(rrow).join("") || `<div class="empty">No pods linked. Without an owner label, pods group by name prefix.</div>`}` : ""}
     ${metricBlock(r, false)}
     <h3>Details</h3><dl class="kv">${kv || `<dt class="muted">—</dt><dd class="faint">no attributes</dd>`}</dl>
-    ${acts.filter((a) => a.status !== "awaiting_approval").length ? `<h3>Prior actions</h3>` + acts.filter((a) => a.status !== "awaiting_approval").map((a) =>
+    ${acts.filter((a) => !actionable(a)).length ? `<h3>Prior actions</h3>` + acts.filter((a) => !actionable(a)).map((a) =>
       `<div class="small muted">${esc(a.status)} · ${esc(a.action)} · ${agoTs(a.created_at)} ago</div>`).join("") : ""}
     <h3>Changed here</h3>${recentFor((ch) => ch.resource_id === id, 5, id)}`;
 }
@@ -1432,10 +1456,12 @@ function select(sel, keepMetric) {
 }
 const sameSel = (t, id) => state.sel && state.sel.t === t && state.sel.id === id;
 document.addEventListener("click", (ev) => {
-  const decision = ev.target.closest("[data-approve],[data-deny]");
+  const decision = ev.target.closest("[data-approve],[data-deny],[data-dismiss],[data-recheck]");
   if (decision) {
     if (decision.dataset.approve) decideRun(decision.dataset.approve, "approve");
     else if (decision.dataset.deny) decideRun(decision.dataset.deny, "deny");
+    else if (decision.dataset.dismiss) decideRun(decision.dataset.dismiss, "dismiss");
+    else if (decision.dataset.recheck) decideRun(decision.dataset.recheck, "recheck");
     return;
   }
   const t = ev.target.closest("[data-tab],[data-strip],[data-gofleet],[data-fleet],[data-win],[data-machine],[data-scope],[data-g],[data-res],[data-kind],[data-showok],[data-metric],[data-close],[data-churn],[data-attnall],[data-attnless],[data-preset],[data-theme-choice],[data-settings],[data-clients]");

@@ -222,16 +222,64 @@ impl ActionRoute for HubInner {
         Ok(run)
     }
 
-    fn deny(&self, run_id: &str) -> Result<pulseblade_core::ActionRun, String> {
+    fn deny(&self, run_id: &str, reason: &str) -> Result<pulseblade_core::ActionRun, String> {
+        let reason = reason.trim();
+        if reason.is_empty() {
+            return Err("deny requires a reason".into());
+        }
         let node = self
             .with_store(|store| store.plan_node(run_id))?
             .ok_or_else(|| format!("unknown run {run_id}"))?;
-        let value = self.call(&node, "deny", serde_json::json!({ "run_id": run_id }))?;
+        let value = self.call(
+            &node,
+            "deny",
+            serde_json::json!({ "run_id": run_id, "reason": reason }),
+        )?;
         let run: pulseblade_core::ActionRun =
             serde_json::from_value(value).map_err(|e| e.to_string())?;
         let run = self.annotate_run(run)?;
+        self.with_store(|store| store.record_rejection(&run.resource_id, &run.action, reason))?;
         let body = serde_json::to_value(&run).map_err(|e| e.to_string())?;
         self.with_store(|store| store.cache_run(&run.id, &node, &body))?;
+        Ok(run)
+    }
+
+    fn dismiss(&self, run_id: &str) -> Result<pulseblade_core::ActionRun, String> {
+        self.routed_decision(run_id, "dismiss", serde_json::json!({ "run_id": run_id }))
+    }
+
+    fn recheck(&self, run_id: &str) -> Result<pulseblade_core::ActionRun, String> {
+        let run =
+            self.routed_decision(run_id, "recheck", serde_json::json!({ "run_id": run_id }))?;
+        if run.output.as_deref() == Some("resource changed") {
+            let params = self.with_store(|store| {
+                pulseblade_act::known_remedy_params(store, &run)
+                    .map_err(|err| StoreError::Invalid(err.to_string()))
+            })?;
+            if let Some(params) = params {
+                let _ = self.plan(params)?;
+            }
+        }
+        Ok(run)
+    }
+}
+
+impl HubInner {
+    fn routed_decision(
+        &self,
+        run_id: &str,
+        op: &str,
+        body: Value,
+    ) -> Result<pulseblade_core::ActionRun, String> {
+        let node = self
+            .with_store(|store| store.plan_node(run_id))?
+            .ok_or_else(|| format!("unknown run {run_id}"))?;
+        let value = self.call(&node, op, body)?;
+        let run: pulseblade_core::ActionRun =
+            serde_json::from_value(value).map_err(|e| e.to_string())?;
+        let run = self.annotate_run(run)?;
+        let cached = serde_json::to_value(&run).map_err(|e| e.to_string())?;
+        self.with_store(|store| store.cache_run(&run.id, &node, &cached))?;
         Ok(run)
     }
 }
@@ -388,9 +436,36 @@ pub fn apply_job(reg: &Registry, store: &Store, job: &RouteJob) -> Result<Value,
             serde_json::to_value(&run).map_err(|e| e.to_string())
         }
         "deny" => {
+            let params: serde_json::Value = job.body.clone();
+            let run_id = params
+                .get("run_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let reason = params
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let run = reg
+                .deny(store, &run_id, &reason)
+                .map_err(|e| e.to_string())?;
+            serde_json::to_value(&run).map_err(|e| e.to_string())
+        }
+        "dismiss" => {
             let params: pulseblade_act::StatusParams =
                 serde_json::from_value(job.body.clone()).map_err(|e| e.to_string())?;
-            let run = reg.deny(store, &params.run_id).map_err(|e| e.to_string())?;
+            let run = reg
+                .dismiss(store, &params.run_id)
+                .map_err(|e| e.to_string())?;
+            serde_json::to_value(&run).map_err(|e| e.to_string())
+        }
+        "recheck" => {
+            let params: pulseblade_act::StatusParams =
+                serde_json::from_value(job.body.clone()).map_err(|e| e.to_string())?;
+            let run = reg
+                .recheck(store, &params.run_id)
+                .map_err(|e| e.to_string())?;
             serde_json::to_value(&run).map_err(|e| e.to_string())
         }
         other => Err(format!("unknown route op {other}")),
@@ -1798,7 +1873,7 @@ mod tests {
 
         let denied: serde_json::Value =
             ureq::post(&format!("{base}/api/v1/actions/{}/deny", waiting.id))
-                .call()
+                .send_json(json!({"reason": "not this unit"}))
                 .unwrap()
                 .into_json()
                 .unwrap();

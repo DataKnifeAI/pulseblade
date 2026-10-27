@@ -53,6 +53,8 @@ pub struct Session {
     config: PilotConfig,
     seq: i64,
     seen: BTreeSet<String>,
+    /// Finding id to the signature last investigated, including error and escalate.
+    signatures: BTreeMap<String, String>,
     heartbeat_at: Instant,
 }
 
@@ -62,6 +64,7 @@ impl Session {
             config,
             seq: 0,
             seen: BTreeSet::new(),
+            signatures: BTreeMap::new(),
             heartbeat_at: now,
         }
     }
@@ -107,7 +110,16 @@ impl Session {
             .collect();
         let wake_findings = self.config.wakes_on("findings") && !fresh.is_empty();
         let wake_changes = self.config.wakes_on("changes") && !change_list.is_empty();
-        let wake_heart = heartbeat_due && (!open.is_empty() || !change_list.is_empty());
+        // An unchanged heartbeat is not a recheck. Every open finding that still
+        // has the signature from the last investigate stays quiet.
+        let signatures_hold = !open.is_empty()
+            && open.iter().all(|finding| {
+                self.signatures
+                    .get(&finding.id)
+                    .is_some_and(|sig| sig == &finding_signature(finding))
+            });
+        let wake_heart =
+            heartbeat_due && !signatures_hold && (!open.is_empty() || !change_list.is_empty());
         let trigger = if wake_findings {
             format!("finding:{}", fresh[0].id)
         } else if wake_changes {
@@ -127,6 +139,7 @@ impl Session {
         let mut model_focus = Vec::new();
         let mut filed = Vec::new();
         let mut closest = Vec::new();
+        let mut denials = Vec::new();
         for finding in &focus {
             if finding.rule.is_empty() {
                 model_focus.push(finding.clone());
@@ -152,7 +165,16 @@ impl Session {
                     .and_then(|action| action.as_str())
                     .is_some_and(|action| !action.is_empty())
             }) {
-                if let Some(action) = file_remedy(tools, finding, matched) {
+                let action_name = matched
+                    .get("action")
+                    .and_then(|action| action.as_str())
+                    .unwrap_or("");
+                if let Some(reason) = denial_reason(&page, action_name) {
+                    denials.push(format!(
+                        "denied {action_name} on {}: {reason}",
+                        finding.resource_id
+                    ));
+                } else if let Some(action) = file_remedy(tools, finding, matched) {
                     filed.push(action);
                     continue;
                 }
@@ -187,10 +209,30 @@ impl Session {
         if model_focus.is_empty() && !focus.is_empty() {
             return Ok(None);
         }
-        let digest = digest(&model_focus, &change_list, &notes, &closest, seq);
+        let digest = digest(&model_focus, &change_list, &notes, &closest, &denials, seq);
         let run = investigate(&self.config, tools, chat, &trigger, &digest, &model_focus);
+        for finding in &model_focus {
+            self.signatures
+                .insert(finding.id.clone(), finding_signature(finding));
+        }
         Ok(Some(run))
     }
+}
+
+fn finding_signature(finding: &OpenFinding) -> String {
+    format!(
+        "{}\n{}\n{}\n{}\n{}",
+        finding.id, finding.resource_id, finding.rule, finding.severity, finding.summary
+    )
+}
+
+fn denial_reason(page: &Value, action: &str) -> Option<String> {
+    page.get("rejections")?
+        .as_array()?
+        .iter()
+        .find(|row| row.get("action").and_then(|v| v.as_str()) == Some(action))
+        .and_then(|row| row.get("reason").and_then(|v| v.as_str()))
+        .map(str::to_string)
 }
 
 /// File the known plan for this resource. Does not execute it.
@@ -310,6 +352,12 @@ fn investigate<T: Tools, C: Chat>(
             }
             if completion.calls.iter().any(|c| c.name == "escalate") {
                 names.push("escalate".into());
+                if idx + 1 >= tiers.len() {
+                    run.status = "escalate".into();
+                    run.conclusion = conclusion_of(&note, &completion.content);
+                    run.detail = names.join(",");
+                    return run;
+                }
                 messages.push(json!({
                     "role": "user",
                     "content": "Escalating to the next tier."
@@ -599,6 +647,7 @@ fn digest(
     changes: &[Value],
     notes: &[String],
     remedies: &[String],
+    denials: &[String],
     seq: i64,
 ) -> String {
     let mut lines = vec![format!("as_of_seq {seq}")];
@@ -625,6 +674,9 @@ fn digest(
     }
     for remedy in remedies.iter().take(5) {
         lines.push(remedy.clone());
+    }
+    for denial in denials.iter().take(5) {
+        lines.push(denial.clone());
     }
     let mut text = lines.join("\n");
     if text.chars().count() > 4000 {
@@ -1181,13 +1233,27 @@ mod tests {
             .tick(&mut tools, &mut chat, start)
             .unwrap()
             .is_some());
+        let calls = chat.n;
         assert!(session
             .tick(&mut tools, &mut chat, start)
             .unwrap()
             .is_none());
         let later = start + Duration::from_secs(11);
-        let run = session.tick(&mut tools, &mut chat, later).unwrap().unwrap();
+        assert!(
+            session
+                .tick(&mut tools, &mut chat, later)
+                .unwrap()
+                .is_none(),
+            "an unchanged open finding does not produce a second model run"
+        );
+        assert_eq!(chat.n, calls);
+        tools.findings["findings"][0]["summary"] = json!("sshd.service failed again");
+        let run = session
+            .tick(&mut tools, &mut chat, later + Duration::from_secs(11))
+            .unwrap()
+            .unwrap();
         assert_eq!(run.trigger, "heartbeat");
+        assert!(chat.n > calls);
     }
 
     #[test]
@@ -1242,7 +1308,18 @@ mod tests {
             Some("f1")
         );
         let later = start + Duration::from_secs(11);
-        let second = session.tick(&mut tools, &mut chat, later).unwrap().unwrap();
+        assert!(
+            session
+                .tick(&mut tools, &mut chat, later)
+                .unwrap()
+                .is_none(),
+            "an unchanged open finding does not produce a second model run"
+        );
+        tools.findings["findings"][0]["summary"] = json!("sshd.service is still failed");
+        let second = session
+            .tick(&mut tools, &mut chat, later + Duration::from_secs(11))
+            .unwrap()
+            .unwrap();
         assert_eq!(second.trigger, "heartbeat");
         assert_eq!(second.status, "ok");
         assert!(tools.calls.iter().any(|c| c == "action_status"));
@@ -1535,8 +1612,119 @@ mod tests {
             &[],
             &[],
             &["remedy health service systemd.restart approve {\"unit\":\"$unit\"}".into()],
+            &["denied k8s.rollout_restart on workload:c:ns:deployment:api: port is closed".into()],
             3,
         );
+        assert!(text.contains("port is closed"));
         assert!(text.contains("remedy health service systemd.restart"));
+    }
+
+    #[test]
+    fn errored_or_escalate_run_suppresses_the_next_heartbeat() {
+        let mut config = local_config();
+        config.heartbeat_secs = 10;
+        let start = Instant::now();
+        let mut session = Session::new(config, start);
+        let mut tools = FakeTools {
+            findings: finding_page(),
+            changes: empty_changes(),
+            calls: Vec::new(),
+            plan_tier: "approve",
+            plan_args: Vec::new(),
+            remedy: json!({}),
+        };
+        let mut chat = ScriptChat {
+            rounds: vec![
+                completion(json!([call("1", "escalate", json!({}))]), ""),
+                completion(json!([]), "summary changed"),
+            ],
+            n: 0,
+            urls: vec![],
+        };
+        let run = session.tick(&mut tools, &mut chat, start).unwrap().unwrap();
+        assert_eq!(run.status, "escalate");
+        let calls = chat.n;
+        assert!(session
+            .tick(&mut tools, &mut chat, start + Duration::from_secs(11))
+            .unwrap()
+            .is_none());
+        assert_eq!(chat.n, calls);
+        tools.findings["findings"][0]["summary"] = json!("sshd.service failed differently");
+        let again = session
+            .tick(&mut tools, &mut chat, start + Duration::from_secs(22))
+            .unwrap()
+            .unwrap();
+        assert_eq!(again.trigger, "heartbeat");
+        assert!(chat.n > calls);
+
+        let mut config = local_config();
+        config.heartbeat_secs = 10;
+        config.local_only = true;
+        config.tiers[0].endpoints[0].base_url = "https://models.example/v1".into();
+        let start = Instant::now();
+        let mut session = Session::new(config, start);
+        let mut tools = FakeTools {
+            findings: finding_page(),
+            changes: empty_changes(),
+            calls: Vec::new(),
+            plan_tier: "approve",
+            plan_args: Vec::new(),
+            remedy: json!({}),
+        };
+        let mut chat = ScriptChat {
+            rounds: vec![],
+            n: 0,
+            urls: vec![],
+        };
+        let failed = session.tick(&mut tools, &mut chat, start).unwrap().unwrap();
+        assert_eq!(failed.status, "error");
+        assert!(chat.urls.is_empty());
+        assert!(session
+            .tick(&mut tools, &mut chat, start + Duration::from_secs(11))
+            .unwrap()
+            .is_none());
+        assert!(chat.urls.is_empty());
+        tools.findings["findings"][0]["summary"] = json!("sshd.service failed differently");
+        let woke = session
+            .tick(&mut tools, &mut chat, start + Duration::from_secs(22))
+            .unwrap()
+            .unwrap();
+        assert_eq!(woke.trigger, "heartbeat");
+        assert_eq!(woke.status, "error");
+    }
+
+    #[test]
+    fn denied_action_is_not_filed_and_the_model_still_runs() {
+        let mut session = Session::new(local_config(), Instant::now());
+        let mut tools = FakeTools {
+            findings: workload_page(),
+            changes: empty_changes(),
+            calls: Vec::new(),
+            plan_tier: "approve",
+            plan_args: Vec::new(),
+            remedy: json!({
+                "matched": {
+                    "rule": "health",
+                    "kind": "workload",
+                    "action": "k8s.rollout_restart",
+                    "params": {"kind": "$kind", "namespace": "$namespace", "name": "$name"},
+                    "tier": "approve",
+                    "outcome": "resolved"
+                },
+                "rejections": [{"action": "k8s.rollout_restart", "reason": "port is closed"}]
+            }),
+        };
+        let mut chat = ScriptChat {
+            rounds: vec![completion(json!([]), "pick another action")],
+            n: 0,
+            urls: vec![],
+        };
+        let run = session
+            .tick(&mut tools, &mut chat, Instant::now())
+            .unwrap()
+            .unwrap();
+        assert_eq!(chat.n, 1);
+        assert_ne!(run.status, "remedy");
+        assert!(!tools.calls.iter().any(|c| c == "action_plan"));
     }
 }

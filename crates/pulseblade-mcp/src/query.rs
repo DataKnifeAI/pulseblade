@@ -1618,12 +1618,20 @@ pub struct RemedyView {
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
+pub struct RejectionView {
+    pub action: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
 pub struct RemedyPage {
     pub open_plan: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub matched: Option<RemedyView>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub closest: Vec<RemedyView>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rejections: Vec<RejectionView>,
 }
 
 fn remedy_view(row: pulseblade_store::RemedyRow) -> RemedyView {
@@ -1649,11 +1657,20 @@ pub fn remedies(store: &Store, p: RemediesParams) -> Result<RemedyPage> {
         p.rule.as_deref().unwrap_or(""),
         kind.as_deref().unwrap_or(""),
         p.finding_id.as_deref(),
+        p.resource_id.as_deref(),
     )?;
     Ok(RemedyPage {
         open_plan: page.open_plan,
         matched: page.matched.map(remedy_view),
         closest: page.closest.into_iter().map(remedy_view).collect(),
+        rejections: page
+            .rejections
+            .into_iter()
+            .map(|row| RejectionView {
+                action: row.action,
+                reason: row.reason,
+            })
+            .collect(),
     })
 }
 

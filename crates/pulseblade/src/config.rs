@@ -503,7 +503,7 @@ mod tests {
             severity = "critical"
 
             [actions]
-            approval_ttl = "1h"
+            approval_ttl = "1d"
             approve_token = ""
 
             [actions.systemd_restart]
@@ -606,7 +606,7 @@ mod tests {
         assert_eq!(cfg.listen, "127.0.0.1:7171");
         assert!(!cfg.dashboard);
         assert_eq!(cfg.detect.rules.len(), 1);
-        assert_eq!(cfg.actions.approval_ttl, "1h");
+        assert_eq!(cfg.actions.approval_ttl, "1d");
         assert!(cfg.actions.disk_prune.allow.is_empty());
         assert_eq!(cfg.actions.script_run.rate_per_hour, 4);
         assert!(cfg.collect.docker);

@@ -13,7 +13,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use pulseblade_core::{ActionRun, ActionRunStatus, ResourceKind, RiskTier};
+use pulseblade_core::{
+    bind_remedy_params, resource_kind_of_id, ActionRun, ActionRunStatus, FindingStatus,
+    ResourceKind, RiskTier,
+};
 use pulseblade_store::{Store, StoreError};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -278,6 +281,12 @@ impl Registry {
         if let Some(existing) = store.open_action_by_key(&key)? {
             return Ok(plan_of(&existing));
         }
+        if let Some(reason) = store.rejection(&resource_id, &req.action)? {
+            return Err(ActError::Invalid(format!(
+                "{} on {resource_id} was denied: {reason}",
+                req.action
+            )));
+        }
         let since = Utc::now() - chrono::Duration::hours(1);
         let used = store.count_actions_since(&req.action, since)?;
         let rate = self.rate(&req.action);
@@ -305,7 +314,7 @@ impl Registry {
 
     /// Start a planned run. Approve-tier runs wait; this call returns immediately.
     pub fn execute(&self, store: &Store, plan_id: &str) -> Result<ActionRun, ActError> {
-        store.expire_actions(Utc::now())?;
+        self.sweep(store)?;
         let run = self.load(store, plan_id)?;
         if run.status != ActionRunStatus::Planned {
             return Ok(run);
@@ -331,7 +340,7 @@ impl Registry {
             ),
             RiskTier::Approve => {
                 let exp = Utc::now() + self.ttl;
-                Ok(store.transition_action(
+                let waiting = store.transition_action(
                     &run.id,
                     pulseblade_store::ActionTransition {
                         from: ActionRunStatus::Planned,
@@ -340,27 +349,44 @@ impl Registry {
                         expires_at: Some(exp),
                         event: "execute",
                     },
-                )?)
+                )?;
+                store.record_basis(&waiting.id)?;
+                Ok(waiting)
             }
             RiskTier::Auto => self.invoke(store, &run),
         }
     }
 
     pub fn status(&self, store: &Store, run_id: &str) -> Result<ActionRun, ActError> {
-        store.expire_actions(Utc::now())?;
+        self.sweep(store)?;
         self.load(store, run_id)
     }
 
-    /// Run an approve-tier action that is still inside its approval window.
+    /// Run an approve-tier action that still matches the open finding and resource.
     pub fn approve(&self, store: &Store, run_id: &str) -> Result<ActionRun, ActError> {
-        let now = Utc::now();
-        store.expire_actions(now)?;
+        self.sweep(store)?;
         let run = self.load(store, run_id)?;
         if run.status != ActionRunStatus::AwaitingApproval {
             return Err(ActError::Invalid(format!(
                 "run {} is {}, not awaiting approval",
                 run.id,
                 run.status.as_str()
+            )));
+        }
+        if let Some(why) = store.approval_block(&run)? {
+            store.transition_action(
+                &run.id,
+                pulseblade_store::ActionTransition {
+                    from: ActionRunStatus::AwaitingApproval,
+                    to: ActionRunStatus::Expired,
+                    output: Some(why),
+                    expires_at: None,
+                    event: "expire",
+                },
+            )?;
+            return Err(ActError::Invalid(format!(
+                "run {} was not approved ({why})",
+                run.id
             )));
         }
         let claimed = store.transition_action(
@@ -384,9 +410,43 @@ impl Registry {
     }
 
     /// Cancel an approve-tier run that is still waiting. The command does not start.
-    pub fn deny(&self, store: &Store, run_id: &str) -> Result<ActionRun, ActError> {
-        store.expire_actions(Utc::now())?;
+    /// `reason` is stored on the run and blocks this action on this resource only.
+    pub fn deny(&self, store: &Store, run_id: &str, reason: &str) -> Result<ActionRun, ActError> {
+        let reason = reason.trim();
+        if reason.is_empty() {
+            return Err(ActError::Invalid("deny requires a reason".into()));
+        }
+        self.sweep(store)?;
         let run = self.load(store, run_id)?;
+        if run.status != ActionRunStatus::AwaitingApproval {
+            return Err(ActError::Invalid(format!(
+                "run {} is {}, not awaiting approval",
+                run.id,
+                run.status.as_str()
+            )));
+        }
+        let done = self.finish(
+            store,
+            &run.id,
+            ActionRunStatus::AwaitingApproval,
+            ActionRunStatus::Rejected,
+            Some(reason),
+            "deny",
+        )?;
+        store.record_rejection(&done.resource_id, &done.action, reason)?;
+        Ok(done)
+    }
+
+    /// Close this request only. The finding stays open. No remedy and no rejection.
+    pub fn dismiss(&self, store: &Store, run_id: &str) -> Result<ActionRun, ActError> {
+        self.sweep(store)?;
+        let run = self.load(store, run_id)?;
+        if matches!(
+            run.status,
+            ActionRunStatus::Expired | ActionRunStatus::Rejected
+        ) {
+            return Ok(run);
+        }
         if run.status != ActionRunStatus::AwaitingApproval {
             return Err(ActError::Invalid(format!(
                 "run {} is {}, not awaiting approval",
@@ -398,10 +458,75 @@ impl Registry {
             store,
             &run.id,
             ActionRunStatus::AwaitingApproval,
-            ActionRunStatus::Rejected,
-            Some("denied: command not executed"),
-            "deny",
+            ActionRunStatus::Expired,
+            Some("dismissed"),
+            "dismiss",
         )
+    }
+
+    /// Re-read the finding and resource. An unchanged failure keeps or restores
+    /// the same waiting run. A change drops the plan. This does not call a model
+    /// and does not start the command.
+    pub fn recheck(&self, store: &Store, run_id: &str) -> Result<ActionRun, ActError> {
+        self.sweep(store)?;
+        let run = self.load(store, run_id)?;
+        if !matches!(
+            run.status,
+            ActionRunStatus::AwaitingApproval | ActionRunStatus::Expired
+        ) {
+            return Err(ActError::Invalid(format!(
+                "run {} is {}, not waiting",
+                run.id,
+                run.status.as_str()
+            )));
+        }
+        if let Some(why) = store.approval_block(&run)? {
+            if run.status == ActionRunStatus::AwaitingApproval {
+                return self.finish(
+                    store,
+                    &run.id,
+                    ActionRunStatus::AwaitingApproval,
+                    ActionRunStatus::Expired,
+                    Some(why),
+                    "expire",
+                );
+            }
+            if run.output.as_deref() != Some(why) {
+                return Ok(store.transition_action(
+                    &run.id,
+                    pulseblade_store::ActionTransition {
+                        from: ActionRunStatus::Expired,
+                        to: ActionRunStatus::Expired,
+                        output: Some(why),
+                        expires_at: None,
+                        event: "expire",
+                    },
+                )?);
+            }
+            return Ok(run);
+        }
+        if !store.finding_still_open(&run)? {
+            return Ok(run);
+        }
+        let exp = Utc::now() + self.ttl;
+        if run.status == ActionRunStatus::AwaitingApproval {
+            return Ok(store.transition_action(
+                &run.id,
+                pulseblade_store::ActionTransition {
+                    from: ActionRunStatus::AwaitingApproval,
+                    to: ActionRunStatus::AwaitingApproval,
+                    output: None,
+                    expires_at: Some(exp),
+                    event: "recheck",
+                },
+            )?);
+        }
+        Ok(store.reopen_approval(&run.id, exp)?)
+    }
+
+    fn sweep(&self, store: &Store) -> Result<(), ActError> {
+        store.expire_actions(Utc::now(), self.ttl)?;
+        Ok(())
     }
 
     fn invoke(&self, store: &Store, run: &ActionRun) -> Result<ActionRun, ActError> {
@@ -529,6 +654,50 @@ impl Registry {
             supports_dry_run: true,
         }
     }
+}
+
+/// Plan params for a resolved remedy after the workload changed. `None` when
+/// nothing matches or the action was denied for this resource. Does not call a model.
+pub fn known_remedy_params(store: &Store, run: &ActionRun) -> Result<Option<PlanParams>, ActError> {
+    if run.output.as_deref() != Some("resource changed") {
+        return Ok(None);
+    }
+    let Some(finding_id) = run.finding_id.clone().filter(|id| !id.is_empty()) else {
+        return Ok(None);
+    };
+    let Some(finding) = store.finding(&finding_id)? else {
+        return Ok(None);
+    };
+    if finding.status == FindingStatus::Resolved {
+        return Ok(None);
+    }
+    let kind = resource_kind_of_id(&run.resource_id).unwrap_or("");
+    let page = store.remedy_page(
+        &finding.rule,
+        kind,
+        Some(&finding_id),
+        Some(&run.resource_id),
+    )?;
+    let Some(matched) = page.matched else {
+        return Ok(None);
+    };
+    if page
+        .rejections
+        .iter()
+        .any(|row| row.action == matched.action)
+    {
+        return Ok(None);
+    }
+    let params = bind_remedy_params(&matched.params, &run.resource_id)
+        .ok_or_else(|| ActError::Invalid("remedy params do not bind to this resource".into()))?;
+    Ok(Some(PlanParams {
+        action: matched.action,
+        params,
+        resource_id: Some(run.resource_id.clone()),
+        idempotency_key: None,
+        dry_run: false,
+        finding_id: Some(finding_id),
+    }))
 }
 
 const NAMES: &[&str] = &[
@@ -1540,5 +1709,419 @@ mod tests {
         let first = plan_script(&reg, &store, false);
         let second = plan_script(&reg, &store, false);
         assert_eq!(first.plan_id, second.plan_id);
+    }
+
+    const WORKLOAD: &str = "workload:demo:pb-fault:deployment:pb-fault-loop";
+
+    fn put_workload(store: &Store, health: pulseblade_core::Health, ready: &str, kind: &str) {
+        use pulseblade_core::{Observation, Resource, ResourceKind};
+        store
+            .apply(
+                "k8s",
+                Utc::now(),
+                &Observation {
+                    resources: vec![Resource::new(
+                        WORKLOAD,
+                        ResourceKind::Workload,
+                        "pb-fault-loop",
+                    )
+                    .health(health)
+                    .label("namespace", "pb-fault")
+                    .attr("kind", kind)
+                    .attr("ready", ready)],
+                    samples: vec![],
+                    logs: vec![],
+                },
+            )
+            .unwrap();
+    }
+
+    fn open_workload_finding(store: &Store) -> String {
+        use pulseblade_core::Severity;
+        use pulseblade_store::FindingDraft;
+        let opened = store
+            .reconcile_findings(
+                &[FindingDraft {
+                    dedupe_key: format!("health:{WORKLOAD}"),
+                    resource_id: WORKLOAD.into(),
+                    rule: "health".into(),
+                    severity: Severity::Critical,
+                    summary: "pb-fault-loop is failed".into(),
+                    context: vec![],
+                    logs: vec![],
+                }],
+                Utc::now(),
+            )
+            .unwrap();
+        opened[0].id.clone()
+    }
+
+    fn k8s_reg(api: Arc<RecK8s>) -> Registry {
+        Registry::new(ActionsConfig::default(), Arc::new(FakeRunner::ok()))
+            .unwrap()
+            .with_k8s(k8s_endpoint(), api)
+    }
+
+    fn waiting_rollout(reg: &Registry, store: &Store, finding_id: &str, key: &str) -> ActionRun {
+        let planned = reg
+            .plan(
+                store,
+                PlanParams {
+                    action: "k8s.rollout_restart".into(),
+                    params: json!({
+                        "namespace": "pb-fault",
+                        "name": "pb-fault-loop",
+                        "kind": "deployment"
+                    }),
+                    resource_id: Some(WORKLOAD.into()),
+                    idempotency_key: Some(key.into()),
+                    dry_run: false,
+                    finding_id: Some(finding_id.into()),
+                },
+            )
+            .unwrap();
+        let held = reg.execute(store, &planned.plan_id).unwrap();
+        assert_eq!(held.status, ActionRunStatus::AwaitingApproval);
+        held
+    }
+
+    #[test]
+    fn still_failed_workload_is_not_expired_at_one_hour() {
+        let api = Arc::new(RecK8s {
+            calls: Mutex::new(Vec::new()),
+        });
+        let reg = k8s_reg(api.clone());
+        let store = Store::open_in_memory().unwrap();
+        put_workload(&store, pulseblade_core::Health::Failed, "0/1", "deployment");
+        let finding = open_workload_finding(&store);
+        let held = waiting_rollout(&reg, &store, &finding, "roll-hour");
+        store
+            .transition_action(
+                &held.id,
+                pulseblade_store::ActionTransition {
+                    from: ActionRunStatus::AwaitingApproval,
+                    to: ActionRunStatus::AwaitingApproval,
+                    output: None,
+                    expires_at: Some(held.created_at + chrono::Duration::hours(1)),
+                    event: "execute",
+                },
+            )
+            .unwrap();
+        let hour = held.created_at + chrono::Duration::hours(1) + chrono::Duration::seconds(1);
+        assert_eq!(
+            store
+                .expire_actions(hour, chrono::Duration::days(1))
+                .unwrap(),
+            0
+        );
+        let still = store.action(&held.id).unwrap().unwrap();
+        assert_eq!(still.status, ActionRunStatus::AwaitingApproval);
+        assert!(api.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn waiting_run_expires_when_the_finding_resolves() {
+        let api = Arc::new(RecK8s {
+            calls: Mutex::new(Vec::new()),
+        });
+        let reg = k8s_reg(api.clone());
+        let store = Store::open_in_memory().unwrap();
+        put_workload(&store, pulseblade_core::Health::Failed, "0/1", "deployment");
+        let finding = open_workload_finding(&store);
+        let held = waiting_rollout(&reg, &store, &finding, "roll-clear");
+        store.reconcile_findings(&[], Utc::now()).unwrap();
+        store
+            .expire_actions(Utc::now(), chrono::Duration::days(1))
+            .unwrap();
+        let gone = store.action(&held.id).unwrap().unwrap();
+        assert_eq!(gone.status, ActionRunStatus::Expired);
+        assert_eq!(gone.output.as_deref(), Some("finding resolved"));
+        assert!(api.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn waiting_run_expires_when_health_ready_or_params_change() {
+        let cases = [
+            (
+                pulseblade_core::Health::Degraded,
+                "0/1",
+                "deployment",
+                "health",
+            ),
+            (
+                pulseblade_core::Health::Failed,
+                "1/1",
+                "deployment",
+                "ready",
+            ),
+            (
+                pulseblade_core::Health::Failed,
+                "0/1",
+                "statefulset",
+                "params",
+            ),
+        ];
+        for (i, (health, ready, kind, label)) in cases.into_iter().enumerate() {
+            let api = Arc::new(RecK8s {
+                calls: Mutex::new(Vec::new()),
+            });
+            let reg = k8s_reg(api.clone());
+            let store = Store::open_in_memory().unwrap();
+            put_workload(&store, pulseblade_core::Health::Failed, "0/1", "deployment");
+            let finding = open_workload_finding(&store);
+            let held = waiting_rollout(&reg, &store, &finding, &format!("roll-{i}"));
+            put_workload(&store, health, ready, kind);
+            store
+                .expire_actions(Utc::now(), chrono::Duration::days(1))
+                .unwrap();
+            let gone = store.action(&held.id).unwrap().unwrap();
+            assert_eq!(gone.status, ActionRunStatus::Expired, "{label}");
+            assert_eq!(gone.output.as_deref(), Some("resource changed"), "{label}");
+            assert!(api.calls.lock().unwrap().is_empty(), "{label}");
+        }
+    }
+
+    #[test]
+    fn one_day_backstop_expires_an_abandoned_run() {
+        let api = Arc::new(RecK8s {
+            calls: Mutex::new(Vec::new()),
+        });
+        let reg = k8s_reg(api.clone());
+        let store = Store::open_in_memory().unwrap();
+        put_workload(&store, pulseblade_core::Health::Failed, "0/1", "deployment");
+        let finding = open_workload_finding(&store);
+        let held = waiting_rollout(&reg, &store, &finding, "roll-day");
+        let later = held.created_at + chrono::Duration::days(1) + chrono::Duration::seconds(2);
+        store
+            .expire_actions(later, chrono::Duration::days(1))
+            .unwrap();
+        let gone = store.action(&held.id).unwrap().unwrap();
+        assert_eq!(gone.status, ActionRunStatus::Expired);
+        assert_eq!(gone.output.as_deref(), Some("approval window elapsed"));
+        assert!(api.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn approve_refuses_a_mismatched_plan_and_does_not_run() {
+        let api = Arc::new(RecK8s {
+            calls: Mutex::new(Vec::new()),
+        });
+        let reg = k8s_reg(api.clone());
+        let store = Store::open_in_memory().unwrap();
+        put_workload(&store, pulseblade_core::Health::Failed, "0/1", "deployment");
+        let finding = open_workload_finding(&store);
+        let held = waiting_rollout(&reg, &store, &finding, "roll-approve");
+        put_workload(
+            &store,
+            pulseblade_core::Health::Degraded,
+            "1/1",
+            "deployment",
+        );
+        let err = reg.approve(&store, &held.id).unwrap_err();
+        assert!(err.to_string().contains("not awaiting") || err.to_string().contains("resource"));
+        let gone = store.action(&held.id).unwrap().unwrap();
+        assert_eq!(gone.status, ActionRunStatus::Expired);
+        assert_eq!(gone.output.as_deref(), Some("resource changed"));
+        assert!(api.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn deny_without_a_reason_is_rejected() {
+        let api = Arc::new(RecK8s {
+            calls: Mutex::new(Vec::new()),
+        });
+        let reg = k8s_reg(api);
+        let store = Store::open_in_memory().unwrap();
+        put_workload(&store, pulseblade_core::Health::Failed, "0/1", "deployment");
+        let finding = open_workload_finding(&store);
+        let held = waiting_rollout(&reg, &store, &finding, "roll-empty");
+        let err = reg.deny(&store, &held.id, "  ").unwrap_err();
+        assert!(err.to_string().contains("reason"));
+        assert_eq!(
+            store.action(&held.id).unwrap().unwrap().status,
+            ActionRunStatus::AwaitingApproval
+        );
+    }
+
+    #[test]
+    fn deny_with_a_reason_blocks_that_action_and_is_not_a_remedy() {
+        let api = Arc::new(RecK8s {
+            calls: Mutex::new(Vec::new()),
+        });
+        let reg = k8s_reg(api.clone());
+        let store = Store::open_in_memory().unwrap();
+        put_workload(&store, pulseblade_core::Health::Failed, "0/1", "deployment");
+        let finding = open_workload_finding(&store);
+        let held = waiting_rollout(&reg, &store, &finding, "roll-deny");
+        let denied = reg.deny(&store, &held.id, "port is closed").unwrap();
+        assert_eq!(denied.status, ActionRunStatus::Rejected);
+        assert_eq!(denied.output.as_deref(), Some("port is closed"));
+        assert_eq!(
+            store
+                .rejection(WORKLOAD, "k8s.rollout_restart")
+                .unwrap()
+                .as_deref(),
+            Some("port is closed")
+        );
+        store.reconcile_findings(&[], Utc::now()).unwrap();
+        let later = store.action(&held.id).unwrap().unwrap();
+        assert_eq!(
+            later.finding_outcome,
+            Some(pulseblade_core::FindingOutcome::Resolved)
+        );
+        assert!(store
+            .remedy_page("health", "workload", Some(&finding), Some(WORKLOAD))
+            .unwrap()
+            .matched
+            .is_none());
+        let again = reg.plan(
+            &store,
+            PlanParams {
+                action: "k8s.rollout_restart".into(),
+                params: json!({
+                    "namespace": "pb-fault",
+                    "name": "pb-fault-loop",
+                    "kind": "deployment"
+                }),
+                resource_id: Some(WORKLOAD.into()),
+                idempotency_key: Some("roll-again".into()),
+                dry_run: false,
+                finding_id: Some(finding),
+            },
+        );
+        assert!(again.unwrap_err().to_string().contains("denied"));
+        let other = reg
+            .plan(
+                &store,
+                PlanParams {
+                    action: "k8s.rollout_restart".into(),
+                    params: json!({"namespace": "other", "name": "api", "kind": "deployment"}),
+                    resource_id: Some("workload:demo:other:deployment:api".into()),
+                    idempotency_key: Some("roll-other".into()),
+                    dry_run: false,
+                    finding_id: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(other.status, ActionRunStatus::Planned);
+        assert!(api.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn dismiss_closes_the_run_without_a_remedy_or_rejection() {
+        let api = Arc::new(RecK8s {
+            calls: Mutex::new(Vec::new()),
+        });
+        let reg = k8s_reg(api.clone());
+        let store = Store::open_in_memory().unwrap();
+        put_workload(&store, pulseblade_core::Health::Failed, "0/1", "deployment");
+        let finding = open_workload_finding(&store);
+        let held = waiting_rollout(&reg, &store, &finding, "roll-dismiss");
+        let closed = reg.dismiss(&store, &held.id).unwrap();
+        assert_eq!(closed.status, ActionRunStatus::Expired);
+        assert_eq!(closed.output.as_deref(), Some("dismissed"));
+        let still = store.finding(&finding).unwrap().unwrap();
+        assert_eq!(still.status, pulseblade_core::FindingStatus::Open);
+        assert!(store
+            .rejection(WORKLOAD, "k8s.rollout_restart")
+            .unwrap()
+            .is_none());
+        assert!(store
+            .remedy_page("health", "workload", Some(&finding), Some(WORKLOAD))
+            .unwrap()
+            .matched
+            .is_none());
+        assert!(api.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn recheck_on_an_unchanged_failure_refreshes_the_waiting_run() {
+        let api = Arc::new(RecK8s {
+            calls: Mutex::new(Vec::new()),
+        });
+        let reg = k8s_reg(api.clone());
+        let store = Store::open_in_memory().unwrap();
+        put_workload(&store, pulseblade_core::Health::Failed, "0/1", "deployment");
+        let finding = open_workload_finding(&store);
+        let held = waiting_rollout(&reg, &store, &finding, "roll-recheck");
+        let later = held.created_at + chrono::Duration::days(1) + chrono::Duration::seconds(2);
+        store
+            .expire_actions(later, chrono::Duration::days(1))
+            .unwrap();
+        assert_eq!(
+            store.action(&held.id).unwrap().unwrap().status,
+            ActionRunStatus::Expired
+        );
+        let again = reg.recheck(&store, &held.id).unwrap();
+        assert_eq!(again.status, ActionRunStatus::AwaitingApproval);
+        let fresh = again.expires_at.expect("fresh backstop");
+        assert!(fresh > Utc::now() + chrono::Duration::hours(12));
+        assert!(api.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn recheck_on_a_changed_workload_files_a_known_remedy_without_a_model() {
+        let api = Arc::new(RecK8s {
+            calls: Mutex::new(Vec::new()),
+        });
+        let reg = k8s_reg(api.clone());
+        let store = Store::open_in_memory().unwrap();
+        put_workload(&store, pulseblade_core::Health::Failed, "0/1", "deployment");
+        let first = open_workload_finding(&store);
+        let learned = store
+            .insert_action(
+                &pulseblade_store::NewAction {
+                    action: "k8s.rollout_restart".into(),
+                    resource_id: WORKLOAD.into(),
+                    params: json!({
+                        "namespace": "pb-fault",
+                        "name": "pb-fault-loop",
+                        "kind": "deployment"
+                    }),
+                    idempotency_key: "learned".into(),
+                    tier: RiskTier::Approve,
+                    dry_run: false,
+                    finding_id: Some(first.clone()),
+                },
+                Utc::now(),
+            )
+            .unwrap();
+        store
+            .transition_action(
+                &learned.id,
+                pulseblade_store::ActionTransition {
+                    from: ActionRunStatus::Planned,
+                    to: ActionRunStatus::Succeeded,
+                    output: Some("restarted"),
+                    expires_at: None,
+                    event: "finish",
+                },
+            )
+            .unwrap();
+        store.reconcile_findings(&[], Utc::now()).unwrap();
+        let _ = store.action(&learned.id).unwrap().unwrap();
+        assert!(store
+            .remedy_page("health", "workload", None, None)
+            .unwrap()
+            .matched
+            .is_some());
+
+        put_workload(&store, pulseblade_core::Health::Failed, "0/1", "deployment");
+        let finding = open_workload_finding(&store);
+        let held = waiting_rollout(&reg, &store, &finding, "roll-changed");
+        put_workload(
+            &store,
+            pulseblade_core::Health::Degraded,
+            "1/1",
+            "deployment",
+        );
+        let dropped = reg.recheck(&store, &held.id).unwrap();
+        assert_eq!(dropped.status, ActionRunStatus::Expired);
+        assert_eq!(dropped.output.as_deref(), Some("resource changed"));
+        let params = known_remedy_params(&store, &dropped).unwrap().unwrap();
+        let planned = reg.plan(&store, params).unwrap();
+        assert_eq!(planned.status, ActionRunStatus::Planned);
+        assert_eq!(planned.finding_id.as_deref(), Some(finding.as_str()));
+        assert!(api.calls.lock().unwrap().is_empty());
     }
 }

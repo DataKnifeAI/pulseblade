@@ -23,6 +23,13 @@ pub struct RemedyRow {
     pub outcome: String,
 }
 
+/// A deny for one resource and one action. It is not a remedy.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ActionRejection {
+    pub action: String,
+    pub reason: String,
+}
+
 /// What the pilot asks before a model call.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RemedyPage {
@@ -31,6 +38,9 @@ pub struct RemedyPage {
     pub matched: Option<RemedyRow>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub closest: Vec<RemedyRow>,
+    /// Denies for this resource id. They block that action name only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rejections: Vec<ActionRejection>,
 }
 
 impl Store {
@@ -73,6 +83,7 @@ impl Store {
         rule: &str,
         kind: &str,
         finding_id: Option<&str>,
+        resource_id: Option<&str>,
     ) -> crate::Result<RemedyPage> {
         let open_plan = finding_id
             .filter(|id| !id.is_empty())
@@ -89,10 +100,19 @@ impl Store {
         } else {
             self.remedy_closest(rule, kind, 3)?
         };
+        let rejections = match resource_id.filter(|id| !id.is_empty()) {
+            Some(id) => self
+                .rejections_for(id)?
+                .into_iter()
+                .map(|(action, reason)| ActionRejection { action, reason })
+                .collect(),
+            None => Vec::new(),
+        };
         Ok(RemedyPage {
             open_plan,
             matched,
             closest,
+            rejections,
         })
     }
 
@@ -269,7 +289,7 @@ mod tests {
             .unwrap();
         assert_eq!(open.finding_outcome, Some(FindingOutcome::StillOpen));
         assert!(store
-            .remedy_page("health", "workload", None)
+            .remedy_page("health", "workload", None, None)
             .unwrap()
             .matched
             .is_none());
@@ -277,7 +297,7 @@ mod tests {
         store.reconcile_findings(&[], now).unwrap();
         let done = store.action(&run.id).unwrap().unwrap();
         assert_eq!(done.finding_outcome, Some(FindingOutcome::Resolved));
-        let page = store.remedy_page("health", "workload", None).unwrap();
+        let page = store.remedy_page("health", "workload", None, None).unwrap();
         let row = page.matched.expect("resolved rollout is a remedy");
         assert_eq!(row.action, "k8s.rollout_restart");
         assert_eq!(row.rule, "health");
@@ -325,7 +345,7 @@ mod tests {
         let later = store.action(&run.id).unwrap().unwrap();
         assert_eq!(later.finding_outcome, Some(FindingOutcome::Resolved));
         assert!(store
-            .remedy_page("health", "workload", Some(&finding_id))
+            .remedy_page("health", "workload", Some(&finding_id), None)
             .unwrap()
             .matched
             .is_none());

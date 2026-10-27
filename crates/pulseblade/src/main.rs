@@ -163,7 +163,11 @@ enum Ctl {
     /// Approve an action that is waiting for a human.
     Approve { run_id: String },
     /// Cancel an action that is waiting for a human. The command does not start.
-    Deny { run_id: String },
+    Deny { run_id: String, reason: String },
+    /// Close a waiting approval. The finding stays open and the command does not start.
+    Dismiss { run_id: String },
+    /// Re-read the resource and refresh or drop the waiting approval.
+    Recheck { run_id: String },
     /// Recent pilot investigations, newest first.
     Runs,
 }
@@ -778,9 +782,17 @@ fn run_ctl(store: &Store, db: &Path, config: &Config, command: Ctl) -> anyhow::R
             let reg = action_registry(config)?;
             print_json(&reg.approve(store, &run_id)?)
         }
-        Ctl::Deny { run_id } => {
+        Ctl::Deny { run_id, reason } => {
             let reg = action_registry(config)?;
-            print_json(&reg.deny(store, &run_id)?)
+            print_json(&reg.deny(store, &run_id, &reason)?)
+        }
+        Ctl::Dismiss { run_id } => {
+            let reg = action_registry(config)?;
+            print_json(&reg.dismiss(store, &run_id)?)
+        }
+        Ctl::Recheck { run_id } => {
+            let reg = action_registry(config)?;
+            print_json(&reg.recheck(store, &run_id)?)
         }
         Ctl::Runs => print_json(&store.recent_pilot_runs(20)?),
     }
