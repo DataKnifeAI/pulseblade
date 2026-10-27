@@ -59,17 +59,18 @@ pub struct Session {
     seen: BTreeSet<String>,
     /// Finding id to the signature last investigated, including error and escalate.
     signatures: BTreeMap<String, String>,
-    heartbeat_at: Instant,
+    /// Failure changes already sent to the model. A replay is not a new failure.
+    change_seen: BTreeSet<String>,
 }
 
 impl Session {
-    pub fn new(config: PilotConfig, now: Instant) -> Self {
+    pub fn new(config: PilotConfig, _now: Instant) -> Self {
         Self {
             config,
             seq: 0,
             seen: BTreeSet::new(),
             signatures: BTreeMap::new(),
-            heartbeat_at: now,
+            change_seen: BTreeSet::new(),
         }
     }
 
@@ -78,7 +79,7 @@ impl Session {
         &mut self,
         tools: &mut T,
         chat: &mut C,
-        now: Instant,
+        _now: Instant,
     ) -> Result<Option<PilotRun>, String> {
         let findings = tools.call(
             "findings_list",
@@ -90,47 +91,46 @@ impl Session {
         )?;
         let seq = seq_of(&findings).max(seq_of(&changes)).max(self.seq);
         let open = open_findings(&findings);
-        let change_list = changes
-            .get("changes")
-            .and_then(|c| c.as_array())
-            .map(|list| {
-                list.iter()
-                    .filter(|c| wakes_pilot(c))
-                    .cloned()
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        let elapsed = now
-            .checked_duration_since(self.heartbeat_at)
-            .unwrap_or(Duration::ZERO);
-        let heartbeat_due = elapsed >= Duration::from_secs(self.config.heartbeat_secs.max(1));
-        if heartbeat_due {
-            self.heartbeat_at = now;
-        }
+        // The first poll from seq 0 is the oldest page of the journal. On a
+        // live hub that page is truncated history, not something that just
+        // failed. Catch the cursor up and do not call the model for it.
+        let startup_backlog =
+            self.seq == 0 && changes.get("truncated").and_then(|v| v.as_bool()) == Some(true);
+        let change_list = if startup_backlog {
+            Vec::new()
+        } else {
+            changes
+                .get("changes")
+                .and_then(|c| c.as_array())
+                .map(|list| {
+                    list.iter()
+                        .filter(|c| wakes_pilot(c))
+                        .filter(|c| !self.change_seen.contains(&change_signature(c)))
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+        // The timer is not a reason to call the model. A call happens when a
+        // finding is new or its signature changed, or when a resource's health
+        // became failed or degraded. An investigation that already failed to
+        // root-cause that same signature does not run again.
         let fresh: Vec<_> = open
             .iter()
-            .filter(|f| !self.seen.contains(&f.id))
+            .filter(|finding| match self.signatures.get(&finding.id) {
+                Some(sig) => sig != &finding_signature(finding),
+                None => !self.seen.contains(&finding.id),
+            })
             .cloned()
             .collect();
         let wake_findings = self.config.wakes_on("findings") && !fresh.is_empty();
-        let wake_changes = self.config.wakes_on("changes") && !change_list.is_empty();
-        // An unchanged heartbeat is not a recheck. Every open finding that still
-        // has the signature from the last investigate stays quiet. No open
-        // finding means no model call: ordinary cluster changes are not a wake
-        // unless `wake_on` includes changes, and that path is `wake_changes`.
-        let signatures_hold = !open.is_empty()
-            && open.iter().all(|finding| {
-                self.signatures
-                    .get(&finding.id)
-                    .is_some_and(|sig| sig == &finding_signature(finding))
-            });
-        let wake_heart = heartbeat_due && !open.is_empty() && !signatures_hold;
+        // A health failure is a root-cause wake on its own. `wake_on` does not
+        // have to list changes, and listing changes does not add routine ones.
+        let wake_changes = !change_list.is_empty();
         let trigger = if wake_findings {
             format!("finding:{}", fresh[0].id)
         } else if wake_changes {
             "changes".into()
-        } else if wake_heart {
-            "heartbeat".into()
         } else if let Some(run) = file_open_probe_fixes(tools, &open) {
             self.seq = seq;
             return Ok(Some(run));
@@ -202,9 +202,14 @@ impl Session {
         }
         for finding in &open {
             self.seen.insert(finding.id.clone());
+            self.signatures
+                .insert(finding.id.clone(), finding_signature(finding));
+        }
+        for change in &change_list {
+            self.change_seen.insert(change_signature(change));
         }
         self.seq = seq;
-        if model_focus.is_empty() && !filed.is_empty() {
+        if change_list.is_empty() && model_focus.is_empty() && !filed.is_empty() {
             return Ok(Some(PilotRun {
                 trigger,
                 tier: String::new(),
@@ -217,18 +222,27 @@ impl Session {
                 detail: "action_plan".into(),
             }));
         }
-        // Every finding already has a plan. A change with no finding still investigates.
-        if model_focus.is_empty() && !focus.is_empty() {
+        // Every finding already has a plan, and nothing new failed.
+        if change_list.is_empty() && model_focus.is_empty() && !focus.is_empty() {
             return Ok(None);
         }
         let digest = digest(&model_focus, &change_list, &notes, &closest, &denials, seq);
         let run = investigate(&self.config, tools, chat, &trigger, &digest, &model_focus);
-        for finding in &model_focus {
-            self.signatures
-                .insert(finding.id.clone(), finding_signature(finding));
-        }
         Ok(Some(run))
     }
+}
+
+fn change_signature(change: &Value) -> String {
+    let text = |key| change.get(key).map(|v| v.to_string()).unwrap_or_default();
+    format!(
+        "{}\n{}\n{}\n{}\n{}\n{}",
+        text("seq"),
+        text("resource_id"),
+        text("kind"),
+        text("field"),
+        text("before"),
+        text("after")
+    )
 }
 
 fn finding_signature(finding: &OpenFinding) -> String {
@@ -785,18 +799,11 @@ fn digest(
     text
 }
 
-/// Process start/stop does not wake the pilot, and neither does any process
-/// journal line other than a stored health change. The 50–90% host-share
-/// band is display-only, so it never becomes a health line. Failed and
-/// degraded (memory) still wake, and so does a finding.
+/// A journal line wakes the model only when stored health became failed or
+/// degraded. Process start/stop, the display-only busy band, and routine
+/// field updates (replicas, labels, a recovery to ok) do not. A finding is a
+/// separate wake.
 fn wakes_pilot(change: &Value) -> bool {
-    let id = change
-        .get("resource_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    if !id.starts_with("proc:") {
-        return true;
-    }
     let kind = change.get("kind").and_then(|v| v.as_str()).unwrap_or("");
     if kind == "appeared" || kind == "disappeared" {
         return false;
@@ -1365,7 +1372,7 @@ mod tests {
             .tick(&mut tools, &mut chat, later + Duration::from_secs(11))
             .unwrap()
             .unwrap();
-        assert_eq!(run.trigger, "heartbeat");
+        assert_eq!(run.trigger, "finding:f1");
         assert!(chat.n > calls);
     }
 
@@ -1434,7 +1441,7 @@ mod tests {
             .tick(&mut tools, &mut chat, later + Duration::from_secs(11))
             .unwrap()
             .unwrap();
-        assert_eq!(second.trigger, "heartbeat");
+        assert_eq!(second.trigger, "finding:f1");
         assert_eq!(second.status, "ok");
         assert!(tools.calls.iter().any(|c| c == "action_status"));
         assert_eq!(
@@ -1544,27 +1551,28 @@ mod tests {
     }
 
     #[test]
-    fn heartbeat_does_not_call_the_model_without_a_finding() {
-        let mut config = local_config();
-        config.wake_on = vec!["findings".into()];
-        config.heartbeat_secs = 10;
+    fn a_failure_wakes_once_and_a_routine_change_does_not() {
         let start = Instant::now();
-        let mut session = Session::new(config, start);
+        let mut session = Session::new(local_config(), start);
         let mut tools = quiet_tools(
             json!({"as_of_seq": 8, "findings": []}),
             json!({
                 "as_of_seq": 8,
                 "changes": [{
+                    "seq": 8,
                     "resource_id": "workload:c:ns:deployment:api",
                     "kind": "changed",
-                    "field": "health",
-                    "before": "ok",
-                    "after": "failed"
+                    "field": "attrs.replicas",
+                    "before": "1",
+                    "after": "2"
                 }]
             }),
         );
         let mut chat = ScriptChat {
-            rounds: vec![],
+            rounds: vec![
+                completion(json!([]), "failed"),
+                completion(json!([]), "failed again"),
+            ],
             n: 0,
             urls: vec![],
         };
@@ -1577,7 +1585,72 @@ mod tests {
             .unwrap()
             .is_none());
         assert_eq!(chat.n, 0);
-        assert!(chat.urls.is_empty());
+
+        let mut config = local_config();
+        config.wake_on = vec!["findings".into()];
+        let mut session = Session::new(config, start);
+        tools.changes = json!({
+            "as_of_seq": 9,
+            "changes": [{
+                "seq": 9,
+                "resource_id": "workload:c:ns:deployment:api",
+                "kind": "changed",
+                "field": "health",
+                "before": "ok",
+                "after": "failed"
+            }]
+        });
+        let run = session
+            .tick(&mut tools, &mut chat, start + Duration::from_secs(12))
+            .unwrap()
+            .expect("a health failure is a root-cause wake");
+        assert_eq!(run.trigger, "changes");
+        let calls = chat.n;
+        assert!(session
+            .tick(&mut tools, &mut chat, start + Duration::from_secs(30))
+            .unwrap()
+            .is_none());
+        assert_eq!(chat.n, calls);
+
+        tools.changes["changes"][0]["seq"] = json!(10);
+        tools.changes["as_of_seq"] = json!(10);
+        let again = session
+            .tick(&mut tools, &mut chat, start + Duration::from_secs(40))
+            .unwrap()
+            .expect("a later failure is a new change");
+        assert_eq!(again.trigger, "changes");
+        assert!(chat.n > calls);
+    }
+
+    #[test]
+    fn startup_backlog_does_not_call_the_model() {
+        let start = Instant::now();
+        let mut session = Session::new(local_config(), start);
+        let mut tools = quiet_tools(
+            json!({"as_of_seq": 900, "findings": []}),
+            json!({
+                "as_of_seq": 900,
+                "truncated": true,
+                "changes": [{
+                    "seq": 1,
+                    "resource_id": "workload:c:ns:deployment:api",
+                    "kind": "changed",
+                    "field": "health",
+                    "before": "ok",
+                    "after": "failed"
+                }]
+            }),
+        );
+        let mut chat = ScriptChat {
+            rounds: vec![completion(json!([]), "old")],
+            n: 0,
+            urls: vec![],
+        };
+        assert!(session
+            .tick(&mut tools, &mut chat, start)
+            .unwrap()
+            .is_none());
+        assert_eq!(chat.n, 0);
     }
 
     #[test]
@@ -1810,7 +1883,7 @@ mod tests {
             .tick(&mut tools, &mut chat, start + Duration::from_secs(22))
             .unwrap()
             .unwrap();
-        assert_eq!(again.trigger, "heartbeat");
+        assert_eq!(again.trigger, "finding:f1");
         assert!(chat.n > calls);
 
         let mut config = local_config();
@@ -1846,7 +1919,7 @@ mod tests {
             .tick(&mut tools, &mut chat, start + Duration::from_secs(22))
             .unwrap()
             .unwrap();
-        assert_eq!(woke.trigger, "heartbeat");
+        assert_eq!(woke.trigger, "finding:f1");
         assert_eq!(woke.status, "error");
     }
 

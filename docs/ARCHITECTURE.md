@@ -36,7 +36,7 @@ flowchart TB
 2. **Nodes own their policy.** The hub may plan and route an action, but the node evaluates it against its own risk tiers and allow-lists before running it. A compromised hub or confused pilot can never exceed what each node permits. Approval can happen at either tier.
 3. **Journals are the replication protocol.** Each node's change journal is append-only with monotonic `seq`. The hub keeps a per-node cursor and consumes changes after it; a disconnected node keeps journaling locally and the hub catches up on reconnect.
 4. **Nodes need no inbound ports.** Nodes connect out to the hub to push journal entries and samples and to long-poll for routed actions.
-5. **Pilots are event-driven.** On a single box the LLM competes for the CPU, GPU, and memory it observes, so the pilot wakes on findings (and on a slow heartbeat), not on every collection pass.
+5. **Pilots are event-driven.** On a single box the LLM competes for the CPU, GPU, and memory it observes, so the pilot wakes on a new or changed finding and on a health failure, not on a timer or every collection pass.
 
 ### Scaling the context window
 
@@ -175,7 +175,7 @@ External agent runtimes such as Hermes Agent do not need the pilot at all: they 
 
 ### Token strategy
 
-- **Zero LLM calls at steady state.** The pilot wakes on new findings or journal changes (and a slow heartbeat), never per collection pass.
+- **Zero LLM calls at steady state.** The pilot wakes on a new or changed finding, or when health became failed or degraded. The same finding and the same failure are not sent again. A routine journal line and the poll timer do not call the model.
 - **Deterministic pre-digestion in Rust.** Findings already carry causal context (recent changes on the resource, its parent, and its dependencies), so the first prompt is small and specific.
 - **Start from summaries and cursors.** Summary snapshot, `changes_since` from the last seen `as_of_seq`, `if_changed_since` on re-checks.
 - **Cap tool outputs** (limits, `detail=brief` at most, short `metrics_query` ranges) and truncate anything that still exceeds a per-call ceiling.

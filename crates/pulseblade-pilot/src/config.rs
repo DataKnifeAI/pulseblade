@@ -61,6 +61,7 @@ pub struct PilotConfig {
     pub enabled: bool,
     pub local_only: bool,
     pub wake_on: Vec<String>,
+    /// Accepted so existing config still parses. The poll timer does not call the model.
     pub heartbeat_secs: u64,
     /// Seconds between MCP polls. This is not an LLM call.
     pub poll_secs: u64,
