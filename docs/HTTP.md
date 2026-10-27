@@ -17,7 +17,8 @@ The node serves an LLM-free view of the same data on its HTTP port, next to `/mc
 | `/api/v1/findings` | `findings_list`: `status`, `severity`, `limit`, `detail` |
 | `/api/v1/logs` | `logs_query`: `resource`, `since`, `limit` |
 | `/api/v1/actions` | Recent action runs |
-| `POST /api/v1/actions/{id}/approve` | Approve a waiting run. Sends `Authorization: Bearer <actions.approve_token>` when that token is set |
+| `POST /api/v1/actions/{id}/approve` | Approve a waiting run. The node starts the command. Sends `Authorization: Bearer <actions.approve_token>` when that token is set |
+| `POST /api/v1/actions/{id}/deny` | Cancel a waiting run. The command does not start. Same token as approve |
 | `GET /api/v1/portal` | Dashboard clock defaults (`timezone`, `time_format` as `12h` or `24h`) and the health cutoffs (`pod_restart_window_mins`, `pod_restart_lifetime`, `proc_cpu_share_failed`, `proc_mem_degraded`, `proc_mem_failed`). A browser may store its own zone and format |
 | `PUT /api/v1/portal` | Save that health document. Unknown fields are rejected, including action tiers, allow-lists, `script.run`, and the clock defaults. A hub includes the saved document on `/hub/v1/poll` |
 | `/healthz` | `ok` |

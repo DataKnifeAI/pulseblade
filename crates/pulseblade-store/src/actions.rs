@@ -105,15 +105,61 @@ impl Store {
         Ok(u32::try_from(n).unwrap_or(u32::MAX))
     }
 
+    /// Waiting runs a person can approve. A routed body is the node's copy and
+    /// wins over a hub row with the same id.
     pub fn awaiting_action_count(&self) -> crate::Result<u64> {
-        let n = self.with_sql(|sql| {
-            sql.query_one(
-                "SELECT COUNT(*) FROM action_runs WHERE status = 'awaiting_approval'",
+        let mut waiting = std::collections::BTreeSet::new();
+        let mut covered = std::collections::BTreeSet::new();
+        for run in self.routed_runs()? {
+            covered.insert(run.id.clone());
+            if run.status == ActionRunStatus::AwaitingApproval {
+                waiting.insert(run.id);
+            }
+        }
+        let local = self.with_sql(|sql| {
+            sql.query(
+                "SELECT id FROM action_runs WHERE status = 'awaiting_approval'",
                 &[],
-                |row| row.int(0),
+                |row| row.text(0),
             )
         })?;
-        Ok(u64::try_from(n).unwrap_or(0))
+        for id in local {
+            if covered.insert(id.clone()) {
+                waiting.insert(id);
+            }
+        }
+        Ok(waiting.len() as u64)
+    }
+
+    /// Portal list: routed node runs plus local runs. Waiting runs are kept
+    /// even when they are older than the recent window. A routed body wins.
+    pub fn portal_actions(&self, limit: usize) -> crate::Result<Vec<ActionRun>> {
+        let limit = limit.clamp(1, 100);
+        let mut by_id = std::collections::BTreeMap::new();
+        for run in self.recent_actions(None, limit)? {
+            by_id.insert(run.id.clone(), run);
+        }
+        for mut run in self.routed_runs()? {
+            run.finding_outcome = None;
+            let run = self.attach_finding_outcome(run)?;
+            by_id.insert(run.id.clone(), run);
+        }
+        let mut waiting = Vec::new();
+        let mut rest = Vec::new();
+        for run in by_id.into_values() {
+            if run.status == ActionRunStatus::AwaitingApproval {
+                waiting.push(run);
+            } else {
+                rest.push(run);
+            }
+        }
+        let by_time =
+            |a: &ActionRun, b: &ActionRun| b.created_at.cmp(&a.created_at).then(b.id.cmp(&a.id));
+        waiting.sort_by(by_time);
+        rest.sort_by(by_time);
+        rest.truncate(limit);
+        waiting.append(&mut rest);
+        Ok(waiting)
     }
 
     /// Insert a planned run and the matching audit event.
@@ -610,5 +656,75 @@ mod tests {
             .unwrap();
         let cleared = store.action(&proxied.id).unwrap().unwrap();
         assert_eq!(cleared.finding_outcome, Some(FindingOutcome::Resolved));
+    }
+
+    #[test]
+    fn portal_lists_a_routed_run_the_hub_table_does_not_have() {
+        let store = Store::open_in_memory().unwrap();
+        let now = Utc::now();
+        let run = ActionRun {
+            id: "a1a17b4835310".into(),
+            action: "k8s.rollout_restart".into(),
+            resource_id: "workload:poc-apps:pb-fault:deployment:pb-fault-loop".into(),
+            params: json!({
+                "namespace": "pb-fault",
+                "name": "pb-fault-loop",
+                "kind": "deployment"
+            }),
+            idempotency_key: "k".into(),
+            tier: RiskTier::Approve,
+            status: ActionRunStatus::AwaitingApproval,
+            created_at: now,
+            dry_run: false,
+            expires_at: Some(now + chrono::Duration::minutes(30)),
+            output: None,
+            finding_id: Some("fc13a29631a17b47555a0".into()),
+            finding_outcome: None,
+        };
+        let body = serde_json::to_value(&run).unwrap();
+        store
+            .remember_plan(
+                &run.id,
+                "poc-apps-worker-2",
+                run.finding_id.as_deref(),
+                Some(run.resource_id.as_str()),
+            )
+            .unwrap();
+        store
+            .cache_run(&run.id, "poc-apps-worker-2", &body)
+            .unwrap();
+        assert!(store.recent_actions(None, 20).unwrap().is_empty());
+        let listed = store.portal_actions(20).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, run.id);
+        assert_eq!(listed[0].status, ActionRunStatus::AwaitingApproval);
+        assert_eq!(
+            listed[0].finding_id.as_deref(),
+            Some("fc13a29631a17b47555a0")
+        );
+        let on_resource = store.actions_for_resource(&run.resource_id, 8).unwrap();
+        assert_eq!(on_resource.len(), 1);
+        assert_eq!(on_resource[0].status, ActionRunStatus::AwaitingApproval);
+        assert_eq!(store.awaiting_action_count().unwrap(), 1);
+
+        let local = store.insert_action(&draft("local-wait"), now).unwrap();
+        store
+            .transition_action(
+                &local.id,
+                ActionTransition {
+                    from: ActionRunStatus::Planned,
+                    to: ActionRunStatus::AwaitingApproval,
+                    output: None,
+                    expires_at: None,
+                    event: "execute",
+                },
+            )
+            .unwrap();
+        assert_eq!(store.awaiting_action_count().unwrap(), 2);
+        let both = store.portal_actions(20).unwrap();
+        assert!(both.iter().any(|r| r.id == run.id));
+        assert!(both
+            .iter()
+            .any(|r| r.id == local.id && r.status == ActionRunStatus::AwaitingApproval));
     }
 }

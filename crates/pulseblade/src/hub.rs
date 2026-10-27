@@ -205,6 +205,32 @@ impl ActionRoute for HubInner {
             }
         }
     }
+
+    fn approve(&self, run_id: &str) -> Result<pulseblade_core::ActionRun, String> {
+        let node = self
+            .with_store(|store| store.plan_node(run_id))?
+            .ok_or_else(|| format!("unknown run {run_id}"))?;
+        let value = self.call(&node, "approve", serde_json::json!({ "run_id": run_id }))?;
+        let run: pulseblade_core::ActionRun =
+            serde_json::from_value(value).map_err(|e| e.to_string())?;
+        let run = self.annotate_run(run)?;
+        let body = serde_json::to_value(&run).map_err(|e| e.to_string())?;
+        self.with_store(|store| store.cache_run(&run.id, &node, &body))?;
+        Ok(run)
+    }
+
+    fn deny(&self, run_id: &str) -> Result<pulseblade_core::ActionRun, String> {
+        let node = self
+            .with_store(|store| store.plan_node(run_id))?
+            .ok_or_else(|| format!("unknown run {run_id}"))?;
+        let value = self.call(&node, "deny", serde_json::json!({ "run_id": run_id }))?;
+        let run: pulseblade_core::ActionRun =
+            serde_json::from_value(value).map_err(|e| e.to_string())?;
+        let run = self.annotate_run(run)?;
+        let body = serde_json::to_value(&run).map_err(|e| e.to_string())?;
+        self.with_store(|store| store.cache_run(&run.id, &node, &body))?;
+        Ok(run)
+    }
 }
 
 /// Keep a node-computed outcome. Fill the finding id the hub remembered, and
@@ -348,6 +374,20 @@ pub fn apply_job(reg: &Registry, store: &Store, job: &RouteJob) -> Result<Value,
             let run = reg
                 .status(store, &params.run_id)
                 .map_err(|e| e.to_string())?;
+            serde_json::to_value(&run).map_err(|e| e.to_string())
+        }
+        "approve" => {
+            let params: pulseblade_act::StatusParams =
+                serde_json::from_value(job.body.clone()).map_err(|e| e.to_string())?;
+            let run = reg
+                .approve(store, &params.run_id)
+                .map_err(|e| e.to_string())?;
+            serde_json::to_value(&run).map_err(|e| e.to_string())
+        }
+        "deny" => {
+            let params: pulseblade_act::StatusParams =
+                serde_json::from_value(job.body.clone()).map_err(|e| e.to_string())?;
+            let run = reg.deny(store, &params.run_id).map_err(|e| e.to_string())?;
             serde_json::to_value(&run).map_err(|e| e.to_string())
         }
         other => Err(format!("unknown route op {other}")),
@@ -1569,6 +1609,208 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         let _ = d1.join();
         let _ = d2.join();
+        shutdown.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn portal_approve_runs_the_command_on_the_node() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = CancellationToken::new();
+        let hub = new_hub(
+            store.clone(),
+            vec![("web1".into(), "token-web1".into())],
+            Duration::from_secs(3),
+        );
+        let stop_serve = shutdown.clone();
+        let served = hub.clone();
+        tokio::spawn(async move {
+            serve(
+                listener,
+                served,
+                vec!["127.0.0.1".into()],
+                stop_serve,
+                Arc::new(Registry::builtin()),
+                None,
+                PortalDefaults::default(),
+            )
+            .await
+            .ok();
+        });
+        let base = format!("http://{addr}");
+        let web1 = HubClient::plain(&base, "token-web1");
+        let node = Arc::new(Store::open_in_memory().unwrap());
+        let mut approve = pulseblade_act::ActionsConfig::default();
+        approve.systemd_restart.tier = Some(RiskTier::Approve);
+        let held = Arc::new(Rec {
+            calls: Mutex::new(vec![]),
+        });
+        let reg = Arc::new(Registry::new(approve, held.clone()).unwrap());
+        let stop = Arc::new(AtomicBool::new(false));
+        let drainer = spawn_drainer(web1, node.clone(), reg, stop.clone());
+
+        let planned = hub
+            .plan(pulseblade_act::PlanParams {
+                action: "systemd.restart".into(),
+                params: json!({"unit": "sshd.service"}),
+                resource_id: Some("unit:web1:sshd.service".into()),
+                idempotency_key: None,
+                dry_run: false,
+                finding_id: Some("fc13a29631a17b47555a0".into()),
+            })
+            .unwrap();
+        let waiting = hub
+            .execute(pulseblade_act::ExecuteParams {
+                plan_id: planned.plan_id,
+            })
+            .unwrap();
+        assert_eq!(waiting.status, ActionRunStatus::AwaitingApproval);
+        assert!(
+            held.calls.lock().unwrap().is_empty(),
+            "approve tier must not run yet"
+        );
+        assert!(
+            store.action(&waiting.id).unwrap().is_none(),
+            "the hub action table does not hold the node run"
+        );
+
+        let listed: serde_json::Value = ureq::get(&format!("{base}/api/v1/actions"))
+            .call()
+            .unwrap()
+            .into_json()
+            .unwrap();
+        assert!(
+            listed["runs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["id"] == waiting.id && r["status"] == "awaiting_approval"),
+            "{listed}"
+        );
+        let status: serde_json::Value = ureq::get(&format!("{base}/api/v1/status"))
+            .call()
+            .unwrap()
+            .into_json()
+            .unwrap();
+        assert_eq!(status["awaiting_actions"], 1);
+
+        let approved: serde_json::Value =
+            ureq::post(&format!("{base}/api/v1/actions/{}/approve", waiting.id))
+                .call()
+                .unwrap()
+                .into_json()
+                .unwrap();
+        assert_eq!(approved["status"], "succeeded", "{approved}");
+        let calls = held.calls.lock().unwrap().clone();
+        assert!(
+            calls.iter().any(|c| {
+                c.contains("systemctl") && c.contains("restart") && c.contains("sshd.service")
+            }),
+            "node did not run the command: {calls:?}"
+        );
+        let on_node = node.action(&waiting.id).unwrap().unwrap();
+        assert_eq!(on_node.status, ActionRunStatus::Succeeded);
+        assert!(store.action(&waiting.id).unwrap().is_none());
+
+        let after: serde_json::Value = ureq::get(&format!("{base}/api/v1/actions"))
+            .call()
+            .unwrap()
+            .into_json()
+            .unwrap();
+        assert!(
+            after["runs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| { r["id"] == waiting.id && r["status"] == "succeeded" }),
+            "{after}"
+        );
+        let status: serde_json::Value = ureq::get(&format!("{base}/api/v1/status"))
+            .call()
+            .unwrap()
+            .into_json()
+            .unwrap();
+        assert_eq!(status["awaiting_actions"], 0);
+
+        stop.store(true, Ordering::Relaxed);
+        let _ = drainer.join();
+        shutdown.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn portal_deny_cancels_without_running_the_command() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = CancellationToken::new();
+        let hub = new_hub(
+            store.clone(),
+            vec![("web1".into(), "token-web1".into())],
+            Duration::from_secs(3),
+        );
+        let stop_serve = shutdown.clone();
+        let served = hub.clone();
+        tokio::spawn(async move {
+            serve(
+                listener,
+                served,
+                vec!["127.0.0.1".into()],
+                stop_serve,
+                Arc::new(Registry::builtin()),
+                None,
+                PortalDefaults::default(),
+            )
+            .await
+            .ok();
+        });
+        let base = format!("http://{addr}");
+        let web1 = HubClient::plain(&base, "token-web1");
+        let node = Arc::new(Store::open_in_memory().unwrap());
+        let mut approve = pulseblade_act::ActionsConfig::default();
+        approve.systemd_restart.tier = Some(RiskTier::Approve);
+        let held = Arc::new(Rec {
+            calls: Mutex::new(vec![]),
+        });
+        let reg = Arc::new(Registry::new(approve, held.clone()).unwrap());
+        let stop = Arc::new(AtomicBool::new(false));
+        let drainer = spawn_drainer(web1, node.clone(), reg, stop.clone());
+
+        let planned = hub
+            .plan(pulseblade_act::PlanParams {
+                action: "systemd.restart".into(),
+                params: json!({"unit": "sshd.service"}),
+                resource_id: Some("unit:web1:sshd.service".into()),
+                idempotency_key: None,
+                dry_run: false,
+                finding_id: None,
+            })
+            .unwrap();
+        let waiting = hub
+            .execute(pulseblade_act::ExecuteParams {
+                plan_id: planned.plan_id,
+            })
+            .unwrap();
+        assert_eq!(waiting.status, ActionRunStatus::AwaitingApproval);
+
+        let denied: serde_json::Value =
+            ureq::post(&format!("{base}/api/v1/actions/{}/deny", waiting.id))
+                .call()
+                .unwrap()
+                .into_json()
+                .unwrap();
+        assert_eq!(denied["status"], "rejected", "{denied}");
+        let calls = held.calls.lock().unwrap().clone();
+        assert!(
+            calls.is_empty(),
+            "deny must not start the command: {calls:?}"
+        );
+        let on_node = node.action(&waiting.id).unwrap().unwrap();
+        assert_eq!(on_node.status, ActionRunStatus::Rejected);
+        assert!(store.action(&waiting.id).unwrap().is_none());
+
+        stop.store(true, Ordering::Relaxed);
+        let _ = drainer.join();
         shutdown.cancel();
     }
 

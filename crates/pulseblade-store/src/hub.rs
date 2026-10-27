@@ -563,6 +563,20 @@ fn write_rows(
     Ok(inserted)
 }
 
+fn runs_from_route_rows(
+    rows: Vec<(String, Option<String>)>,
+) -> crate::Result<Vec<pulseblade_core::ActionRun>> {
+    let mut out = Vec::new();
+    for (body, finding_id) in rows {
+        let mut run: pulseblade_core::ActionRun = serde_json::from_str(&body)?;
+        if run.finding_id.as_ref().is_none_or(|id| id.is_empty()) {
+            run.finding_id = finding_id.filter(|id| !id.is_empty());
+        }
+        out.push(run);
+    }
+    Ok(out)
+}
+
 fn is_deadlock(err: &StoreError) -> bool {
     let StoreError::Database(message) = err else {
         return false;
@@ -868,24 +882,29 @@ impl Store {
         &self,
         resource_id: &str,
     ) -> crate::Result<Vec<pulseblade_core::ActionRun>> {
-        self.with_sql(|sql| {
-            let rows = sql.query(
+        let rows = self.with_sql(|sql| {
+            sql.query(
                 "SELECT r.body, p.finding_id FROM route_results r
                  JOIN route_plans p ON p.plan_id = r.id
                  WHERE p.resource_id = ?1",
                 &[SqlVal::text(resource_id)],
                 |row| Ok((row.text(0)?, row.opt_text(1)?)),
-            )?;
-            let mut out = Vec::new();
-            for (body, finding_id) in rows {
-                let mut run: pulseblade_core::ActionRun = serde_json::from_str(&body)?;
-                if run.finding_id.as_ref().is_none_or(|id| id.is_empty()) {
-                    run.finding_id = finding_id.filter(|id| !id.is_empty());
-                }
-                out.push(run);
-            }
-            Ok(out)
-        })
+            )
+        })?;
+        runs_from_route_rows(rows)
+    }
+
+    /// Every cached run the hub routed, including ones with no resource id.
+    pub fn routed_runs(&self) -> crate::Result<Vec<pulseblade_core::ActionRun>> {
+        let rows = self.with_sql(|sql| {
+            sql.query(
+                "SELECT r.body, p.finding_id FROM route_results r
+                 LEFT JOIN route_plans p ON p.plan_id = r.id",
+                &[],
+                |row| Ok((row.text(0)?, row.opt_text(1)?)),
+            )
+        })?;
+        runs_from_route_rows(rows)
     }
 
     pub fn plan_node(&self, plan_id: &str) -> crate::Result<Option<String>> {

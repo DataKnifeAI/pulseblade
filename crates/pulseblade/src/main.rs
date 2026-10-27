@@ -162,6 +162,8 @@ enum Ctl {
     Actions,
     /// Approve an action that is waiting for a human.
     Approve { run_id: String },
+    /// Cancel an action that is waiting for a human. The command does not start.
+    Deny { run_id: String },
     /// Recent pilot investigations, newest first.
     Runs,
 }
@@ -775,6 +777,10 @@ fn run_ctl(store: &Store, db: &Path, config: &Config, command: Ctl) -> anyhow::R
         Ctl::Approve { run_id } => {
             let reg = action_registry(config)?;
             print_json(&reg.approve(store, &run_id)?)
+        }
+        Ctl::Deny { run_id } => {
+            let reg = action_registry(config)?;
+            print_json(&reg.deny(store, &run_id)?)
         }
         Ctl::Runs => print_json(&store.recent_pilot_runs(20)?),
     }

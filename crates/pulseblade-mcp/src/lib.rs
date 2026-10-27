@@ -106,7 +106,7 @@ pub fn build_router(
         Arc::new(LocalSessionManager::default()),
         config,
     );
-    http::router_with_journal(journal, Utc::now(), actions, portal)
+    http::router_with_journal(journal, Utc::now(), actions, portal, route)
         .merge(extra)
         .nest_service("/mcp", service)
         .route("/healthz", axum::routing::get(|| async { "ok" }))

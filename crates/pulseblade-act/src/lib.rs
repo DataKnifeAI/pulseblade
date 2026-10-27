@@ -383,6 +383,27 @@ impl Registry {
         self.invoke_claimed(store, &claimed)
     }
 
+    /// Cancel an approve-tier run that is still waiting. The command does not start.
+    pub fn deny(&self, store: &Store, run_id: &str) -> Result<ActionRun, ActError> {
+        store.expire_actions(Utc::now())?;
+        let run = self.load(store, run_id)?;
+        if run.status != ActionRunStatus::AwaitingApproval {
+            return Err(ActError::Invalid(format!(
+                "run {} is {}, not awaiting approval",
+                run.id,
+                run.status.as_str()
+            )));
+        }
+        self.finish(
+            store,
+            &run.id,
+            ActionRunStatus::AwaitingApproval,
+            ActionRunStatus::Rejected,
+            Some("denied: command not executed"),
+            "deny",
+        )
+    }
+
     fn invoke(&self, store: &Store, run: &ActionRun) -> Result<ActionRun, ActError> {
         let claimed = store.transition_action(
             &run.id,

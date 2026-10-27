@@ -26,6 +26,7 @@ use serde_json::json;
 use crate::journal::{self, Journal, Read};
 use crate::prom;
 use crate::query::{self, Detail, QueryError};
+use crate::server::ActionRoute;
 
 const DASHBOARD: &str = include_str!("dashboard.html");
 const FAVICON_PNG: &[u8] = include_bytes!("../../../docs/assets/dashboard/favicon-32.png");
@@ -54,6 +55,8 @@ struct AppState {
     started: DateTime<Utc>,
     actions: Arc<pulseblade_act::Registry>,
     portal: PortalDefaults,
+    /// Set on a hub. Approve of a routed run is sent to the node that holds it.
+    route: Option<Arc<dyn ActionRoute>>,
 }
 
 /// Routes for `/`, `/metrics`, and `/api/v1/*`. `started` feeds `uptime_secs`.
@@ -76,6 +79,7 @@ pub fn router_with(
         started,
         actions,
         PortalDefaults::default(),
+        None,
     )
 }
 
@@ -85,6 +89,7 @@ pub fn router_with_journal(
     started: DateTime<Utc>,
     actions: Arc<pulseblade_act::Registry>,
     portal: PortalDefaults,
+    route: Option<Arc<dyn ActionRoute>>,
 ) -> Router {
     let api = Router::new()
         .route("/status", get(status))
@@ -99,6 +104,7 @@ pub fn router_with_journal(
         .route("/logs", get(logs))
         .route("/actions", get(actions_list))
         .route("/actions/{id}/approve", post(approve_action))
+        .route("/actions/{id}/deny", post(deny_action))
         .route("/portal", get(portal_get).put(portal_put))
         .fallback(|| async { ApiError::not_found("no such API endpoint") });
     Router::new()
@@ -111,6 +117,7 @@ pub fn router_with_journal(
             started,
             actions,
             portal,
+            route,
         })
 }
 
@@ -418,15 +425,37 @@ struct LogsQuery {
 
 async fn actions_list(State(st): State<AppState>) -> ApiResult {
     blocking(&st, |s| {
-        Ok(serde_json::json!({ "runs": s.recent_actions(None, 20)? }))
+        Ok(serde_json::json!({ "runs": s.portal_actions(20)? }))
     })
     .await
+}
+
+enum Decision {
+    Approve,
+    Deny,
 }
 
 async fn approve_action(
     State(st): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
+) -> ApiResult {
+    decide_action(st, id, headers, Decision::Approve).await
+}
+
+async fn deny_action(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult {
+    decide_action(st, id, headers, Decision::Deny).await
+}
+
+async fn decide_action(
+    st: AppState,
+    id: String,
+    headers: HeaderMap,
+    decision: Decision,
 ) -> ApiResult {
     if let Some(expected) = st.actions.approve_token() {
         let presented = headers
@@ -441,6 +470,44 @@ async fn approve_action(
             ));
         }
     }
+    // A hub row is not the run. The node that planned it applies the decision,
+    // because that is the process that would start the command.
+    if let Some(route) = st.route.clone() {
+        let journal = st.journal.clone();
+        let lookup = id.clone();
+        let node = tokio::task::spawn_blocking(move || {
+            let Some(store) = journal.store() else {
+                return Err(ApiError(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "database unavailable".into(),
+                ));
+            };
+            match store.plan_node(&lookup) {
+                Ok(node) => Ok(node),
+                Err(err) if journal::is_down(&err) => {
+                    journal.mark_down();
+                    Err(ApiError(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "database unavailable".into(),
+                    ))
+                }
+                Err(err) => Err(ApiError(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())),
+            }
+        })
+        .await
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
+        if node.is_some() {
+            let run_id = id.clone();
+            let run = tokio::task::spawn_blocking(move || match decision {
+                Decision::Approve => route.approve(&run_id),
+                Decision::Deny => route.deny(&run_id),
+            })
+            .await
+            .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            .map_err(route_approve_error)?;
+            return ok(run);
+        }
+    }
     let actions = st.actions.clone();
     let journal = st.journal.clone();
     let run = tokio::task::spawn_blocking(move || {
@@ -450,7 +517,11 @@ async fn approve_action(
                 "database unavailable".into(),
             ));
         };
-        match actions.approve(&store, &id) {
+        let result = match decision {
+            Decision::Approve => actions.approve(&store, &id),
+            Decision::Deny => actions.deny(&store, &id),
+        };
+        match result {
             Ok(run) => Ok(run),
             Err(pulseblade_act::ActError::Store(err)) if journal::is_down(&err) => {
                 journal.mark_down();
@@ -478,6 +549,18 @@ fn token_matches(expected: &str, presented: &str) -> bool {
         diff |= x ^ y;
     }
     diff == 0
+}
+
+fn route_approve_error(err: String) -> ApiError {
+    let lower = err.to_ascii_lowercase();
+    let status = if lower.contains("did not answer") {
+        StatusCode::BAD_GATEWAY
+    } else if lower.contains("unknown run") || lower.contains("unknown action") {
+        StatusCode::NOT_FOUND
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    ApiError(status, err)
 }
 
 fn act_error(e: pulseblade_act::ActError) -> ApiError {
@@ -934,6 +1017,7 @@ mod tests {
                 time_format: "24h".into(),
                 health: HealthThresholds::default(),
             },
+            None,
         );
         let (code, v) = get_json(&app, "/api/v1/portal").await;
         assert_eq!(code, StatusCode::OK);
@@ -998,6 +1082,39 @@ mod tests {
             .arg(&script)
             .output()
             .expect("node is required to check dashboard clock formatting");
+        assert!(
+            output.status.success(),
+            "stdout {}\nstderr {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn dashboard_approve_posts_to_the_action_route() {
+        assert!(DASHBOARD.contains(">Approve</button>"));
+        assert!(DASHBOARD.contains(">Deny</button>"));
+        assert!(DASHBOARD.contains("data-approve"));
+        assert!(DASHBOARD.contains("data-deny"));
+        assert!(DASHBOARD.contains("/api/v1/actions/"));
+        assert!(DASHBOARD.contains("method: \"POST\""));
+        assert!(!DASHBOARD.contains("read-only"));
+        assert_eq!(
+            DASHBOARD.matches("decisionControl(").count(),
+            4,
+            "buttons on the actions tab, the finding, and the waiting callout"
+        );
+        let start = DASHBOARD.rfind("<script>").expect("dashboard script");
+        let end = DASHBOARD.rfind("</script>").expect("dashboard script end");
+        let script = &DASHBOARD[start + "<script>".len()..end];
+        let path = std::env::temp_dir().join(format!("pulseblade-dash-{}.js", std::process::id()));
+        std::fs::write(&path, script).unwrap();
+        let output = std::process::Command::new("node")
+            .arg("--check")
+            .arg(&path)
+            .output()
+            .expect("node is required to check the dashboard script");
+        let _ = std::fs::remove_file(&path);
         assert!(
             output.status.success(),
             "stdout {}\nstderr {}",

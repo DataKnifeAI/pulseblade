@@ -36,6 +36,10 @@ pub trait ActionRoute: Send + Sync {
         &self,
         params: pulseblade_act::StatusParams,
     ) -> Result<pulseblade_core::ActionRun, String>;
+    /// Approve a run on the node that holds it. The node runs the command.
+    fn approve(&self, run_id: &str) -> Result<pulseblade_core::ActionRun, String>;
+    /// Cancel a waiting run on the node that holds it. The command does not start.
+    fn deny(&self, run_id: &str) -> Result<pulseblade_core::ActionRun, String>;
 }
 
 const STATE_URI: &str = "pulseblade://state";
@@ -64,6 +68,8 @@ memory_search for notes on a resource.
 5. actions_list shows node-local remediation and its risk tier. action_plan does not run \
 anything. action_execute runs `auto` immediately, leaves `approve` waiting for a human \
 (`pulseblade ctl approve` or POST /api/v1/actions/{id}/approve), and rejects `deny`. \
+On a hub, POST /api/v1/actions/{id}/approve and POST /api/v1/actions/{id}/deny are routed \
+to the node that holds the run. Approve starts the command. Deny cancels it. \
 action_status reads the run and says whether its finding is resolved, still open, \
 or the approval is still waiting. Pass finding_id to action_plan to tie the run to one. \
 Pass dry_run to plan when you only want the audit record. \
@@ -99,7 +105,7 @@ impl PulsebladeServer {
         Self::with_route(store, actions, None)
     }
 
-    /// `route` sends action_plan, action_execute, and action_status to another tier.
+    /// `route` sends action_plan, action_execute, action_status, approve, and deny to another tier.
     /// The local registry is still what `actions_list` describes.
     pub fn with_route(
         store: Arc<Store>,

@@ -214,6 +214,7 @@
   .chip { background: var(--tint); border-radius: 999px; padding: 2px 10px; font-size: 12px; color: var(--muted); }
   .chip b { font-family: var(--mono); font-weight: 600; color: var(--text); }
   .chip.on { background: var(--amber-dim); color: var(--amber-ink); }
+  .approve { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
   svg.spark { width: 100%; height: 64px; display: block; }
   .sparkmeta { display: flex; justify-content: space-between; color: var(--muted); font-size: 12px; }
   .kind > button { width: 100%; display: flex; align-items: center; gap: 8px; background: none; border: 0; border-radius: 6px; padding: 6px 2px; text-align: left; font-size: 14px; color: var(--text); }
@@ -393,6 +394,7 @@ const state = {
   tab: "overview", fleet: "all", win: "1h", sel: null, filter: null, churn: false, metric: params.get("metric"),
   paused: false, timer: null, interval: 15, open: {}, showOk: {}, attnAll: false,
   changesKey: "", spark: null, sparkLoading: null, searchHits: [], detailRecent: {}, detailFindings: {}, detailActions: {}, missing: {},
+  deciding: null, decideErr: null,
   tz: loadZone(), serverTz: serverZone(), tf: loadFormat(), serverTf: serverFormat(), health: Object.assign({}, HEALTH_DEFAULTS), portalMsg: "",
 };
 let D = { status: null, all: [], findings: { total: 0, findings: [] }, actions: { runs: [] }, changes: [], counts: {} };
@@ -613,6 +615,33 @@ function sinceOf(id) {
 const isChurn = (c) => (String(c.resource_id).startsWith("proc:") && c.kind !== "changed") || (String(c.resource_id).startsWith("net:") && c.field === "attrs.mac");
 const unhealthy = () => D.all.filter(bad);
 const pending = () => ((D.actions && D.actions.runs) || []).filter((a) => a.status === "awaiting_approval");
+function decisionControl(id) {
+  const busy = state.deciding === id;
+  const err = state.decideErr && state.decideErr.id === id ? `<span class="small t-failed">${esc(state.decideErr.msg)}</span>` : "";
+  const dis = busy ? "disabled" : "";
+  return `<div class="approve"><button type="button" data-approve="${esc(id)}" ${dis}>Approve</button><button type="button" data-deny="${esc(id)}" ${dis}>Deny</button>${err}</div>`;
+}
+async function decideRun(id, op) {
+  if (!id || state.deciding || (op !== "approve" && op !== "deny")) return;
+  state.deciding = id;
+  state.decideErr = null;
+  render();
+  try {
+    const r = await fetch("/api/v1/actions/" + encodeURIComponent(id) + "/" + op, {
+      method: "POST",
+      headers: { accept: "application/json" },
+    });
+    const body = await r.json().catch(() => ({ error: r.statusText }));
+    if (!r.ok) throw new Error(body.error || (op + " failed"));
+  } catch (e) {
+    state.deciding = null;
+    state.decideErr = { id, msg: e.message || (op + " failed") };
+    render();
+    return;
+  }
+  state.deciding = null;
+  refresh().catch(showError);
+}
 function staleSources() {
   const nodes = ((D.status && D.status.nodes) || []).filter((n) => n.stale).map((n) => ({ name: n.node, id: "host:" + n.node, age: n.last_push_age_secs, what: n.shutting_down ? "node shut down" : "no push from node agent" }));
   const cols = ((D.status && D.status.collectors) || []).filter((c) => c.stale || !c.ok).map((c) => ({ name: c.source + " collector", id: null, age: c.age_secs, what: c.stale ? "no pass" : (c.error || "failing") }));
@@ -857,7 +886,7 @@ function actionsView() {
       <div class="small muted">${esc(scopeText(scopeOf(r)))} · requested ${agoTs(a.created_at)} ago · tier ${esc(a.tier)} · <span class="mono">${esc(a.id)}</span></div>
       ${f ? `<div class="small">Because: <span class="t-failed">${esc(f.summary)}</span></div>` : ""}
       ${a.params && Object.keys(a.params).length ? `<div class="mono muted">${esc(JSON.stringify(a.params))}</div>` : ""}
-      <div class="small faint">Approve from an agent (MCP) or the CLI. This view is read-only.</div></div>`;
+      ${decisionControl(a.id)}</div>`;
   };
   return `<section class="card"><h2>Waiting for approval<span class="right faint">${wait.length || "none"}</span></h2>
       ${wait.length ? wait.map(card).join("") : `<div class="empty">Nothing is waiting for a human.</div>`}</section>
@@ -1015,10 +1044,13 @@ function resourceView(id) {
     <div class="ititle">${dot(r.health)}${ic(KIND_ICON[r.kind], "lg")}<b>${esc(r.name)}</b><span class="small t-${esc(r.health)}">${esc(r.health)}</span></div>
     <div class="mono faint">${esc(r.id)}</div>
     ${r.health !== "ok" ? `<div class="why-line t-${esc(r.health)}">${esc(reason(r))} · since ${esc(sinceOf(id))}</div>` : ""}
-    ${f.map((x) => `<div class="callout finding"><div class="lbl">Finding · ${esc(x.severity)}</div><div>${esc(x.summary)}</div>
-      <div class="muted">${esc(x.rule)} · opened ${agoTs(x.opened_at)} ago</div>${(x.logs || []).length ? `<pre>${x.logs.slice(0, 3).map((l) => esc(l.message)).join("\n")}</pre>` : ""}</div>`).join("")}
+    ${f.map((x) => {
+      const wait = acts.find((a) => a.status === "awaiting_approval" && a.finding_id === x.id);
+      return `<div class="callout finding"><div class="lbl">Finding · ${esc(x.severity)}</div><div>${esc(x.summary)}</div>
+      <div class="muted">${esc(x.rule)} · opened ${agoTs(x.opened_at)} ago</div>${(x.logs || []).length ? `<pre>${x.logs.slice(0, 3).map((l) => esc(l.message)).join("\n")}</pre>` : ""}${wait ? decisionControl(wait.id) : ""}</div>`;
+    }).join("")}
     ${acts.filter((a) => a.status === "awaiting_approval").map((a) => `<div class="callout approval"><div class="lbl">Waiting for approval</div><div class="mono">${esc(a.action)}</div>
-      <div class="muted">requested ${agoTs(a.created_at)} ago${a.expires_at ? ` · expires in ${ago((Date.parse(a.expires_at) - Date.now()) / 1000)}` : ""} · read-only here</div></div>`).join("")}
+      <div class="muted">requested ${agoTs(a.created_at)} ago${a.expires_at ? ` · expires in ${ago((Date.parse(a.expires_at) - Date.now()) / 1000)}` : ""}</div>${decisionControl(a.id)}</div>`).join("")}
     ${r.kind === "workload" ? `<h3>Pods</h3>${podsOf(r).sort((a, b) => (RANK[a.health] ?? 9) - (RANK[b.health] ?? 9)).map(rrow).join("") || `<div class="empty">No pods linked. Without an owner label, pods group by name prefix.</div>`}` : ""}
     ${metricBlock(r, false)}
     <h3>Details</h3><dl class="kv">${kv || `<dt class="muted">—</dt><dd class="faint">no attributes</dd>`}</dl>
@@ -1400,6 +1432,12 @@ function select(sel, keepMetric) {
 }
 const sameSel = (t, id) => state.sel && state.sel.t === t && state.sel.id === id;
 document.addEventListener("click", (ev) => {
+  const decision = ev.target.closest("[data-approve],[data-deny]");
+  if (decision) {
+    if (decision.dataset.approve) decideRun(decision.dataset.approve, "approve");
+    else if (decision.dataset.deny) decideRun(decision.dataset.deny, "deny");
+    return;
+  }
   const t = ev.target.closest("[data-tab],[data-strip],[data-gofleet],[data-fleet],[data-win],[data-machine],[data-scope],[data-g],[data-res],[data-kind],[data-showok],[data-metric],[data-close],[data-churn],[data-attnall],[data-attnless],[data-preset],[data-theme-choice],[data-settings],[data-clients]");
   if (!t) return;
   const d = t.dataset;
