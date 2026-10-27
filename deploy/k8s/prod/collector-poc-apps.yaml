@@ -55,7 +55,7 @@ spec:
           effect: NoSchedule
       containers:
         - name: pulseblade
-          image: harbor.dataknife.net/library/pulseblade:0.1.0@sha256:c86176323f80470cb123173aa2e26b9303bd83714375d61b58fe8636a3f11ba4
+          image: harbor.dataknife.net/library/pulseblade:0.1.0@sha256:c59cdf3a586bc1327099bc135d30073134bb48e0dc904bc15d90a484d5409869
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "-c"]
           args:
