@@ -389,6 +389,7 @@ fn action_registry(config: &Config) -> anyhow::Result<Arc<pulseblade_act::Regist
 fn portal_defaults(config: &Config) -> pulseblade_mcp::PortalDefaults {
     pulseblade_mcp::PortalDefaults {
         timezone: config.timezone.clone(),
+        time_format: config.time_format.clone(),
         health: config.health.clone(),
     }
 }

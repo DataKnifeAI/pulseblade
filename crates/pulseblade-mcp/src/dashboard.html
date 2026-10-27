@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Pulseblade</title>
 <meta name="pulseblade-timezone" content="__PB_TIMEZONE__">
+<meta name="pulseblade-time-format" content="__PB_TIME_FORMAT__">
 <link rel="icon" href="/favicon.ico" type="image/png">
 <script>
 (function () {
@@ -75,8 +76,11 @@
   .seg { display: inline-flex; padding: 2px; gap: 2px; background: var(--tint); border-radius: 999px; }
   .seg button { border: 0; background: transparent; color: var(--muted); border-radius: 999px; padding: 3px 10px; }
   .seg button[aria-pressed="true"] { background: var(--amber-dim); color: var(--amber-ink); }
-  button[data-settings] { border: 0; background: var(--tint); color: var(--muted); border-radius: 999px; padding: 3px 10px; font-size: 13px; }
-  button[data-settings]:hover { color: var(--text); }
+  button[data-settings], button[data-clients] { border: 0; background: var(--tint); color: var(--muted); border-radius: 999px; padding: 3px 10px; font-size: 13px; }
+  button[data-settings]:hover, button[data-clients]:hover { color: var(--text); }
+  .guide p { margin: 8px 0 0; font-size: 13px; line-height: 1.45; }
+  .guide a { color: var(--amber-ink); text-decoration: none; }
+  .guide a:hover { text-decoration: underline; }
   .settings label { display: grid; gap: 4px; margin: 10px 0; font-size: 12px; color: var(--muted); }
   .settings input, .settings select { width: 100%; }
   .settings .row { display: flex; gap: 8px; align-items: center; margin-top: 12px; }
@@ -289,6 +293,7 @@
     <div class="brand"><svg class="logo mark-dark" viewBox="0 0 64 64" aria-hidden="true"><rect x="1" y="1" width="62" height="62" rx="14" fill="#0b1020" stroke="#24344d" stroke-width="2"/><rect x="25.5" y="16" width="13" height="32" rx="2" fill="#1c2a45" stroke="#2c3f62" stroke-width="1.5"/><circle cx="32" cy="23" r="2.6" fill="#2fcea8"/><path d="M11.3 28.4A21 21 0 1 1 48.1 45.5" fill="none" stroke="#f0a429" stroke-width="10" stroke-linecap="round" stroke-linejoin="round" opacity="0.18"/><path d="M21.5 50.2A21 21 0 0 1 11.3 28.4" fill="none" stroke="#f0a429" stroke-width="4.5" stroke-linecap="round" opacity=".38"/><path d="M11.3 28.4A21 21 0 1 1 48.1 45.5" fill="none" stroke="#f0a429" stroke-width="4.5" stroke-linecap="round"/><circle cx="48.1" cy="45.5" r="4" fill="#ffd27a"/></svg><svg class="logo mark-light" viewBox="0 0 64 64" aria-hidden="true"><rect x="1" y="1" width="62" height="62" rx="14" fill="#fffdf9" stroke="#e2d5c3" stroke-width="2"/><rect x="25.5" y="16" width="13" height="32" rx="2" fill="#e6d8c3" stroke="#cdb998" stroke-width="1.5"/><circle cx="32" cy="23" r="2.6" fill="#0e7c6b"/><path d="M21.5 50.2A21 21 0 0 1 11.3 28.4" fill="none" stroke="#c47f0a" stroke-width="4.5" stroke-linecap="round" opacity=".38"/><path d="M11.3 28.4A21 21 0 1 1 48.1 45.5" fill="none" stroke="#c47f0a" stroke-width="4.5" stroke-linecap="round"/><circle cx="48.1" cy="45.5" r="4" fill="#e09a1c"/></svg><span>Pulse<span class="mark">blade</span></span></div>
     <button type="button" class="live" id="live" title="Live · click to pause" aria-label="Pause live refresh"><svg viewBox="0 0 20 20" aria-hidden="true"><circle class="trk" cx="10" cy="10" r="7"/><path class="arc" d="M10 3a7 7 0 0 1 7 7"/><circle class="core" cx="10" cy="10" r="2.6"/></svg></button>
     <span class="spacer"></span>
+    <button type="button" data-clients>Add a client</button>
     <button type="button" data-settings>Settings</button>
     <input id="q" type="search" placeholder="Find or filter…  ( / )" aria-label="Find or filter resources">
     <div class="seg" role="group" aria-label="Color theme">
@@ -330,7 +335,37 @@ const params = new URLSearchParams(location.search);
 const FALLBACK_TZ = "America/Los_Angeles";
 const TZ_KEY = "pulseblade.timezone";
 const ZONES = ["America/Los_Angeles", "America/Denver", "America/Chicago", "America/New_York", "UTC", "Europe/London"];
+const FALLBACK_TF = "12h";
+const TF_KEY = "pulseblade.time_format";
+const TF_LABEL = { "12h": "12-hour (AM/PM)", "24h": "24-hour" };
 const HEALTH_DEFAULTS = { pod_restart_window_mins: 15, pod_restart_lifetime: 100, proc_cpu_share_failed: 90, proc_mem_degraded: 25, proc_mem_failed: 50 };
+/* pb-time */
+function formatOk(fmt) {
+  return fmt === "12h" || fmt === "24h";
+}
+function chosenFormat(saved, server) {
+  if (formatOk(saved)) return saved;
+  return formatOk(server) ? server : "12h";
+}
+function hour12For(format) {
+  return format === "12h";
+}
+function timeOptsFor(zone, format, extra) {
+  return Object.assign({ timeZone: zone, hour12: hour12For(format) }, extra);
+}
+function formatClock(ts, zone, format, withSeconds) {
+  const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) return "–";
+  const extra = { hour: "2-digit", minute: "2-digit" };
+  if (withSeconds) extra.second = "2-digit";
+  return d.toLocaleTimeString("en-US", timeOptsFor(zone, format, extra));
+}
+function formatStamp(ts, zone, format) {
+  const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) return "–";
+  return d.toLocaleString("en-US", timeOptsFor(zone, format, { year: "numeric", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit" }));
+}
+/* /pb-time */
 function zoneOk(tz) {
   if (!tz || String(tz).indexOf("__") === 0) return false;
   try { new Intl.DateTimeFormat("en-US", { timeZone: tz }); return true; } catch (e) { return false; }
@@ -344,11 +379,21 @@ function loadZone() {
   try { const saved = localStorage.getItem(TZ_KEY); if (zoneOk(saved)) return saved; } catch (e) {}
   return serverZone();
 }
+function serverFormat() {
+  const meta = document.querySelector('meta[name="pulseblade-time-format"]');
+  const raw = meta && meta.content;
+  return formatOk(raw) ? raw : FALLBACK_TF;
+}
+function loadFormat() {
+  let saved = null;
+  try { saved = localStorage.getItem(TF_KEY); } catch (e) {}
+  return chosenFormat(saved, serverFormat());
+}
 const state = {
   tab: "overview", fleet: "all", win: "1h", sel: null, filter: null, churn: false, metric: params.get("metric"),
   paused: false, timer: null, interval: 15, open: {}, showOk: {}, attnAll: false,
   changesKey: "", spark: null, sparkLoading: null, searchHits: [], detailRecent: {}, detailFindings: {}, detailActions: {}, missing: {},
-  tz: loadZone(), serverTz: serverZone(), health: Object.assign({}, HEALTH_DEFAULTS), portalMsg: "",
+  tz: loadZone(), serverTz: serverZone(), tf: loadFormat(), serverTf: serverFormat(), health: Object.assign({}, HEALTH_DEFAULTS), portalMsg: "",
 };
 let D = { status: null, all: [], findings: { total: 0, findings: [] }, actions: { runs: [] }, changes: [], counts: {} };
 let byId = new Map();
@@ -433,9 +478,9 @@ function ago(secs) {
 }
 const agoTs = (ts) => { const t = Date.parse(ts); return Number.isNaN(t) ? "–" : ago((Date.now() - t) / 1000); };
 const zoneName = () => state.tz && zoneOk(state.tz) ? state.tz : FALLBACK_TZ;
-const timeOpts = (extra) => Object.assign({ timeZone: zoneName(), hour12: false }, extra);
-const clock = (ts) => { const d = new Date(ts); return Number.isNaN(d.getTime()) ? "–" : d.toLocaleTimeString("en-US", timeOpts({ hour: "2-digit", minute: "2-digit" })); };
-const stamp = (ts) => { const d = new Date(ts); return Number.isNaN(d.getTime()) ? "–" : d.toLocaleString("en-US", timeOpts({ year: "numeric", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit" })); };
+const timeFormatName = () => formatOk(state.tf) ? state.tf : FALLBACK_TF;
+const clock = (ts) => formatClock(ts, zoneName(), timeFormatName(), false);
+const stamp = (ts) => formatStamp(ts, zoneName(), timeFormatName());
 const showAttr = (k, v) => (typeof v === "string" && /(_at|_time)$/.test(k) && !Number.isNaN(Date.parse(v))) ? stamp(v) : (typeof v === "object" ? JSON.stringify(v) : v);
 function cpuFailed() { const n = Number(state.health.proc_cpu_share_failed); return Number.isFinite(n) && n > 0 ? n : 90; }
 function memDegraded() { const n = Number(state.health.proc_mem_degraded); return Number.isFinite(n) && n > 0 ? n : 25; }
@@ -1019,22 +1064,47 @@ function zoneChoices() {
   for (const z of [state.tz, state.serverTz, serverZone()]) if (z && zones.indexOf(z) < 0) zones.unshift(z);
   return zones.map((z) => `<option value="${esc(z)}" ${z === state.tz ? "selected" : ""}>${esc(z === "America/Los_Angeles" ? "America/Los_Angeles (Pacific)" : z)}</option>`).join("");
 }
-function numField(key, label, step) {
+function numField(key, label, step, help) {
   const v = state.health[key];
-  return `<label>${esc(label)}<input name="${esc(key)}" type="number" step="${step}" min="0" value="${esc(v)}"></label>`;
+  return `<label>${esc(label)}<input name="${esc(key)}" type="number" step="${step}" min="0" value="${esc(v)}"></label><div class="small muted">${esc(help)}</div>`;
+}
+function clientsView() {
+  return `${crumbs(`<span>add a client</span>`)}
+    <div class="ititle"><b>Add a client</b></div>
+    <div class="guide">
+      <p>This is a guide. It does not create a token. The toml names the environment variable. Put the value in a secret or in hub.env.</p>
+      <p>The hub is not a client. You do not enroll it.</p>
+      <h3>Host</h3>
+      <p>A machine running <span class="mono">pulseblade node</span>. <span class="mono">pulseblade agent</span> is the same command. In the upstream block, set the hub URL and <span class="mono">token_env</span> to the name of the variable that holds the token. That name is <span class="mono">PULSEBLADE_HUB_TOKEN</span> unless you change it. On the hub, list the host under <span class="mono">[[hub.nodes]]</span> with the same id as this machine's hostname. The fleet shows that host id.</p>
+      <h3>Kubernetes</h3>
+      <p>A DaemonSet, one pod on each node, and one token per node. The node id is the Kubernetes node name, and the hub lists that same id. The pod maps that node's token onto <span class="mono">PULSEBLADE_HUB_TOKEN</span>. The cluster name in the Kubernetes block is the name in the fleet. The manifest is <span class="mono">deploy/k8s/daemonset.yaml</span>. Each cluster copy under <span class="mono">deploy/k8s/prod/</span> does the per-node mapping.</p>
+      <h3>Proxmox</h3>
+      <p>The Proxmox collector on a host node. In the Proxmox block, set <span class="mono">api_url</span>, the token id, and <span class="mono">token_secret_env</span> (the name of the variable that holds the API token secret; the usual name is <span class="mono">PVE_TOKEN_SECRET</span>). An empty API URL leaves the collector off. Each Proxmox node name shows up under Proxmox.</p>
+      <p>Docker is a switch on a host node (<span class="mono">[collect] docker</span>), not a separate client.</p>
+      <p class="muted">Read <a href="https://github.com/DataKnifeAI/pulseblade/blob/main/docs/DEPLOY.md">docs/DEPLOY.md</a> and <a href="https://github.com/DataKnifeAI/pulseblade/blob/main/docs/CONFIG.md">docs/CONFIG.md</a>.</p>
+    </div>`;
+}
+function formatChoices() {
+  return ["12h", "24h"].map((f) => `<option value="${f}" ${f === state.tf ? "selected" : ""}>${esc(TF_LABEL[f])}</option>`).join("");
+}
+function formatLabel(fmt) {
+  return TF_LABEL[formatOk(fmt) ? fmt : FALLBACK_TF];
 }
 function settingsView() {
   return `${crumbs(`<span>settings</span>`)}
     <div class="ititle"><b>Settings</b></div>
+    <div class="small">How a host, a cluster, or Proxmox is added: <button type="button" class="linkish" data-clients>Add a client</button>.</div>
     <form class="settings" id="settings-form">
-      <label>Timezone<select name="timezone" aria-label="Portal timezone">${zoneChoices()}</select></label>
+      <label>Time zone<select name="timezone" aria-label="Time zone">${zoneChoices()}</select></label>
       <div class="small muted">Clocks use this zone. A fresh browser uses ${esc(state.serverTz || FALLBACK_TZ)} until you pick one here. The choice stays in this browser.</div>
+      <label>Time format<select name="time_format" aria-label="Time format">${formatChoices()}</select></label>
+      <div class="small muted">Clocks use this format. A fresh browser uses ${esc(formatLabel(state.serverTf))} until you pick one here. The choice stays in this browser.</div>
       <h3>Health thresholds</h3>
-      ${numField("pod_restart_window_mins", "Pod restart window (minutes)", "1")}
-      ${numField("pod_restart_lifetime", "Pod lifetime restarts", "1")}
-      ${numField("proc_cpu_share_failed", "Process CPU, percent of the host", "0.1")}
-      ${numField("proc_mem_degraded", "Process memory degraded, percent", "0.1")}
-      ${numField("proc_mem_failed", "Process memory failed, percent", "0.1")}
+      ${numField("pod_restart_window_mins", "Restart window", "1", "How recently a pod must have restarted to count as degraded")}
+      ${numField("pod_restart_lifetime", "Lifetime restarts", "1", "Degrade a running pod when the total reaches this")}
+      ${numField("proc_cpu_share_failed", "CPU share", "0.1", "Percent of the host")}
+      ${numField("proc_mem_degraded", "Memory warning", "0.1", "Percent of RAM")}
+      ${numField("proc_mem_failed", "Memory critical", "0.1", "Percent of RAM")}
       <div class="small muted">Saving writes this hub's copy. Nodes apply it on the next poll, over their compiled defaults, and keep the last good copy if the hub is unreachable. Action tiers, allow-lists, and script.run stay in the toml.</div>
       <div class="row"><button type="submit">Save thresholds</button>${state.portalMsg ? `<span class="small">${esc(state.portalMsg)}</span>` : ""}</div>
     </form>`;
@@ -1048,6 +1118,14 @@ function bindSettings() {
     if (!zoneOk(next)) return;
     state.tz = next;
     try { localStorage.setItem(TZ_KEY, next); } catch (e) {}
+    render();
+  };
+  const tf = form.querySelector('[name="time_format"]');
+  if (tf) tf.onchange = () => {
+    const next = tf.value;
+    if (!formatOk(next)) return;
+    state.tf = next;
+    try { localStorage.setItem(TF_KEY, next); } catch (e) {}
     render();
   };
   form.onsubmit = (ev) => {
@@ -1077,7 +1155,7 @@ function renderPanel() {
   if (!s) return;
   const active = document.activeElement;
   if (s.t === "settings" && active && (active.tagName === "INPUT" || active.tagName === "SELECT") && el.contains(active)) return;
-  el.innerHTML = s.t === "machine" ? machineView(s.id) : s.t === "scope" ? scopeView(s.id) : s.t === "search" ? searchView(s.id) : s.t === "settings" ? settingsView() : resourceView(s.id);
+  el.innerHTML = s.t === "machine" ? machineView(s.id) : s.t === "scope" ? scopeView(s.id) : s.t === "search" ? searchView(s.id) : s.t === "settings" ? settingsView() : s.t === "clients" ? clientsView() : resourceView(s.id);
   if (s.t === "settings") bindSettings();
 }
 function renderView() {
@@ -1091,7 +1169,7 @@ function renderFoot() {
   const src = s.nodes && s.nodes.length ? `${s.nodes.filter((x) => !x.stale).length}/${s.nodes.length} agents pushing`
     : (s.collectors || []).map((c) => `<span class="${c.stale || !c.ok ? "t-degraded" : ""}">${esc(c.source)} ${ago(c.age_secs)}</span>`).join(" · ");
   $("foot").innerHTML = `<span>${esc(scope)} · ${resourceTotal()} resources</span><span>${src}</span>
-    <span>${state.paused ? "paused" : "updated " + new Date().toLocaleTimeString("en-US", timeOpts({ hour: "2-digit", minute: "2-digit", second: "2-digit" }))}</span>
+    <span>${state.paused ? "paused" : "updated " + formatClock(new Date(), zoneName(), timeFormatName(), true)}</span>
     <label>refresh <select id="interval" aria-label="Refresh interval">${[5, 15, 60].map((v) => `<option value="${v}" ${v === state.interval ? "selected" : ""}>${v}s</option>`).join("")}</select></label>
     <span class="spacer"></span><span><svg class="logo" aria-hidden="true"><use href="#pb-mark"/></svg>Pulseblade v${esc(s.version)} · seq ${s.as_of_seq} · up ${ago(s.uptime_secs)} · db ${bytes(s.db && s.db.size_bytes)}</span>`;
   $("interval").onchange = (e) => { state.interval = Number(e.target.value); schedule(); };
@@ -1267,9 +1345,13 @@ async function loadPortal() {
     const p = await api("/api/v1/portal");
     if (p.health) state.health = Object.assign({}, HEALTH_DEFAULTS, p.health);
     if (zoneOk(p.timezone)) state.serverTz = p.timezone;
+    if (formatOk(p.time_format)) state.serverTf = p.time_format;
     let saved = null;
     try { saved = localStorage.getItem(TZ_KEY); } catch (e) {}
     if (!zoneOk(saved)) state.tz = state.serverTz || serverZone();
+    let savedTf = null;
+    try { savedTf = localStorage.getItem(TF_KEY); } catch (e) {}
+    state.tf = chosenFormat(savedTf, state.serverTf || serverFormat());
   } catch (e) {}
 }
 async function refresh() {
@@ -1318,10 +1400,11 @@ function select(sel, keepMetric) {
 }
 const sameSel = (t, id) => state.sel && state.sel.t === t && state.sel.id === id;
 document.addEventListener("click", (ev) => {
-  const t = ev.target.closest("[data-tab],[data-strip],[data-gofleet],[data-fleet],[data-win],[data-machine],[data-scope],[data-g],[data-res],[data-kind],[data-showok],[data-metric],[data-close],[data-churn],[data-attnall],[data-attnless],[data-preset],[data-theme-choice],[data-settings]");
+  const t = ev.target.closest("[data-tab],[data-strip],[data-gofleet],[data-fleet],[data-win],[data-machine],[data-scope],[data-g],[data-res],[data-kind],[data-showok],[data-metric],[data-close],[data-churn],[data-attnall],[data-attnless],[data-preset],[data-theme-choice],[data-settings],[data-clients]");
   if (!t) return;
   const d = t.dataset;
   if (d.themeChoice) return setTheme(d.themeChoice);
+  if (d.clients !== undefined) return select(sameSel("clients", "clients") ? null : { t: "clients", id: "clients" });
   if (d.settings !== undefined) return select(sameSel("settings", "settings") ? null : { t: "settings", id: "settings" });
   if (d.tab) { state.tab = d.tab; render(); enrich().then(render).catch(showError); return syncUrl(); }
   if (d.gofleet) { state.tab = "fleet"; state.fleet = d.gofleet; render(); enrich().then(render).catch(showError); return syncUrl(); }

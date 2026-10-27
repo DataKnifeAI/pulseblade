@@ -69,7 +69,7 @@ Still missing, and the page works around each gap:
 
 ## How the page fetches
 
-It polls a summary snapshot, status, findings, and actions (not a full resource dump) and refreshes every 15 seconds (pausable). Clocks and timestamps use the portal timezone. The default is `America/Los_Angeles` (Pacific: PDT or PST by date), from the `timezone` config key, unless this browser has saved another IANA zone. Settings also edits the health cutoffs; a save writes the hub copy that nodes pick up on their next poll. Detail stays in the side panel, with at most one sparkline, fetched when that panel opens. Deep links: `/?tab=overview&kind=service&q=ssh&select=unit:web1:sshd.service&metric=cpu.used_pct&theme=dark`.
+It polls a summary snapshot, status, findings, and actions (not a full resource dump) and refreshes every 15 seconds (pausable). Clocks and timestamps use the portal timezone and time format. The zone default is `America/Los_Angeles` (Pacific: PDT or PST by date), from the `timezone` config key, unless this browser has saved another IANA zone. The format default is 12-hour (`time_format = "12h"`), unless this browser has saved 24-hour. Settings also edits the health cutoffs; a save writes the hub copy that nodes pick up on their next poll. Detail stays in the side panel, with at most one sparkline, fetched when that panel opens. Deep links: `/?tab=overview&kind=service&q=ssh&select=unit:web1:sshd.service&metric=cpu.used_pct&theme=dark`.
 
 Sample fleet in the screenshots, not a live machine.
 

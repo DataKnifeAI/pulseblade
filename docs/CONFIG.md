@@ -13,6 +13,8 @@ listen = "127.0.0.1:7171"
 dashboard = false
 # IANA zone for every clock on the dashboard. Pacific is PST or PDT by date.
 timezone = "America/Los_Angeles"
+# Clock format for those timestamps. 12h or 24h. A browser choice overrides this.
+time_format = "12h"
 allowed_hosts = []        # extra Host header values, e.g. a reverse proxy's hostname
 
 # Health cutoffs. Missing keys keep these defaults, so an older file still loads.

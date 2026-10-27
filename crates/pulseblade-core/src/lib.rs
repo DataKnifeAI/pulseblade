@@ -8,7 +8,9 @@ mod labels;
 mod model;
 mod time;
 
-pub use health::{default_timezone, valid_timezone, HealthThresholds};
+pub use health::{
+    default_time_format, default_timezone, valid_time_format, valid_timezone, HealthThresholds,
+};
 pub use labels::{glob_match, LabelRule};
 pub use model::*;
 pub use time::{parse_duration, Since, SinceParseError};

@@ -15,7 +15,10 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
-use pulseblade_core::{default_timezone, valid_timezone, HealthThresholds, ResourceKind};
+use pulseblade_core::{
+    default_time_format, default_timezone, valid_time_format, valid_timezone, HealthThresholds,
+    ResourceKind,
+};
 use pulseblade_store::{Store, StoreError};
 use serde::Deserialize;
 use serde_json::json;
@@ -31,6 +34,7 @@ const FAVICON_PNG: &[u8] = include_bytes!("../../../docs/assets/dashboard/favico
 #[derive(Clone, Debug)]
 pub struct PortalDefaults {
     pub timezone: String,
+    pub time_format: String,
     pub health: HealthThresholds,
 }
 
@@ -38,6 +42,7 @@ impl Default for PortalDefaults {
     fn default() -> Self {
         Self {
             timezone: default_timezone(),
+            time_format: default_time_format(),
             health: HealthThresholds::default(),
         }
     }
@@ -117,8 +122,18 @@ fn dashboard_timezone(portal: &PortalDefaults) -> String {
     }
 }
 
+fn dashboard_time_format(portal: &PortalDefaults) -> String {
+    if valid_time_format(&portal.time_format) {
+        portal.time_format.clone()
+    } else {
+        default_time_format()
+    }
+}
+
 async fn dashboard(State(st): State<AppState>) -> Html<String> {
-    let html = DASHBOARD.replace("__PB_TIMEZONE__", &dashboard_timezone(&st.portal));
+    let html = DASHBOARD
+        .replace("__PB_TIMEZONE__", &dashboard_timezone(&st.portal))
+        .replace("__PB_TIME_FORMAT__", &dashboard_time_format(&st.portal));
     Html(html)
 }
 
@@ -144,6 +159,7 @@ async fn portal_get(State(st): State<AppState>) -> ApiResult {
     .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     ok(json!({
         "timezone": dashboard_timezone(&st.portal),
+        "time_format": dashboard_time_format(&st.portal),
         "health": health,
     }))
 }
@@ -771,8 +787,27 @@ mod tests {
         assert!(html.contains("/api/v1/search"));
         assert!(html.contains("Overview"));
         assert!(html.contains("Fleet"));
+        assert!(html.contains("Add a client"));
+        assert!(html.contains("deploy/k8s/daemonset.yaml"));
+        assert!(html.contains("docs/DEPLOY.md"));
+        assert!(html.contains("docs/CONFIG.md"));
         assert!(html.contains("data-theme-choice=\"light\""));
         assert!(html.contains("rel=\"icon\""));
+        assert!(html.contains("name=\"pulseblade-time-format\" content=\"12h\""));
+        assert!(html.contains("Time zone<select"));
+        assert!(html.contains("Time format<select"));
+        assert!(html.contains("12-hour (AM/PM)"));
+        assert!(html.contains("24-hour"));
+        assert!(html.contains("\"Restart window\""));
+        assert!(html.contains("\"Lifetime restarts\""));
+        assert!(html.contains("\"CPU share\""));
+        assert!(html.contains("\"Memory warning\""));
+        assert!(html.contains("\"Memory critical\""));
+        assert!(html.contains("How recently a pod must have restarted to count as degraded"));
+        assert!(html.contains("Degrade a running pod when the total reaches this"));
+        assert!(html.contains("Percent of the host"));
+        assert!(html.contains("Percent of RAM"));
+        assert!(!html.contains("hour12: false"));
 
         let res = app
             .clone()
@@ -800,6 +835,7 @@ mod tests {
         let (code, v) = get_json(&app, "/api/v1/portal").await;
         assert_eq!(code, StatusCode::OK);
         assert_eq!(v["timezone"], "America/Los_Angeles");
+        assert_eq!(v["time_format"], "12h");
         assert_eq!(v["health"]["pod_restart_window_mins"], 15);
         assert_eq!(v["health"]["pod_restart_lifetime"], 100);
         assert_eq!(v["health"]["proc_cpu_share_failed"], 90.0);
@@ -859,9 +895,115 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let format_body = json!({
+            "time_format": "24h",
+            "health": {
+                "pod_restart_window_mins": 15,
+                "pod_restart_lifetime": 100,
+                "proc_cpu_share_failed": 90.0,
+                "proc_mem_degraded": 25.0,
+                "proc_mem_failed": 50.0
+            }
+        });
+        let res = app
+            .clone()
+            .oneshot(
+                HttpRequest::put("/api/v1/portal")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
         let (code, v) = get_json(&app, "/api/v1/portal").await;
         assert_eq!(code, StatusCode::OK);
         assert_eq!(v["health"]["pod_restart_window_mins"], 20);
+        assert_eq!(v["time_format"], "12h");
+    }
+
+    #[tokio::test]
+    async fn portal_time_format_comes_from_toml_defaults() {
+        let store = Store::open_in_memory().unwrap();
+        let app = router_with_journal(
+            journal::Journal::always(Arc::new(store)),
+            Utc::now(),
+            Arc::new(pulseblade_act::Registry::builtin()),
+            PortalDefaults {
+                timezone: "UTC".into(),
+                time_format: "24h".into(),
+                health: HealthThresholds::default(),
+            },
+        );
+        let (code, v) = get_json(&app, "/api/v1/portal").await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(v["timezone"], "UTC");
+        assert_eq!(v["time_format"], "24h");
+        let (code, html, _) = get(&app, "/").await;
+        assert_eq!(code, StatusCode::OK);
+        assert!(html.contains("name=\"pulseblade-timezone\" content=\"UTC\""));
+        assert!(html.contains("name=\"pulseblade-time-format\" content=\"24h\""));
+    }
+
+    #[test]
+    fn invalid_portal_clock_defaults_fall_back() {
+        let portal = PortalDefaults {
+            timezone: "not a zone".into(),
+            time_format: "hours".into(),
+            health: HealthThresholds::default(),
+        };
+        assert_eq!(dashboard_timezone(&portal), "America/Los_Angeles");
+        assert_eq!(dashboard_time_format(&portal), "12h");
+    }
+
+    #[test]
+    fn dashboard_clock_renders_meridiem_only_for_12h() {
+        let start = DASHBOARD.find("/* pb-time */").expect("clock helpers");
+        let end = DASHBOARD.find("/* /pb-time */").expect("clock helpers end");
+        let body = &DASHBOARD[start + "/* pb-time */".len()..end];
+        let script = format!(
+            r#"
+            {body}
+            const ts = "2026-10-26T20:15:00Z";
+            const zone = "America/Los_Angeles";
+            const norm = (s) => s.replace(/\s+/g, " ").trim();
+            const c12 = norm(formatClock(ts, zone, "12h", false));
+            const c24 = norm(formatClock(ts, zone, "24h", false));
+            const s12 = norm(formatStamp(ts, zone, "12h"));
+            const s24 = norm(formatStamp(ts, zone, "24h"));
+            const sec12 = norm(formatClock(ts, zone, "12h", true));
+            const sec24 = norm(formatClock(ts, zone, "24h", true));
+            const meridiem = (s) => /AM|PM/.test(s);
+            if (chosenFormat(null, null) !== "12h") throw new Error("fresh default " + chosenFormat(null, null));
+            if (chosenFormat(undefined, "nope") !== "12h") throw new Error("bad server default");
+            if (chosenFormat(null, "24h") !== "24h") throw new Error("toml default lost");
+            if (chosenFormat("24h", "12h") !== "24h") throw new Error("browser choice lost");
+            if (chosenFormat("12h", "24h") !== "12h") throw new Error("browser 12h lost");
+            if (!hour12For("12h") || hour12For("24h")) throw new Error("hour12 flag");
+            if (!meridiem(c12) || !meridiem(s12) || !meridiem(sec12)) {{
+              throw new Error("12h missing AM/PM " + JSON.stringify({{c12, s12, sec12}}));
+            }}
+            if (meridiem(c24) || meridiem(s24) || meridiem(sec24)) {{
+              throw new Error("24h has AM/PM " + JSON.stringify({{c24, s24, sec24}}));
+            }}
+            if (c12 !== "01:15 PM" || sec12 !== "01:15:00 PM") throw new Error("12h clock " + c12 + " " + sec12);
+            if (c24 !== "13:15" || sec24 !== "13:15:00") throw new Error("24h clock " + c24 + " " + sec24);
+            if (!s12.endsWith("PM") || s24.includes("PM") || s24.includes("AM")) {{
+              throw new Error("stamp " + s12 + " | " + s24);
+            }}
+            "#
+        );
+        let output = std::process::Command::new("node")
+            .arg("-e")
+            .arg(&script)
+            .output()
+            .expect("node is required to check dashboard clock formatting");
+        assert!(
+            output.status.success(),
+            "stdout {}\nstderr {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]

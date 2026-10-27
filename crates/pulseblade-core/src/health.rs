@@ -42,6 +42,16 @@ pub fn valid_timezone(tz: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '/' | '+' | '-'))
 }
 
+/// Dashboard clock format. `12h` is 12-hour with AM/PM; `24h` is 24-hour.
+pub fn default_time_format() -> String {
+    "12h".into()
+}
+
+/// `12h` or `24h`. Any other string is rejected when the config is loaded.
+pub fn valid_time_format(fmt: &str) -> bool {
+    matches!(fmt, "12h" | "24h")
+}
+
 /// Cutoffs the node uses when it scores a pod or a process.
 ///
 /// The portal may edit this document. It cannot carry action tiers, allow-lists,
@@ -131,6 +141,18 @@ mod tests {
         assert_eq!(d.proc_mem_failed, 50.0);
         assert_eq!(default_timezone(), "America/Los_Angeles");
         assert!(valid_timezone(&default_timezone()));
+        assert_eq!(default_time_format(), "12h");
+        assert!(valid_time_format(&default_time_format()));
+    }
+
+    #[test]
+    fn time_format_accepts_only_12h_and_24h() {
+        assert!(valid_time_format("12h"));
+        assert!(valid_time_format("24h"));
+        assert!(!valid_time_format("12H"));
+        assert!(!valid_time_format("24H"));
+        assert!(!valid_time_format(""));
+        assert!(!valid_time_format("hours"));
     }
 
     #[test]

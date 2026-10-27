@@ -3,7 +3,10 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use pulseblade_act::ActionsConfig;
 use pulseblade_collect::{CollectorOpts, K8sTarget, PromTarget, ProxmoxTarget};
-use pulseblade_core::{default_timezone, valid_timezone, HealthThresholds, LabelRule};
+use pulseblade_core::{
+    default_time_format, default_timezone, valid_time_format, valid_timezone, HealthThresholds,
+    LabelRule,
+};
 use pulseblade_detect::DetectConfig;
 use pulseblade_pilot::PilotConfig;
 use serde::Deserialize;
@@ -28,6 +31,9 @@ pub struct Config {
     /// IANA zone for dashboard clocks. Default is Pacific (`America/Los_Angeles`).
     #[serde(default = "default_timezone")]
     pub timezone: String,
+    /// Dashboard clock format: `12h` or `24h`. A browser choice overrides this.
+    #[serde(default = "default_time_format")]
+    pub time_format: String,
     /// Pod restart and process CPU/memory cutoffs. The portal edits this document only.
     #[serde(default)]
     pub health: HealthThresholds,
@@ -355,6 +361,7 @@ impl Default for Config {
             listen: "127.0.0.1:7171".to_string(),
             dashboard: false,
             timezone: default_timezone(),
+            time_format: default_time_format(),
             health: HealthThresholds::default(),
             allowed_hosts: Vec::new(),
             labels: Vec::new(),
@@ -402,6 +409,13 @@ impl Config {
             anyhow::bail!(
                 "timezone {:?} in {} is not an IANA name such as America/Los_Angeles",
                 cfg.timezone,
+                path.display()
+            );
+        }
+        if !valid_time_format(&cfg.time_format) {
+            anyhow::bail!(
+                "time_format {:?} in {} must be \"12h\" or \"24h\"",
+                cfg.time_format,
                 path.display()
             );
         }
@@ -608,6 +622,7 @@ mod tests {
         assert_eq!(cfg.prometheus.len(), 1);
         assert!(cfg.prometheus[0].url.is_empty());
         assert_eq!(cfg.timezone, "America/Los_Angeles");
+        assert_eq!(cfg.time_format, "12h");
         assert_eq!(cfg.health.pod_restart_window_mins, 15);
         assert_eq!(cfg.health.pod_restart_lifetime, 100);
         assert_eq!(cfg.health.proc_cpu_share_failed, 90.0);
@@ -620,12 +635,14 @@ mod tests {
         let cfg: Config = toml::from_str(
             r#"
             timezone = "UTC"
+            time_format = "24h"
             [health]
             pod_restart_window_mins = 45
             "#,
         )
         .unwrap();
         assert_eq!(cfg.timezone, "UTC");
+        assert_eq!(cfg.time_format, "24h");
         assert_eq!(cfg.health.pod_restart_window_mins, 45);
         assert_eq!(cfg.health.pod_restart_lifetime, 100);
         assert_eq!(cfg.health.proc_mem_degraded, 25.0);
@@ -650,5 +667,30 @@ mod tests {
     fn rejects_unknown_keys() {
         assert!(toml::from_str::<Config>("intervl_secs = 5").is_err());
         assert!(toml::from_str::<Config>("dashbord = true").is_err());
+    }
+
+    #[test]
+    fn time_format_defaults_to_12h_and_load_rejects_other_values() {
+        let omitted: Config = toml::from_str("interval_secs = 30").unwrap();
+        assert_eq!(omitted.time_format, "12h");
+        let path = std::env::temp_dir().join(format!(
+            "pulseblade-time-format-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, "time_format = \"24h\"\n").unwrap();
+        assert_eq!(Config::load(Some(&path)).unwrap().time_format, "24h");
+        std::fs::write(&path, "timezone = \"UTC\"\n").unwrap();
+        let kept = Config::load(Some(&path)).unwrap();
+        assert_eq!(kept.timezone, "UTC");
+        assert_eq!(kept.time_format, "12h");
+        std::fs::write(&path, "time_format = \"hours\"\n").unwrap();
+        let err = Config::load(Some(&path)).unwrap_err().to_string();
+        assert!(err.contains("12h"), "{err}");
+        assert!(err.contains("24h"), "{err}");
+        let _ = std::fs::remove_file(&path);
     }
 }
