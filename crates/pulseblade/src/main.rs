@@ -386,14 +386,22 @@ fn action_registry(config: &Config) -> anyhow::Result<Arc<pulseblade_act::Regist
     Ok(Arc::new(reg))
 }
 
+fn portal_defaults(config: &Config) -> pulseblade_mcp::PortalDefaults {
+    pulseblade_mcp::PortalDefaults {
+        timezone: config.timezone.clone(),
+        health: config.health.clone(),
+    }
+}
+
 async fn serve_mcp_dashboard(
     store: Arc<Store>,
     addr: SocketAddr,
     allowed: Vec<String>,
     shutdown: CancellationToken,
     actions: Arc<pulseblade_act::Registry>,
+    portal: pulseblade_mcp::PortalDefaults,
 ) {
-    match pulseblade_mcp::serve_http(store, addr, allowed, shutdown, actions).await {
+    match pulseblade_mcp::serve_http(store, addr, allowed, shutdown, actions, portal).await {
         Ok(()) => {}
         Err(e) if is_addr_in_use(&e) => {
             tracing::warn!(
@@ -462,6 +470,7 @@ async fn main() -> anyhow::Result<()> {
                 allowed,
                 shutdown.clone(),
                 actions,
+                portal_defaults(&config),
             )
             .await
             {
@@ -518,10 +527,18 @@ async fn main() -> anyhow::Result<()> {
                 let http_store = store.clone();
                 let http_actions = actions.clone();
                 let http_shutdown = shutdown.clone();
+                let http_portal = portal_defaults(&config);
                 watch_shutdown(shutdown.clone());
                 Some(tokio::spawn(async move {
-                    serve_mcp_dashboard(http_store, addr, allowed, http_shutdown, http_actions)
-                        .await;
+                    serve_mcp_dashboard(
+                        http_store,
+                        addr,
+                        allowed,
+                        http_shutdown,
+                        http_actions,
+                        http_portal,
+                    )
+                    .await;
                 }))
             } else {
                 None
@@ -588,7 +605,17 @@ async fn main() -> anyhow::Result<()> {
                 tokens,
                 std::time::Duration::from_secs(config.hub.action_wait_secs.max(1)),
             );
-            hub::serve(listener, inner, allowed, shutdown, actions, tls).await
+            inner.set_health_defaults(config.health.clone());
+            hub::serve(
+                listener,
+                inner,
+                allowed,
+                shutdown,
+                actions,
+                tls,
+                portal_defaults(&config),
+            )
+            .await
         }
         Command::Pilot { mcp_url, once } => {
             let url = pilot_mcp_url(&config, mcp_url);
@@ -703,7 +730,9 @@ fn run_ctl(store: &Store, db: &Path, config: &Config, command: Ctl) -> anyhow::R
             let _lock = CollectorLock::try_acquire(db)?
                 .context("a node is already collecting into this database")?;
             let opts = config.collector_opts();
-            let mut collectors = default_collectors(&opts);
+            let health =
+                std::sync::Arc::new(pulseblade_collect::HealthGate::new(config.health.clone()));
+            let mut collectors = default_collectors(&opts, health);
             let n = collect_once(store, &mut collectors, &config.labels, None);
             detect_pass(store, &config.detect);
             print_json(&serde_json::json!({

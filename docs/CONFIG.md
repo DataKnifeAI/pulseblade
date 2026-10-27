@@ -1,15 +1,30 @@
 # Configuration
 
-Optional TOML at `~/.config/pulseblade/pulseblade.toml` (or `--config`). State lives in `~/.local/state/pulseblade/pulseblade.db` by default (`--db` to override).
+Optional TOML at `~/.config/pulseblade/pulseblade.toml` (or `--config`). Unknown keys are rejected. State lives in `~/.local/state/pulseblade/pulseblade.db` by default (`--db` to override).
 
 ```toml
 interval_secs = 15
-retention_hours = 24
+retention_hours = 24       # raw samples on a node
+change_retention_days = 30 # change journal and absent resources
+history_days = 90          # 5-minute buckets and failure, restart, and error events
 listen = "127.0.0.1:7171"
 # Set `dashboard = true` so `pulseblade mcp` serves the HTTP dashboard and API
 # when that process is the collector.
 dashboard = false
+# IANA zone for every clock on the dashboard. Pacific is PST or PDT by date.
+timezone = "America/Los_Angeles"
 allowed_hosts = []        # extra Host header values, e.g. a reverse proxy's hostname
+
+# Health cutoffs. Missing keys keep these defaults, so an older file still loads.
+# The dashboard can edit this document. It cannot change action tiers, allow-lists, or script.run.
+# A hub sends the saved document on `/hub/v1/poll`. A node applies a valid document
+# over its compiled defaults and keeps the last good copy when the hub is unreachable.
+[health]
+pod_restart_window_mins = 15   # newest container restart inside this window degrades a Running or Succeeded pod
+pod_restart_lifetime = 100     # lifetime restart sum at or above this also degrades it
+proc_cpu_share_failed = 90     # host CPU share; 100 is the whole machine
+proc_mem_degraded = 25         # percent of host RAM
+proc_mem_failed = 50
 
 # Semantic labels attached to matching resource ids (`*` wildcard).
 [[labels]]
@@ -100,13 +115,13 @@ kind = "openai_compatible"
 base_url = "http://127.0.0.1:11434/v1"
 model = "local"
 
-# Hub. Empty nodes means `pulseblade node` ignores this section.
-# token_env is the name of an environment variable, never the token.
+# Hub. `pulseblade node` ignores this section.
+# token_env and the database_*_env keys are environment variable names, never the values.
+# Unknown keys are rejected. New fields here have defaults, so an older file still loads.
 [hub]
 listen = "127.0.0.1:7170"
 action_wait_secs = 20
-# Names of environment variables, never the values. Empty database_url_env
-# keeps this hub on its SQLite file. Nodes ignore this section.
+# Empty database_url_env keeps this hub on its SQLite file.
 database_url_env = ""
 database_user_env = ""
 database_password_env = ""
@@ -148,7 +163,7 @@ name = "app"
 url = ""
 ```
 
-`systemd.restart` takes `unit` (a bare name gets `.service`) and optional `user: true` for `systemctl --user`. `docker.restart` takes `container` and shells out to `docker`. `disk.prune_path` deletes regular files in an allow-listed directory and refuses `/`, `/home`, `/etc`, `/usr`, `/var`, `/boot`, and the other system roots. `script.run` runs an allow-listed program with an `args` array and no shell. `proxmox.start` and `proxmox.stop` take `node`, `vmid`, and optional `guest` (`qemu` or `lxc`). `proxmox.migrate` takes `node`, `vmid`, and `target`. `k8s.rollout_restart` takes `namespace`, `name`, and optional `kind` (`deployment`, `statefulset`, or `daemonset`). `k8s.scale` takes `namespace`, `name`, `replicas`, and optional `kind` (`deployment` or `statefulset`). Those wait for approval unless the tier is changed. `action_plan` with `dry_run: true` records the run without invoking the command. Approve a waiting run with `pulseblade ctl approve <run_id>` or `POST /api/v1/actions/{id}/approve`.
+`systemd.restart` takes `unit` (a bare name gets `.service`) and optional `user: true` for `systemctl --user`. `docker.restart` takes `container` and shells out to `docker`. `disk.prune_path` deletes regular files in an allow-listed directory and refuses `/`, `/home`, `/etc`, `/usr`, `/var`, `/boot`, and the other system roots. `script.run` runs an allow-listed program with an `args` array and no shell. `proxmox.start` and `proxmox.stop` take `node`, `vmid`, and optional `guest` (`qemu` or `lxc`). `proxmox.migrate` takes `node`, `vmid`, and `target`. `k8s.rollout_restart` takes `namespace`, `name`, and optional `kind` (`deployment`, `statefulset`, or `daemonset`). `k8s.scale` takes `namespace`, `name`, `replicas`, and optional `kind` (`deployment` or `statefulset`). `script.run` is denied unless its tier is changed. The other eight wait for approval unless their tier is changed. `action_plan` with `dry_run: true` records the run without invoking the command. Approve a waiting run with `pulseblade ctl approve <run_id>` or `POST /api/v1/actions/{id}/approve`.
 
 `pulseblade pilot` polls the MCP server and calls the model only when a new finding, a journal change, or the heartbeat says so. A quiet `--once` prints `{"investigated": false}` and does not call the model. Conclusions are `memory_note`s; proposed remediations are `action_plan`s. The node still applies its own tier. `pulseblade ctl runs` lists recorded investigations. Provider routing and a two-tier example: [ARCHITECTURE.md](ARCHITECTURE.md#example-configuration).
 

@@ -9,11 +9,16 @@ use std::io::{Read, Write};
 #[cfg(all(test, feature = "k8s"))]
 use std::net::TcpListener;
 
-use pulseblade_core::{Health, LogLine, Observation, Resource, ResourceKind, Sample};
+use std::sync::Arc;
+
+use chrono::{DateTime, SecondsFormat, Utc};
+use pulseblade_core::{
+    Health, HealthThresholds, LogLine, Observation, Resource, ResourceKind, Sample,
+};
 #[cfg(test)]
 use serde_json::Value;
 
-use crate::{CollectError, Collector};
+use crate::{CollectError, Collector, HealthGate};
 
 const MAX_NODES: usize = 40;
 const MAX_WORKLOADS: usize = 60;
@@ -44,6 +49,8 @@ pub struct K8sPod {
     pub phase: String,
     pub node: String,
     pub restarts: u64,
+    /// Newest container restart, when one could be read.
+    pub restarted_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -81,13 +88,23 @@ pub trait K8sSource: Send {
 pub struct K8sCollector<S> {
     cluster: String,
     source: S,
+    health: Arc<HealthGate>,
 }
 
 impl<S> K8sCollector<S> {
     pub fn new(cluster: impl Into<String>, source: S) -> Self {
+        Self::with_health(
+            cluster,
+            source,
+            Arc::new(HealthGate::new(HealthThresholds::default())),
+        )
+    }
+
+    pub fn with_health(cluster: impl Into<String>, source: S, health: Arc<HealthGate>) -> Self {
         Self {
             cluster: cluster.into(),
             source,
+            health,
         }
     }
 }
@@ -99,11 +116,17 @@ impl<S: K8sSource> Collector for K8sCollector<S> {
 
     fn collect(&mut self) -> Result<Observation, CollectError> {
         let view = self.source.snapshot()?;
-        Ok(observe_k8s(&self.cluster, &view))
+        let limits = self.health.get();
+        Ok(observe_k8s(&self.cluster, &view, &limits, Utc::now()))
     }
 }
 
-pub fn observe_k8s(cluster: &str, view: &K8sView) -> Observation {
+pub fn observe_k8s(
+    cluster: &str,
+    view: &K8sView,
+    limits: &HealthThresholds,
+    now: DateTime<Utc>,
+) -> Observation {
     let mut obs = Observation::default();
     for node in view.nodes.iter().take(MAX_NODES) {
         let Some(name) = id_part(&node.name) else {
@@ -167,22 +190,19 @@ pub fn observe_k8s(cluster: &str, view: &K8sView) -> Observation {
             continue;
         };
         let id = format!("pod:{cluster}:{ns}:{name}");
-        let phase = pod.phase.to_ascii_lowercase();
-        let health = if phase == "failed" || phase == "unknown" {
-            Health::Failed
-        } else if phase == "pending" || pod.restarts >= 5 {
-            Health::Degraded
-        } else if phase == "running" || phase == "succeeded" {
-            Health::Ok
-        } else {
-            Health::Unknown
-        };
+        let health = pod_health(&pod.phase, pod.restarts, pod.restarted_at, now, limits);
         let mut resource = Resource::new(&id, ResourceKind::Pod, name)
             .health(health)
             .label("cluster", cluster)
             .label("namespace", ns)
             .attr("phase", pod.phase.clone())
             .attr("namespace", ns);
+        if let Some(at) = pod.restarted_at {
+            resource = resource.attr(
+                "restarted_at",
+                at.to_rfc3339_opts(SecondsFormat::Secs, true),
+            );
+        }
         if let Some(node) = id_part(&pod.node) {
             resource = resource.parent(format!("knode:{cluster}:{node}"));
         }
@@ -218,6 +238,107 @@ fn id_part(raw: &str) -> Option<&str> {
         None
     } else {
         Some(s)
+    }
+}
+
+/// One container's restart counter and the two timestamps the rule can use.
+struct ContainerRestart {
+    restarts: u64,
+    running_started_at: Option<DateTime<Utc>>,
+    waiting_reason: String,
+    last_finished_at: Option<DateTime<Utc>>,
+}
+
+/// Newest restart across containers, and the lifetime sum.
+///
+/// A container with `restartCount > 0` contributes `state.running.startedAt`.
+/// A container waiting in backoff contributes `lastState.terminated.finishedAt`.
+fn fold_restarts(
+    containers: impl IntoIterator<Item = ContainerRestart>,
+) -> (u64, Option<DateTime<Utc>>) {
+    let mut sum = 0u64;
+    let mut newest = None;
+    for c in containers {
+        sum = sum.saturating_add(c.restarts);
+        if let Some(at) = container_restart_at(&c) {
+            if newest.is_none_or(|have| at > have) {
+                newest = Some(at);
+            }
+        }
+    }
+    (sum, newest)
+}
+
+fn container_restart_at(c: &ContainerRestart) -> Option<DateTime<Utc>> {
+    let mut newest = None;
+    let consider = |newest: &mut Option<DateTime<Utc>>, at: Option<DateTime<Utc>>| {
+        let Some(at) = at else {
+            return;
+        };
+        if newest.is_none_or(|have| at > have) {
+            *newest = Some(at);
+        }
+    };
+    if c.restarts > 0 {
+        consider(&mut newest, c.running_started_at);
+    }
+    if c.waiting_reason.to_ascii_lowercase().contains("backoff") {
+        consider(&mut newest, c.last_finished_at);
+    }
+    newest
+}
+
+/// Phase first. Restart age and the lifetime sum apply only to Running and Succeeded.
+pub fn pod_health(
+    phase: &str,
+    restarts: u64,
+    restarted_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    limits: &HealthThresholds,
+) -> Health {
+    let phase = phase.to_ascii_lowercase();
+    if phase == "failed" || phase == "unknown" {
+        return Health::Failed;
+    }
+    if phase == "pending" {
+        return Health::Degraded;
+    }
+    if phase != "running" && phase != "succeeded" {
+        return Health::Unknown;
+    }
+    let window = chrono::Duration::minutes(limits.pod_restart_window_mins as i64);
+    let recent = restarted_at.is_some_and(|at| now.signed_duration_since(at) <= window);
+    if recent || restarts >= limits.pod_restart_lifetime {
+        Health::Degraded
+    } else {
+        Health::Ok
+    }
+}
+
+#[cfg(test)]
+fn parse_ts(raw: Option<&str>) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(raw?)
+        .ok()
+        .map(|d| d.with_timezone(&Utc))
+}
+
+#[cfg(test)]
+fn restart_from_status(c: &Value) -> ContainerRestart {
+    ContainerRestart {
+        restarts: c.get("restartCount").and_then(|n| n.as_u64()).unwrap_or(0),
+        running_started_at: parse_ts(
+            c.pointer("/state/running/startedAt")
+                .and_then(|v| v.as_str()),
+        ),
+        waiting_reason: c
+            .pointer("/state/waiting/reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        last_finished_at: parse_ts(
+            c.pointer("/lastState/terminated/finishedAt")
+                .and_then(|v| v.as_str()),
+        ),
     }
 }
 
@@ -283,15 +404,11 @@ pub fn parse_lists(
         if name.is_empty() {
             continue;
         }
-        let restarts = item
+        let (restarts, restarted_at) = item
             .pointer("/status/containerStatuses")
             .and_then(|v| v.as_array())
-            .map(|cs| {
-                cs.iter()
-                    .map(|c| c.get("restartCount").and_then(|n| n.as_u64()).unwrap_or(0))
-                    .sum()
-            })
-            .unwrap_or(0);
+            .map(|cs| fold_restarts(cs.iter().map(restart_from_status)))
+            .unwrap_or((0, None));
         view.pods.push(K8sPod {
             namespace: if namespace.is_empty() {
                 "default".into()
@@ -302,6 +419,7 @@ pub fn parse_lists(
             phase: str_at(item, &["status", "phase"]),
             node: str_at(item, &["spec", "nodeName"]),
             restarts,
+            restarted_at,
         });
     }
     for item in items(events) {
@@ -428,6 +546,39 @@ impl K8sSource for LiveK8s {
 }
 
 #[cfg(feature = "k8s")]
+fn k8s_time(t: &k8s_openapi::apimachinery::pkg::apis::meta::v1::Time) -> Option<DateTime<Utc>> {
+    let ts = t.clone().0;
+    let nanos = ts.subsec_nanosecond();
+    let nanos = if nanos < 0 { 0 } else { nanos as u32 };
+    DateTime::<Utc>::from_timestamp(ts.as_second(), nanos)
+}
+
+#[cfg(feature = "k8s")]
+fn container_restart_of(cs: &k8s_openapi::api::core::v1::ContainerStatus) -> ContainerRestart {
+    ContainerRestart {
+        restarts: cs.restart_count.max(0) as u64,
+        running_started_at: cs
+            .state
+            .as_ref()
+            .and_then(|s| s.running.as_ref())
+            .and_then(|r| r.started_at.as_ref())
+            .and_then(k8s_time),
+        waiting_reason: cs
+            .state
+            .as_ref()
+            .and_then(|s| s.waiting.as_ref())
+            .and_then(|w| w.reason.clone())
+            .unwrap_or_default(),
+        last_finished_at: cs
+            .last_state
+            .as_ref()
+            .and_then(|s| s.terminated.as_ref())
+            .and_then(|t| t.finished_at.as_ref())
+            .and_then(k8s_time),
+    }
+}
+
+#[cfg(feature = "k8s")]
 async fn fetch_view(client: kube::Client) -> Result<K8sView, CollectError> {
     use k8s_openapi::api::apps::v1::{DaemonSet, Deployment, StatefulSet};
     use k8s_openapi::api::core::v1::{Event, Node, Pod};
@@ -522,12 +673,12 @@ async fn fetch_view(client: kube::Client) -> Result<K8sView, CollectError> {
         let Some(name) = pod.metadata.name else {
             continue;
         };
-        let restarts = pod
+        let (restarts, restarted_at) = pod
             .status
             .as_ref()
             .and_then(|s| s.container_statuses.as_ref())
-            .map(|cs| cs.iter().map(|c| c.restart_count.max(0) as u64).sum())
-            .unwrap_or(0);
+            .map(|cs| fold_restarts(cs.iter().map(container_restart_of)))
+            .unwrap_or((0, None));
         view.pods.push(K8sPod {
             namespace: pod.metadata.namespace.unwrap_or_else(|| "default".into()),
             name,
@@ -542,6 +693,7 @@ async fn fetch_view(client: kube::Client) -> Result<K8sView, CollectError> {
                 .and_then(|s| s.node_name.clone())
                 .unwrap_or_default(),
             restarts,
+            restarted_at,
         });
     }
     for event in events {
@@ -664,7 +816,7 @@ mod tests {
 
     #[test]
     fn inventory_ids_and_health() {
-        let obs = observe_k8s("demo", &fixture());
+        let obs = observe_k8s("demo", &fixture(), &HealthThresholds::default(), Utc::now());
         let n1 = obs
             .resources
             .iter()
@@ -702,6 +854,104 @@ mod tests {
             .logs
             .iter()
             .any(|l| l.resource_id == "pod:demo:demo:bad" && l.message.contains("BackOff")));
+    }
+
+    fn pod_at(name: &str, phase: &str, statuses: Value) -> Value {
+        json!({
+            "metadata": {"name": name, "namespace": "demo"},
+            "spec": {"nodeName": "n1"},
+            "status": {"phase": phase, "containerStatuses": statuses}
+        })
+    }
+
+    fn started(restarts: u64, at: &str) -> Value {
+        json!({
+            "restartCount": restarts,
+            "state": {"running": {"startedAt": at}}
+        })
+    }
+
+    #[test]
+    fn running_pod_restart_window_and_lifetime() {
+        let now = DateTime::parse_from_rfc3339("2026-10-26T18:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let days = (now - chrono::Duration::days(3)).to_rfc3339_opts(SecondsFormat::Secs, true);
+        let recent =
+            (now - chrono::Duration::minutes(2)).to_rfc3339_opts(SecondsFormat::Secs, true);
+        let limits = HealthThresholds::default();
+        assert_eq!(limits.pod_restart_window_mins, 15);
+        assert_eq!(limits.pod_restart_lifetime, 100);
+        let view = parse_lists(
+            &json!({"items": []}),
+            &json!({"items": [
+                pod_at("old", "Running", json!([started(29, &days)])),
+                pod_at("fresh", "Running", json!([started(29, &recent)])),
+                pod_at("many", "Running", json!([started(100, &days)])),
+                pod_at("dead", "Failed", json!([started(0, &recent)])),
+                pod_at("wait", "Pending", json!([started(0, &days)])),
+                pod_at("loop", "Running", json!([{
+                    "restartCount": 4,
+                    "state": {"waiting": {"reason": "CrashLoopBackOff"}},
+                    "lastState": {"terminated": {"finishedAt": recent}}
+                }]))
+            ]}),
+            &json!({"items": []}),
+            &json!({"items": []}),
+            &json!({"items": []}),
+            &json!({"items": []}),
+        );
+        let obs = observe_k8s("c", &view, &limits, now);
+        let health = |name: &str| {
+            obs.resources
+                .iter()
+                .find(|r| r.id == format!("pod:c:demo:{name}"))
+                .unwrap()
+                .health
+        };
+        let attr = |name: &str| {
+            obs.resources
+                .iter()
+                .find(|r| r.id == format!("pod:c:demo:{name}"))
+                .unwrap()
+                .attrs
+                .get("restarted_at")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        };
+        assert_eq!(health("old"), Health::Ok);
+        assert_eq!(attr("old").as_deref(), Some(days.as_str()));
+        assert_eq!(health("fresh"), Health::Degraded);
+        assert_eq!(attr("fresh").as_deref(), Some(recent.as_str()));
+        assert_eq!(health("many"), Health::Degraded);
+        assert_eq!(health("dead"), Health::Failed);
+        assert_eq!(health("wait"), Health::Degraded);
+        assert_eq!(health("loop"), Health::Degraded);
+        assert_eq!(attr("loop").as_deref(), Some(recent.as_str()));
+        assert!(obs.samples.iter().any(|s| {
+            s.resource_id == "pod:c:demo:old" && s.metric == "k8s.restarts" && s.value == 29.0
+        }));
+        let mut wider = limits.clone();
+        wider.pod_restart_window_mins = 1;
+        let narrowed = observe_k8s("c", &view, &wider, now);
+        assert_eq!(
+            narrowed
+                .resources
+                .iter()
+                .find(|r| r.id == "pod:c:demo:fresh")
+                .unwrap()
+                .health,
+            Health::Ok
+        );
+        assert_eq!(
+            narrowed
+                .resources
+                .iter()
+                .find(|r| r.id == "pod:c:demo:many")
+                .unwrap()
+                .health,
+            Health::Degraded
+        );
     }
 
     #[cfg(feature = "k8s")]

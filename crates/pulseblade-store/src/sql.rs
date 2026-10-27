@@ -740,6 +740,11 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS events_res ON events(resource_id, ts);
 CREATE INDEX IF NOT EXISTS events_ts ON events(ts);
 CREATE UNIQUE INDEX IF NOT EXISTS events_dedupe ON events(resource_id, ts, kind, message);
+
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 "#;
 
 #[cfg(test)]

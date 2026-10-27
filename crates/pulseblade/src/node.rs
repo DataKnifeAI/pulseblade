@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use chrono::Utc;
-use pulseblade_collect::{default_collectors, Collector};
+use pulseblade_collect::{default_collectors, Collector, HealthGate};
 use pulseblade_core::{ChangeKind, CollectorRun, Finding, LabelRule};
 use pulseblade_detect::DetectConfig;
 use pulseblade_store::Store;
@@ -150,9 +150,11 @@ pub fn spawn_collector(
     let change_retention = chrono::Duration::days(config.change_retention_days as i64);
     let history_retention = chrono::Duration::days(config.history_days.max(1) as i64);
     let opts = config.collector_opts();
+    let gate = std::sync::Arc::new(HealthGate::new(config.health.clone()));
+    let fallback = config.health.clone();
     std::thread::spawn(move || {
         let _lock = lock;
-        let mut collectors = default_collectors(&opts);
+        let mut collectors = default_collectors(&opts, gate.clone());
         tracing::info!(
             collectors = ?collectors.iter().map(|c| c.name()).collect::<Vec<_>>(),
             interval_secs = interval.as_secs(),
@@ -160,6 +162,13 @@ pub fn spawn_collector(
         );
         let mut last_prune = Instant::now();
         while !shutdown.is_cancelled() {
+            match store.health_thresholds() {
+                Ok(Some(doc)) => gate.set(doc),
+                Ok(None) => gate.set(fallback.clone()),
+                Err(e) => {
+                    tracing::warn!(error = %e, "health thresholds unreadable; keeping the last copy")
+                }
+            }
             let started = Instant::now();
             let n = collect_once(&store, &mut collectors, &labels, Some(interval.as_secs()));
             detect_pass(&store, &detect);

@@ -17,10 +17,10 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use pulseblade_act::Registry;
-use pulseblade_core::host_of_id;
+use pulseblade_core::{host_of_id, HealthThresholds};
 use pulseblade_mcp::journal::{self, Journal, WriteError};
 use pulseblade_mcp::query::{self, SnapshotParams};
-use pulseblade_mcp::{build_router, ActionRoute};
+use pulseblade_mcp::{build_router, ActionRoute, PortalDefaults};
 use pulseblade_store::{
     ChangeFilter, IngestResult, NodeBatch, NodeCursor, RouteJob, Store, StoreError,
 };
@@ -39,6 +39,8 @@ pub struct HubInner {
     notify: tokio::sync::Notify,
     action_wait: Duration,
     ids: AtomicU64,
+    /// Toml cutoffs used when the hub has not stored a portal document.
+    health: Mutex<HealthThresholds>,
 }
 
 impl HubInner {
@@ -373,7 +375,15 @@ pub fn new_hub_journal(
         notify: tokio::sync::Notify::new(),
         action_wait,
         ids: AtomicU64::new(1),
+        health: Mutex::new(HealthThresholds::default()),
     })
+}
+
+impl HubInner {
+    /// Cutoffs from the hub's toml. A stored portal document still wins on poll.
+    pub fn set_health_defaults(&self, health: HealthThresholds) {
+        *self.health.lock().unwrap_or_else(|e| e.into_inner()) = health;
+    }
 }
 
 pub async fn serve(
@@ -383,6 +393,7 @@ pub async fn serve(
     shutdown: CancellationToken,
     actions: Arc<Registry>,
     tls: Option<Arc<rustls::ServerConfig>>,
+    portal: PortalDefaults,
 ) -> anyhow::Result<()> {
     let journal = hub.journal.clone();
     let extra = Router::new()
@@ -398,6 +409,7 @@ pub async fn serve(
         actions,
         Some(hub),
         extra,
+        portal,
     );
     let bound = listener.local_addr()?;
     tracing::info!(%bound, "hub serving");
@@ -674,6 +686,30 @@ async fn push(
     Ok(Json(result))
 }
 
+/// Health document beside the routed jobs. Omitted when the store cannot be read,
+/// so a node keeps the last good copy instead of replacing it with defaults.
+fn poll_body(hub: &HubInner, jobs: Vec<Value>) -> Value {
+    let mut payload = json!({ "jobs": jobs });
+    let fallback = hub.health.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let Some(store) = hub.journal.store() else {
+        return payload;
+    };
+    let health = match store.health_thresholds() {
+        Ok(Some(doc)) => Some(doc),
+        Ok(None) => Some(fallback),
+        Err(err) => {
+            tracing::warn!(error = %err, "health thresholds unreadable; poll omits them");
+            None
+        }
+    };
+    if let Some(health) = health {
+        if let Ok(value) = serde_json::to_value(&health) {
+            payload["health"] = value;
+        }
+    }
+    payload
+}
+
 #[derive(Deserialize)]
 struct PollQuery {
     #[serde(default)]
@@ -705,11 +741,11 @@ async fn poll(
             }
         };
         if !jobs.is_empty() || wait.is_zero() || tokio::time::Instant::now() >= deadline {
-            let body = jobs
+            let jobs = jobs
                 .into_iter()
                 .map(|j| json!({"id": j.id, "op": j.op, "body": j.body}))
                 .collect::<Vec<_>>();
-            return Ok(Json(json!({ "jobs": body })));
+            return Ok(Json(poll_body(&hub, jobs)));
         }
         let notified = hub.notify.notified();
         tokio::pin!(notified);
@@ -794,6 +830,12 @@ async fn result(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Jobs from a hub long-poll, plus the health document when the hub sent one.
+pub struct PollReply {
+    pub jobs: Vec<RouteJob>,
+    pub health: Option<HealthThresholds>,
+}
+
 /// Outbound client a node uses. Plain HTTP uses ureq. mTLS uses rustls.
 #[derive(Clone)]
 pub struct HubClient {
@@ -856,7 +898,7 @@ impl HubClient {
         self.push(&batch)
     }
 
-    pub fn poll(&self, wait_ms: u64) -> anyhow::Result<Vec<RouteJob>> {
+    pub fn poll(&self, wait_ms: u64) -> anyhow::Result<PollReply> {
         let v = self.exchange("GET", &format!("/hub/v1/poll?wait_ms={wait_ms}"), None)?;
         let jobs = v
             .get("jobs")
@@ -871,7 +913,17 @@ impl HubClient {
                 body: job["body"].clone(),
             });
         }
-        Ok(out)
+        let health = match v.get("health") {
+            Some(raw) => match HealthThresholds::from_value(raw) {
+                Ok(doc) => Some(doc),
+                Err(err) => {
+                    tracing::warn!(error = %err, "ignoring invalid hub health document");
+                    None
+                }
+            },
+            None => None,
+        };
+        Ok(PollReply { jobs: out, health })
     }
 
     pub fn finish(&self, id: &str, ok: bool, body: &Value) -> anyhow::Result<()> {
@@ -885,7 +937,7 @@ impl HubClient {
 
     #[cfg(test)]
     pub fn drain(&self, store: &Store, reg: &Registry) -> anyhow::Result<()> {
-        for job in self.poll(0)? {
+        for job in self.poll(0)?.jobs {
             match apply_job(reg, store, &job) {
                 Ok(body) => self.finish(&job.id, true, &body)?,
                 Err(e) => self.finish(&job.id, false, &json!({"error": e}))?,
@@ -971,8 +1023,17 @@ pub fn run_upstream(
             tracing::warn!(error = %e, "hub push failed");
         }
         match client.poll(pause.as_millis().min(30_000) as u64) {
-            Ok(jobs) => {
-                for job in jobs {
+            Ok(reply) => {
+                if let Some(health) = reply.health {
+                    let changed =
+                        store.health_thresholds().ok().flatten().as_ref() != Some(&health);
+                    if changed {
+                        if let Err(e) = store.set_health_thresholds(&health) {
+                            tracing::warn!(error = %e, "saving hub health thresholds failed");
+                        }
+                    }
+                }
+                for job in reply.jobs {
                     match apply_job(&reg, &store, &job) {
                         Ok(body) => {
                             if let Err(e) = client.finish(&job.id, true, &body) {
@@ -1179,6 +1240,7 @@ mod tests {
                 stop_serve,
                 Arc::new(Registry::builtin()),
                 None,
+                PortalDefaults::default(),
             )
             .await
             .ok();
@@ -1308,6 +1370,7 @@ mod tests {
                 stop_serve,
                 Arc::new(Registry::builtin()),
                 None,
+                PortalDefaults::default(),
             )
             .await
             .ok();
@@ -1568,6 +1631,7 @@ mod tests {
                 stop,
                 Arc::new(Registry::builtin()),
                 Some(tls),
+                PortalDefaults::default(),
             )
             .await
             .ok();
@@ -1676,6 +1740,7 @@ mod tests {
                 stop,
                 Arc::new(Registry::builtin()),
                 Some(tls),
+                PortalDefaults::default(),
             )
             .await
             .ok();
@@ -1768,6 +1833,7 @@ mod tests {
                 stop,
                 Arc::new(Registry::builtin()),
                 None,
+                PortalDefaults::default(),
             )
             .await
             .ok();

@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Pulseblade</title>
+<meta name="pulseblade-timezone" content="__PB_TIMEZONE__">
 <link rel="icon" href="/favicon.ico" type="image/png">
 <script>
 (function () {
@@ -74,6 +75,11 @@
   .seg { display: inline-flex; padding: 2px; gap: 2px; background: var(--tint); border-radius: 999px; }
   .seg button { border: 0; background: transparent; color: var(--muted); border-radius: 999px; padding: 3px 10px; }
   .seg button[aria-pressed="true"] { background: var(--amber-dim); color: var(--amber-ink); }
+  button[data-settings] { border: 0; background: var(--tint); color: var(--muted); border-radius: 999px; padding: 3px 10px; font-size: 13px; }
+  button[data-settings]:hover { color: var(--text); }
+  .settings label { display: grid; gap: 4px; margin: 10px 0; font-size: 12px; color: var(--muted); }
+  .settings input, .settings select { width: 100%; }
+  .settings .row { display: flex; gap: 8px; align-items: center; margin-top: 12px; }
   .tabs { display: flex; gap: 22px; padding: 4px 24px 0; max-width: 1480px; margin: 0 auto; overflow-x: auto; scrollbar-width: none; }
   .tab { display: inline-flex; align-items: center; gap: 7px; background: none; border: 0; border-bottom: 2px solid transparent; border-radius: 0;
     padding: 9px 0 8px; font-size: 14px; color: var(--muted); white-space: nowrap; }
@@ -283,6 +289,7 @@
     <div class="brand"><svg class="logo mark-dark" viewBox="0 0 64 64" aria-hidden="true"><rect x="1" y="1" width="62" height="62" rx="14" fill="#0b1020" stroke="#24344d" stroke-width="2"/><rect x="25.5" y="16" width="13" height="32" rx="2" fill="#1c2a45" stroke="#2c3f62" stroke-width="1.5"/><circle cx="32" cy="23" r="2.6" fill="#2fcea8"/><path d="M11.3 28.4A21 21 0 1 1 48.1 45.5" fill="none" stroke="#f0a429" stroke-width="10" stroke-linecap="round" stroke-linejoin="round" opacity="0.18"/><path d="M21.5 50.2A21 21 0 0 1 11.3 28.4" fill="none" stroke="#f0a429" stroke-width="4.5" stroke-linecap="round" opacity=".38"/><path d="M11.3 28.4A21 21 0 1 1 48.1 45.5" fill="none" stroke="#f0a429" stroke-width="4.5" stroke-linecap="round"/><circle cx="48.1" cy="45.5" r="4" fill="#ffd27a"/></svg><svg class="logo mark-light" viewBox="0 0 64 64" aria-hidden="true"><rect x="1" y="1" width="62" height="62" rx="14" fill="#fffdf9" stroke="#e2d5c3" stroke-width="2"/><rect x="25.5" y="16" width="13" height="32" rx="2" fill="#e6d8c3" stroke="#cdb998" stroke-width="1.5"/><circle cx="32" cy="23" r="2.6" fill="#0e7c6b"/><path d="M21.5 50.2A21 21 0 0 1 11.3 28.4" fill="none" stroke="#c47f0a" stroke-width="4.5" stroke-linecap="round" opacity=".38"/><path d="M11.3 28.4A21 21 0 1 1 48.1 45.5" fill="none" stroke="#c47f0a" stroke-width="4.5" stroke-linecap="round"/><circle cx="48.1" cy="45.5" r="4" fill="#e09a1c"/></svg><span>Pulse<span class="mark">blade</span></span></div>
     <button type="button" class="live" id="live" title="Live · click to pause" aria-label="Pause live refresh"><svg viewBox="0 0 20 20" aria-hidden="true"><circle class="trk" cx="10" cy="10" r="7"/><path class="arc" d="M10 3a7 7 0 0 1 7 7"/><circle class="core" cx="10" cy="10" r="2.6"/></svg></button>
     <span class="spacer"></span>
+    <button type="button" data-settings>Settings</button>
     <input id="q" type="search" placeholder="Find or filter…  ( / )" aria-label="Find or filter resources">
     <div class="seg" role="group" aria-label="Color theme">
       <button type="button" data-theme-choice="dark" aria-pressed="true">Dark</button>
@@ -320,10 +327,28 @@ const KIND_ALIAS = { disk: "disk", disks: "disk", vm: "vm", vms: "vm", lxc: "con
   storage: "storage", net: "net_iface", node: "node", nodes: "node", host: "host", hosts: "host" };
 const PRESETS = ["disks over 90%", "storage over 85%", "pods is:unhealthy", "vms is:paused", "is:stopped", "services is:failed", "cpu over 50%", "mem over 75%"];
 const params = new URLSearchParams(location.search);
+const FALLBACK_TZ = "America/Los_Angeles";
+const TZ_KEY = "pulseblade.timezone";
+const ZONES = ["America/Los_Angeles", "America/Denver", "America/Chicago", "America/New_York", "UTC", "Europe/London"];
+const HEALTH_DEFAULTS = { pod_restart_window_mins: 15, pod_restart_lifetime: 100, proc_cpu_share_failed: 90, proc_mem_degraded: 25, proc_mem_failed: 50 };
+function zoneOk(tz) {
+  if (!tz || String(tz).indexOf("__") === 0) return false;
+  try { new Intl.DateTimeFormat("en-US", { timeZone: tz }); return true; } catch (e) { return false; }
+}
+function serverZone() {
+  const meta = document.querySelector('meta[name="pulseblade-timezone"]');
+  const raw = meta && meta.content;
+  return zoneOk(raw) ? raw : FALLBACK_TZ;
+}
+function loadZone() {
+  try { const saved = localStorage.getItem(TZ_KEY); if (zoneOk(saved)) return saved; } catch (e) {}
+  return serverZone();
+}
 const state = {
   tab: "overview", fleet: "all", win: "1h", sel: null, filter: null, churn: false, metric: params.get("metric"),
   paused: false, timer: null, interval: 15, open: {}, showOk: {}, attnAll: false,
   changesKey: "", spark: null, sparkLoading: null, searchHits: [], detailRecent: {}, detailFindings: {}, detailActions: {}, missing: {},
+  tz: loadZone(), serverTz: serverZone(), health: Object.assign({}, HEALTH_DEFAULTS), portalMsg: "",
 };
 let D = { status: null, all: [], findings: { total: 0, findings: [] }, actions: { runs: [] }, changes: [], counts: {} };
 let byId = new Map();
@@ -407,7 +432,13 @@ function ago(secs) {
   return Math.round(secs / 86400) + "d";
 }
 const agoTs = (ts) => { const t = Date.parse(ts); return Number.isNaN(t) ? "–" : ago((Date.now() - t) / 1000); };
-const clock = (ts) => { const d = new Date(ts); return Number.isNaN(d.getTime()) ? "–" : d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false }); };
+const zoneName = () => state.tz && zoneOk(state.tz) ? state.tz : FALLBACK_TZ;
+const timeOpts = (extra) => Object.assign({ timeZone: zoneName(), hour12: false }, extra);
+const clock = (ts) => { const d = new Date(ts); return Number.isNaN(d.getTime()) ? "–" : d.toLocaleTimeString("en-US", timeOpts({ hour: "2-digit", minute: "2-digit" })); };
+const stamp = (ts) => { const d = new Date(ts); return Number.isNaN(d.getTime()) ? "–" : d.toLocaleString("en-US", timeOpts({ year: "numeric", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit" })); };
+const showAttr = (k, v) => (typeof v === "string" && /(_at|_time)$/.test(k) && !Number.isNaN(Date.parse(v))) ? stamp(v) : (typeof v === "object" ? JSON.stringify(v) : v);
+function cpuFailed() { const n = Number(state.health.proc_cpu_share_failed); return Number.isFinite(n) && n > 0 ? n : 90; }
+function memDegraded() { const n = Number(state.health.proc_mem_degraded); return Number.isFinite(n) && n > 0 ? n : 25; }
 const dot = (h) => `<span class="dot ${esc(h)}" title="${esc(h)}"></span>`;
 const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
 const bad = (r) => r && (r.health === "failed" || r.health === "degraded");
@@ -504,7 +535,7 @@ const scopeText = (s) => s ? `${s.type === "k8s" ? "k8s" : s.type === "pve" ? "p
 function reason(r) {
   const m = r.metrics || {}, a = r.attrs || {};
   switch (r.kind) {
-    case "pod": return [m["k8s.restarts"] ? `${m["k8s.restarts"]} restarts` : "", a.reason || a.phase].filter(Boolean).join(" · ");
+    case "pod": return [m["k8s.restarts"] ? `${m["k8s.restarts"]} restarts` : "", a.restarted_at ? stamp(a.restarted_at) : "", a.reason || a.phase].filter(Boolean).join(" · ");
     case "workload": return `${a.ready || (m["k8s.ready"] != null ? m["k8s.ready"] + "/" + (m["k8s.replicas"] ?? "?") : "?")} ready`;
     case "disk": return `${fmt("disk.used_pct", m["disk.used_pct"])} full · ${bytes(m["disk.available_bytes"])} free`;
     case "storage": return `${fmt("storage.used_pct", m["storage.used_pct"])} full${a.kind ? " · " + a.kind : ""}${a.active === false ? " · inactive" : ""}`;
@@ -515,8 +546,8 @@ function reason(r) {
         return m["proc.cpu_pct"] > 50 ? `cpu ${fmt("proc.cpu_pct", m["proc.cpu_pct"])}` : `mem ${fmt("proc.mem_pct", m["proc.mem_pct"])} · ${bytes(m["proc.rss_bytes"])}`;
       }
       let text = `${fmt("x_pct", share)} of host`;
-      if (share >= 50 && share < 90 && r.health === "ok") text = `busy · ${text}`;
-      if (m["proc.mem_pct"] >= 25) text += ` · mem ${fmt("proc.mem_pct", m["proc.mem_pct"])}`;
+      if (share >= 50 && share < cpuFailed() && r.health === "ok") text = `busy · ${text}`;
+      if (m["proc.mem_pct"] >= memDegraded()) text += ` · mem ${fmt("proc.mem_pct", m["proc.mem_pct"])}`;
       return text;
     }
     case "service": return [a.active, a.sub, a.result].filter(Boolean).join(" · ");
@@ -846,7 +877,7 @@ function dedupeDisks(list) {
 function procBusy(r) {
   if (!r || r.kind !== "process" || r.health !== "ok") return false;
   const share = r.metrics && r.metrics["proc.host_cpu_pct"];
-  return share != null && share >= 50 && share < 90;
+  return share != null && share >= 50 && share < cpuFailed();
 }
 function fold(key, title, count, list, inner) {
   const f = list.filter((r) => r.health === "failed").length, dg = list.filter((r) => r.health === "degraded").length;
@@ -932,7 +963,7 @@ function resourceView(id) {
   const s = scopeOf(r), g = s && M.groups.get(s.g), h = hostOf(r);
   const f = findingsFor(id), acts = actionsFor(id);
   const kv = Object.entries(Object.assign({}, r.labels, r.attrs)).filter(([, v]) => v != null && v !== "" && !(Array.isArray(v) && !v.length))
-    .map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(typeof v === "object" ? JSON.stringify(v) : v)}</dd>`).join("");
+    .map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(showAttr(k, v))}</dd>`).join("");
   const owner = r.kind === "pod" && ownerOf(r);
   return `${crumbs(g && g.type !== "host" && scopeCrumb(g), h && M.machines.has(h) && `<button type="button" data-machine="${esc(h)}">${esc(h)}</button>`,
       owner && `<button type="button" data-res="${esc(owner.id)}">${esc(owner.name)}</button>`, `<span>${esc(KIND_LABEL[r.kind] || r.kind)}</span>`)}
@@ -983,12 +1014,71 @@ function searchView(q) {
 }
 
 let M = null;
+function zoneChoices() {
+  const zones = ZONES.slice();
+  for (const z of [state.tz, state.serverTz, serverZone()]) if (z && zones.indexOf(z) < 0) zones.unshift(z);
+  return zones.map((z) => `<option value="${esc(z)}" ${z === state.tz ? "selected" : ""}>${esc(z === "America/Los_Angeles" ? "America/Los_Angeles (Pacific)" : z)}</option>`).join("");
+}
+function numField(key, label, step) {
+  const v = state.health[key];
+  return `<label>${esc(label)}<input name="${esc(key)}" type="number" step="${step}" min="0" value="${esc(v)}"></label>`;
+}
+function settingsView() {
+  return `${crumbs(`<span>settings</span>`)}
+    <div class="ititle"><b>Settings</b></div>
+    <form class="settings" id="settings-form">
+      <label>Timezone<select name="timezone" aria-label="Portal timezone">${zoneChoices()}</select></label>
+      <div class="small muted">Clocks use this zone. A fresh browser uses ${esc(state.serverTz || FALLBACK_TZ)} until you pick one here. The choice stays in this browser.</div>
+      <h3>Health thresholds</h3>
+      ${numField("pod_restart_window_mins", "Pod restart window (minutes)", "1")}
+      ${numField("pod_restart_lifetime", "Pod lifetime restarts", "1")}
+      ${numField("proc_cpu_share_failed", "Process CPU, percent of the host", "0.1")}
+      ${numField("proc_mem_degraded", "Process memory degraded, percent", "0.1")}
+      ${numField("proc_mem_failed", "Process memory failed, percent", "0.1")}
+      <div class="small muted">Saving writes this hub's copy. Nodes apply it on the next poll, over their compiled defaults, and keep the last good copy if the hub is unreachable. Action tiers, allow-lists, and script.run stay in the toml.</div>
+      <div class="row"><button type="submit">Save thresholds</button>${state.portalMsg ? `<span class="small">${esc(state.portalMsg)}</span>` : ""}</div>
+    </form>`;
+}
+function bindSettings() {
+  const form = $("settings-form");
+  if (!form) return;
+  const tz = form.querySelector('[name="timezone"]');
+  if (tz) tz.onchange = () => {
+    const next = tz.value;
+    if (!zoneOk(next)) return;
+    state.tz = next;
+    try { localStorage.setItem(TZ_KEY, next); } catch (e) {}
+    render();
+  };
+  form.onsubmit = (ev) => {
+    ev.preventDefault();
+    const health = {};
+    for (const key of Object.keys(HEALTH_DEFAULTS)) {
+      const raw = Number(form.querySelector(`[name="${key}"]`).value);
+      health[key] = Number.isFinite(raw) ? raw : HEALTH_DEFAULTS[key];
+    }
+    fetch("/api/v1/portal", {
+      method: "PUT",
+      headers: { "content-type": "application/json", accept: "application/json" },
+      body: JSON.stringify({ health }),
+    }).then(async (r) => {
+      const body = await r.json().catch(() => ({ error: r.statusText }));
+      if (!r.ok) throw new Error(body.error || r.statusText);
+      state.health = Object.assign({}, HEALTH_DEFAULTS, body.health || health);
+      state.portalMsg = "Saved";
+      render();
+    }).catch((e) => { state.portalMsg = e.message || "save failed"; render(); });
+  };
+}
 function renderPanel() {
   const s = state.sel, el = $("panel");
   el.hidden = !s;
   $("layout").classList.toggle("open", !!s);
   if (!s) return;
-  el.innerHTML = s.t === "machine" ? machineView(s.id) : s.t === "scope" ? scopeView(s.id) : s.t === "search" ? searchView(s.id) : resourceView(s.id);
+  const active = document.activeElement;
+  if (s.t === "settings" && active && (active.tagName === "INPUT" || active.tagName === "SELECT") && el.contains(active)) return;
+  el.innerHTML = s.t === "machine" ? machineView(s.id) : s.t === "scope" ? scopeView(s.id) : s.t === "search" ? searchView(s.id) : s.t === "settings" ? settingsView() : resourceView(s.id);
+  if (s.t === "settings") bindSettings();
 }
 function renderView() {
   if (state.tab === "fleet" && single()) state.tab = "overview";
@@ -1001,7 +1091,7 @@ function renderFoot() {
   const src = s.nodes && s.nodes.length ? `${s.nodes.filter((x) => !x.stale).length}/${s.nodes.length} agents pushing`
     : (s.collectors || []).map((c) => `<span class="${c.stale || !c.ok ? "t-degraded" : ""}">${esc(c.source)} ${ago(c.age_secs)}</span>`).join(" · ");
   $("foot").innerHTML = `<span>${esc(scope)} · ${resourceTotal()} resources</span><span>${src}</span>
-    <span>${state.paused ? "paused" : "updated " + new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false })}</span>
+    <span>${state.paused ? "paused" : "updated " + new Date().toLocaleTimeString("en-US", timeOpts({ hour: "2-digit", minute: "2-digit", second: "2-digit" }))}</span>
     <label>refresh <select id="interval" aria-label="Refresh interval">${[5, 15, 60].map((v) => `<option value="${v}" ${v === state.interval ? "selected" : ""}>${v}s</option>`).join("")}</select></label>
     <span class="spacer"></span><span><svg class="logo" aria-hidden="true"><use href="#pb-mark"/></svg>Pulseblade v${esc(s.version)} · seq ${s.as_of_seq} · up ${ago(s.uptime_secs)} · db ${bytes(s.db && s.db.size_bytes)}</span>`;
   $("interval").onchange = (e) => { state.interval = Number(e.target.value); schedule(); };
@@ -1172,6 +1262,16 @@ async function ensureSpark() {
   }
 }
 let refreshing = false;
+async function loadPortal() {
+  try {
+    const p = await api("/api/v1/portal");
+    if (p.health) state.health = Object.assign({}, HEALTH_DEFAULTS, p.health);
+    if (zoneOk(p.timezone)) state.serverTz = p.timezone;
+    let saved = null;
+    try { saved = localStorage.getItem(TZ_KEY); } catch (e) {}
+    if (!zoneOk(saved)) state.tz = state.serverTz || serverZone();
+  } catch (e) {}
+}
 async function refresh() {
   if (refreshing) return;
   refreshing = true;
@@ -1181,6 +1281,7 @@ async function refresh() {
       api("/api/v1/snapshot"),
       api("/api/v1/findings?limit=20"),
       api("/api/v1/actions"),
+      loadPortal(),
     ]);
     D.status = status;
     D.findings = findings || { total: 0, findings: [] };
@@ -1217,10 +1318,11 @@ function select(sel, keepMetric) {
 }
 const sameSel = (t, id) => state.sel && state.sel.t === t && state.sel.id === id;
 document.addEventListener("click", (ev) => {
-  const t = ev.target.closest("[data-tab],[data-strip],[data-gofleet],[data-fleet],[data-win],[data-machine],[data-scope],[data-g],[data-res],[data-kind],[data-showok],[data-metric],[data-close],[data-churn],[data-attnall],[data-attnless],[data-preset],[data-theme-choice]");
+  const t = ev.target.closest("[data-tab],[data-strip],[data-gofleet],[data-fleet],[data-win],[data-machine],[data-scope],[data-g],[data-res],[data-kind],[data-showok],[data-metric],[data-close],[data-churn],[data-attnall],[data-attnless],[data-preset],[data-theme-choice],[data-settings]");
   if (!t) return;
   const d = t.dataset;
   if (d.themeChoice) return setTheme(d.themeChoice);
+  if (d.settings !== undefined) return select(sameSel("settings", "settings") ? null : { t: "settings", id: "settings" });
   if (d.tab) { state.tab = d.tab; render(); enrich().then(render).catch(showError); return syncUrl(); }
   if (d.gofleet) { state.tab = "fleet"; state.fleet = d.gofleet; render(); enrich().then(render).catch(showError); return syncUrl(); }
   if (d.fleet) { state.fleet = d.fleet; render(); return syncUrl(); }

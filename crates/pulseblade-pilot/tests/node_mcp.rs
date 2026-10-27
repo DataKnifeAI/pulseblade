@@ -63,6 +63,7 @@ fn failed_unit_notes_and_plans_a_restart_over_mcp() {
             vec!["127.0.0.1".into()],
             stop,
             actions,
+            pulseblade_mcp::PortalDefaults::default(),
         )
         .await;
     });

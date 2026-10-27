@@ -15,7 +15,7 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
-use pulseblade_core::ResourceKind;
+use pulseblade_core::{default_timezone, valid_timezone, HealthThresholds, ResourceKind};
 use pulseblade_store::{Store, StoreError};
 use serde::Deserialize;
 use serde_json::json;
@@ -27,11 +27,28 @@ use crate::query::{self, Detail, QueryError};
 const DASHBOARD: &str = include_str!("dashboard.html");
 const FAVICON_PNG: &[u8] = include_bytes!("../../../docs/assets/dashboard/favicon-32.png");
 
+/// Compiled or toml defaults the dashboard shows until a portal save is stored.
+#[derive(Clone, Debug)]
+pub struct PortalDefaults {
+    pub timezone: String,
+    pub health: HealthThresholds,
+}
+
+impl Default for PortalDefaults {
+    fn default() -> Self {
+        Self {
+            timezone: default_timezone(),
+            health: HealthThresholds::default(),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct AppState {
     journal: Arc<Journal>,
     started: DateTime<Utc>,
     actions: Arc<pulseblade_act::Registry>,
+    portal: PortalDefaults,
 }
 
 /// Routes for `/`, `/metrics`, and `/api/v1/*`. `started` feeds `uptime_secs`.
@@ -49,7 +66,12 @@ pub fn router_with(
     started: DateTime<Utc>,
     actions: Arc<pulseblade_act::Registry>,
 ) -> Router {
-    router_with_journal(journal::Journal::always(store), started, actions)
+    router_with_journal(
+        journal::Journal::always(store),
+        started,
+        actions,
+        PortalDefaults::default(),
+    )
 }
 
 /// Same routes, using a hub journal that can serve a stale snapshot.
@@ -57,6 +79,7 @@ pub fn router_with_journal(
     journal: Arc<Journal>,
     started: DateTime<Utc>,
     actions: Arc<pulseblade_act::Registry>,
+    portal: PortalDefaults,
 ) -> Router {
     let api = Router::new()
         .route("/status", get(status))
@@ -71,9 +94,10 @@ pub fn router_with_journal(
         .route("/logs", get(logs))
         .route("/actions", get(actions_list))
         .route("/actions/{id}/approve", post(approve_action))
+        .route("/portal", get(portal_get).put(portal_put))
         .fallback(|| async { ApiError::not_found("no such API endpoint") });
     Router::new()
-        .route("/", get(|| async { Html(DASHBOARD) }))
+        .route("/", get(dashboard))
         .route("/favicon.ico", get(favicon))
         .route("/metrics", get(prometheus))
         .nest("/api/v1", api)
@@ -81,7 +105,80 @@ pub fn router_with_journal(
             journal,
             started,
             actions,
+            portal,
         })
+}
+
+fn dashboard_timezone(portal: &PortalDefaults) -> String {
+    if valid_timezone(&portal.timezone) {
+        portal.timezone.clone()
+    } else {
+        default_timezone()
+    }
+}
+
+async fn dashboard(State(st): State<AppState>) -> Html<String> {
+    let html = DASHBOARD.replace("__PB_TIMEZONE__", &dashboard_timezone(&st.portal));
+    Html(html)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PortalWrite {
+    health: HealthThresholds,
+}
+
+async fn portal_get(State(st): State<AppState>) -> ApiResult {
+    let defaults = st.portal.health.clone();
+    let journal = st.journal.clone();
+    let health = tokio::task::spawn_blocking(move || {
+        let Some(store) = journal.store() else {
+            return defaults;
+        };
+        match store.health_thresholds() {
+            Ok(Some(doc)) => doc,
+            _ => defaults,
+        }
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    ok(json!({
+        "timezone": dashboard_timezone(&st.portal),
+        "health": health,
+    }))
+}
+
+async fn portal_put(
+    State(st): State<AppState>,
+    body: Result<Json<PortalWrite>, axum::extract::rejection::JsonRejection>,
+) -> ApiResult {
+    let Json(body) = body.map_err(|e| ApiError::invalid(e.body_text()))?;
+    body.health.validate().map_err(ApiError::invalid)?;
+    let journal = st.journal.clone();
+    let health = body.health;
+    tokio::task::spawn_blocking(move || {
+        let Some(store) = journal.store() else {
+            return Err(ApiError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "database unavailable".into(),
+            ));
+        };
+        match store.set_health_thresholds(&health) {
+            Ok(()) => Ok(health),
+            Err(err) if journal::is_down(&err) => {
+                journal.mark_down();
+                Err(ApiError(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "database unavailable".into(),
+                ))
+            }
+            Err(StoreError::Invalid(msg)) => Err(ApiError::invalid(msg)),
+            Err(err) => Err(ApiError(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())),
+        }
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
+    portal_get(State(st)).await
 }
 
 pub struct ApiError(StatusCode, String);
@@ -695,6 +792,76 @@ mod tests {
         );
         let icon = to_bytes(res.into_body(), usize::MAX).await.unwrap();
         assert!(icon.starts_with(b"\x89PNG"));
+    }
+
+    #[tokio::test]
+    async fn portal_saves_health_and_rejects_policy() {
+        let app = app();
+        let (code, v) = get_json(&app, "/api/v1/portal").await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(v["timezone"], "America/Los_Angeles");
+        assert_eq!(v["health"]["pod_restart_window_mins"], 15);
+        assert_eq!(v["health"]["pod_restart_lifetime"], 100);
+        assert_eq!(v["health"]["proc_cpu_share_failed"], 90.0);
+        assert_eq!(v["health"]["proc_mem_degraded"], 25.0);
+        assert_eq!(v["health"]["proc_mem_failed"], 50.0);
+
+        let saved = json!({
+            "health": {
+                "pod_restart_window_mins": 20,
+                "pod_restart_lifetime": 100,
+                "proc_cpu_share_failed": 90.0,
+                "proc_mem_degraded": 25.0,
+                "proc_mem_failed": 50.0
+            }
+        });
+        let res = app
+            .clone()
+            .oneshot(
+                HttpRequest::put("/api/v1/portal")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(saved.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["health"]["pod_restart_window_mins"], 20);
+
+        let rejected = json!({
+            "health": {
+                "pod_restart_window_mins": 15,
+                "tier": "auto"
+            }
+        });
+        let res = app
+            .clone()
+            .oneshot(
+                HttpRequest::put("/api/v1/portal")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(rejected.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let policy = json!({"actions": {"script_run": {"tier": "auto"}}, "health": {"pod_restart_window_mins": 15}});
+        let res = app
+            .clone()
+            .oneshot(
+                HttpRequest::put("/api/v1/portal")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(policy.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let (code, v) = get_json(&app, "/api/v1/portal").await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(v["health"]["pod_restart_window_mins"], 20);
     }
 
     #[test]

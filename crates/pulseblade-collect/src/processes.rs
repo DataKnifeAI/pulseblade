@@ -7,11 +7,12 @@
 
 use std::collections::HashMap;
 use std::ops::Deref;
+use std::sync::Arc;
 
-use pulseblade_core::{Health, Observation, Resource, ResourceKind, Sample};
+use pulseblade_core::{Health, HealthThresholds, Observation, Resource, ResourceKind, Sample};
 use sysinfo::{CpuRefreshKind, ProcessesToUpdate, System, Users};
 
-use crate::{CollectError, Collector};
+use crate::{CollectError, Collector, HealthGate};
 
 /// Include a process once CPU or memory crosses this floor.
 const CPU_KEEP: f64 = 5.0;
@@ -19,16 +20,13 @@ const MEM_KEEP: f64 = 3.0;
 const MAX_PROCS: usize = 12;
 /// Passes to keep reporting a process after it leaves the top set.
 const STICKY_MISSES: u8 = 3;
-/// Host CPU share at or above this is failed. 100 is the whole machine.
-const CPU_SHARE_FAILED: f64 = 90.0;
-const MEM_FAILED: f64 = 50.0;
-const MEM_DEGRADED: f64 = 25.0;
 
 pub struct ProcessCollector {
     host: String,
     sys: System,
     /// Pid to consecutive passes spent below the keep floor.
     sticky: HashMap<u32, u8>,
+    health: Arc<HealthGate>,
 }
 
 #[derive(Debug, Clone)]
@@ -43,11 +41,12 @@ pub(crate) struct ProcView {
 }
 
 impl ProcessCollector {
-    pub fn new(host: String) -> Self {
+    pub fn new(host: String, health: Arc<HealthGate>) -> Self {
         Self {
             host,
             sys: System::new(),
             sticky: HashMap::new(),
+            health,
         }
     }
 }
@@ -98,23 +97,26 @@ impl Collector for ProcessCollector {
             self.sys.refresh_cpu_list(CpuRefreshKind::nothing());
         }
         let cpu_count = self.sys.cpus().len();
+        let limits = self.health.get();
         Ok(observation(
             &self.host,
             cpu_count,
             &choose(&procs, &mut self.sticky),
+            &limits,
         ))
     }
 }
 
 /// Stored health from host CPU share and memory percent.
 ///
-/// CPU changes health only at [`CPU_SHARE_FAILED`]: 50% of the host up to that
-/// line is busy on the dashboard and stays [`Health::Ok`]. Memory is degraded
-/// at 25% and failed at 50%.
-pub(crate) fn proc_health(cpu_share: f64, mem_pct: f64) -> Health {
-    if cpu_share >= CPU_SHARE_FAILED || mem_pct >= MEM_FAILED {
+/// CPU changes health only at `proc_cpu_share_failed` (default 90): 50% of the
+/// host up to that line is busy on the dashboard and stays [`Health::Ok`].
+/// Memory is degraded at `proc_mem_degraded` (default 25) and failed at
+/// `proc_mem_failed` (default 50).
+pub(crate) fn proc_health(cpu_share: f64, mem_pct: f64, limits: &HealthThresholds) -> Health {
+    if cpu_share >= limits.proc_cpu_share_failed || mem_pct >= limits.proc_mem_failed {
         Health::Failed
-    } else if mem_pct >= MEM_DEGRADED {
+    } else if mem_pct >= limits.proc_mem_degraded {
         Health::Degraded
     } else {
         Health::Ok
@@ -168,7 +170,12 @@ pub(crate) fn choose(procs: &[ProcView], sticky: &mut HashMap<u32, u8>) -> Vec<P
     out
 }
 
-fn observation(host: &str, cpu_count: usize, procs: &[ProcView]) -> Observation {
+fn observation(
+    host: &str,
+    cpu_count: usize,
+    procs: &[ProcView],
+    limits: &HealthThresholds,
+) -> Observation {
     let parent = format!("host:{host}");
     let mut obs = Observation::default();
     for proc in procs {
@@ -176,7 +183,7 @@ fn observation(host: &str, cpu_count: usize, procs: &[ProcView]) -> Observation 
         let share = cpu_share(proc.cpu_pct, cpu_count);
         let mut resource = Resource::new(&id, ResourceKind::Process, &proc.name)
             .parent(&parent)
-            .health(proc_health(share, proc.mem_pct))
+            .health(proc_health(share, proc.mem_pct, limits))
             .label("host", host)
             .attr("pid", proc.pid);
         if let Some(user) = &proc.user {
@@ -228,19 +235,31 @@ mod tests {
         }
     }
 
+    fn limits() -> HealthThresholds {
+        HealthThresholds::default()
+    }
+
     #[test]
     fn health_thresholds() {
-        assert_eq!(proc_health(10.0, 1.0), Health::Ok);
+        let limits = limits();
+        assert_eq!(limits.proc_cpu_share_failed, 90.0);
+        assert_eq!(limits.proc_mem_degraded, 25.0);
+        assert_eq!(limits.proc_mem_failed, 50.0);
+        assert_eq!(proc_health(10.0, 1.0, &limits), Health::Ok);
         // ~10 of 32 cores, with modest memory, stays ok.
-        assert_eq!(proc_health(1000.0 / 32.0, 12.0), Health::Ok);
+        assert_eq!(proc_health(1000.0 / 32.0, 12.0, &limits), Health::Ok);
         // 50% up to 90% of the host is busy on the dashboard only.
-        assert_eq!(proc_health(50.0, 1.0), Health::Ok);
-        assert_eq!(proc_health(89.9, 1.0), Health::Ok);
-        assert_eq!(proc_health(10.0, 24.9), Health::Ok);
-        assert_eq!(proc_health(10.0, 25.0), Health::Degraded);
-        assert_eq!(proc_health(90.0, 1.0), Health::Failed);
-        assert_eq!(proc_health(1.0, 50.0), Health::Failed);
-        assert_eq!(proc_health(90.0, 12.0), Health::Failed);
+        assert_eq!(proc_health(50.0, 1.0, &limits), Health::Ok);
+        assert_eq!(proc_health(89.9, 1.0, &limits), Health::Ok);
+        assert_eq!(proc_health(10.0, 24.9, &limits), Health::Ok);
+        assert_eq!(proc_health(10.0, 25.0, &limits), Health::Degraded);
+        assert_eq!(proc_health(90.0, 1.0, &limits), Health::Failed);
+        assert_eq!(proc_health(1.0, 50.0, &limits), Health::Failed);
+        assert_eq!(proc_health(90.0, 12.0, &limits), Health::Failed);
+        let mut tighter = limits.clone();
+        tighter.proc_cpu_share_failed = 80.0;
+        assert_eq!(proc_health(80.0, 1.0, &tighter), Health::Failed);
+        assert_eq!(proc_health(79.9, 1.0, &tighter), Health::Ok);
     }
 
     #[test]
@@ -264,7 +283,7 @@ mod tests {
 
     #[test]
     fn wide_host_keeps_a_few_busy_cores_ok() {
-        let obs = observation("h", 32, &[proc(9, 1000.0, 12.0)]);
+        let obs = observation("h", 32, &[proc(9, 1000.0, 12.0)], &limits());
         let resource = &obs.resources[0];
         assert_eq!(resource.health, Health::Ok);
         assert!(obs
@@ -277,19 +296,19 @@ mod tests {
             .any(|s| s.metric == "proc.host_cpu_pct" && s.value == 1000.0 / 32.0));
         // The old one-core 95% line is not a host-share failure.
         assert_eq!(
-            observation("h", 32, &[proc(9, 95.0, 1.0)]).resources[0].health,
+            observation("h", 32, &[proc(9, 95.0, 1.0)], &limits()).resources[0].health,
             Health::Ok
         );
         // Half the machine is still stored as ok.
         assert_eq!(
-            observation("h", 32, &[proc(9, 1600.0, 1.0)]).resources[0].health,
+            observation("h", 32, &[proc(9, 1600.0, 1.0)], &limits()).resources[0].health,
             Health::Ok
         );
     }
 
     #[test]
     fn host_share_at_least_90_is_failed() {
-        let obs = observation("h", 32, &[proc(9, 32.0 * 90.0, 1.0)]);
+        let obs = observation("h", 32, &[proc(9, 32.0 * 90.0, 1.0)], &limits());
         let resource = &obs.resources[0];
         assert_eq!(resource.id, "proc:h:9");
         assert_eq!(resource.kind, ResourceKind::Process);

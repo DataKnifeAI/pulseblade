@@ -23,8 +23,8 @@ pub use memory::{FindingDraft, FindingFilter};
 pub use pilot::{NewPilotRun, PilotRunRow};
 
 use pulseblade_core::{
-    Aggregation, Change, ChangeKind, Checkpoint, CollectorRun, Health, Observation, Point,
-    Resource, ResourceKind, Since, StoredResource,
+    Aggregation, Change, ChangeKind, Checkpoint, CollectorRun, Health, HealthThresholds,
+    Observation, Point, Resource, ResourceKind, Since, StoredResource,
 };
 use rusqlite::{params, Connection, Row};
 
@@ -237,6 +237,11 @@ CREATE TABLE IF NOT EXISTS route_results (
     id      TEXT PRIMARY KEY,
     node_id TEXT NOT NULL,
     body    TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
 );
 "#;
 
@@ -709,6 +714,40 @@ impl Store {
         self.with_sql(|sql| {
             let rows = sql.query(&format!("{RESOURCE_COLS} ORDER BY id"), &[], map_resource)?;
             Ok(rows.into_iter().filter(|row| filter.matches(row)).collect())
+        })
+    }
+
+    /// Portal or hub health document, when one has been saved.
+    pub fn health_thresholds(&self) -> Result<Option<HealthThresholds>> {
+        self.with_sql(|sql| {
+            let raw = sql.query_opt(
+                "SELECT value FROM settings WHERE key = ?1",
+                &[SqlVal::text("health")],
+                |row| row.text(0),
+            )?;
+            match raw {
+                None => Ok(None),
+                Some(text) => {
+                    let value: Value = serde_json::from_str(&text)?;
+                    HealthThresholds::from_value(&value)
+                        .map(Some)
+                        .map_err(StoreError::Invalid)
+                }
+            }
+        })
+    }
+
+    /// Replace the saved health document. Invalid numbers are refused.
+    pub fn set_health_thresholds(&self, doc: &HealthThresholds) -> Result<()> {
+        doc.validate().map_err(StoreError::Invalid)?;
+        let text = serde_json::to_string(doc)?;
+        self.with_sql(|sql| {
+            sql.execute(
+                "INSERT INTO settings (key, value) VALUES (?1, ?2)
+                 ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                &[SqlVal::text("health"), SqlVal::text(text)],
+            )?;
+            Ok(())
         })
     }
 

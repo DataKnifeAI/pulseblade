@@ -22,6 +22,7 @@ use rmcp::transport::streamable_http_server::{
 use rmcp::ServiceExt;
 use tokio_util::sync::CancellationToken;
 
+pub use http::PortalDefaults;
 pub use server::{ActionRoute, PulsebladeServer};
 
 /// Serve MCP over stdin/stdout until the client disconnects.
@@ -42,9 +43,10 @@ pub async fn serve_http(
     allowed_hosts: Vec<String>,
     shutdown: CancellationToken,
     actions: Arc<Registry>,
+    portal: PortalDefaults,
 ) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    serve_listener(listener, store, allowed_hosts, shutdown, actions).await
+    serve_listener(listener, store, allowed_hosts, shutdown, actions, portal).await
 }
 
 /// Serve on an already-bound listener so callers can discover port 0.
@@ -54,6 +56,7 @@ pub async fn serve_listener(
     allowed_hosts: Vec<String>,
     shutdown: CancellationToken,
     actions: Arc<Registry>,
+    portal: PortalDefaults,
 ) -> anyhow::Result<()> {
     let router = build_router(
         Journal::always(store),
@@ -62,6 +65,7 @@ pub async fn serve_listener(
         actions,
         None,
         Router::new(),
+        portal,
     );
     let bound = listener.local_addr()?;
     tracing::info!(%bound, "listening: MCP http://{bound}/mcp, dashboard http://{bound}/");
@@ -80,6 +84,7 @@ pub fn build_router(
     actions: Arc<Registry>,
     route: Option<Arc<dyn ActionRoute>>,
     extra: Router,
+    portal: PortalDefaults,
 ) -> Router {
     let mut config = StreamableHttpServerConfig::default()
         .with_json_response(true)
@@ -101,7 +106,7 @@ pub fn build_router(
         Arc::new(LocalSessionManager::default()),
         config,
     );
-    http::router_with_journal(journal, Utc::now(), actions)
+    http::router_with_journal(journal, Utc::now(), actions, portal)
         .merge(extra)
         .nest_service("/mcp", service)
         .route("/healthz", axum::routing::get(|| async { "ok" }))

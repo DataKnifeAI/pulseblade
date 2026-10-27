@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use pulseblade_act::ActionsConfig;
 use pulseblade_collect::{CollectorOpts, K8sTarget, PromTarget, ProxmoxTarget};
-use pulseblade_core::LabelRule;
+use pulseblade_core::{default_timezone, valid_timezone, HealthThresholds, LabelRule};
 use pulseblade_detect::DetectConfig;
 use pulseblade_pilot::PilotConfig;
 use serde::Deserialize;
@@ -25,6 +25,12 @@ pub struct Config {
     /// When true, `pulseblade mcp` also serves the HTTP dashboard and API.
     #[serde(default)]
     pub dashboard: bool,
+    /// IANA zone for dashboard clocks. Default is Pacific (`America/Los_Angeles`).
+    #[serde(default = "default_timezone")]
+    pub timezone: String,
+    /// Pod restart and process CPU/memory cutoffs. The portal edits this document only.
+    #[serde(default)]
+    pub health: HealthThresholds,
     /// Extra `Host` header values accepted by the HTTP endpoint (loopback is always allowed).
     pub allowed_hosts: Vec<String>,
     /// Semantic labels applied to matching resource ids.
@@ -348,6 +354,8 @@ impl Default for Config {
             history_days: default_history_days(),
             listen: "127.0.0.1:7171".to_string(),
             dashboard: false,
+            timezone: default_timezone(),
+            health: HealthThresholds::default(),
             allowed_hosts: Vec::new(),
             labels: Vec::new(),
             detect: DetectConfig::default(),
@@ -385,7 +393,19 @@ impl Config {
         }
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
-        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+        let cfg: Self =
+            toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        cfg.health
+            .validate()
+            .map_err(|err| anyhow::anyhow!("invalid [health] in {}: {err}", path.display()))?;
+        if !valid_timezone(&cfg.timezone) {
+            anyhow::bail!(
+                "timezone {:?} in {} is not an IANA name such as America/Los_Angeles",
+                cfg.timezone,
+                path.display()
+            );
+        }
+        Ok(cfg)
     }
 }
 
@@ -587,6 +607,33 @@ mod tests {
         assert_eq!(cfg.k8s.cluster, "demo");
         assert_eq!(cfg.prometheus.len(), 1);
         assert!(cfg.prometheus[0].url.is_empty());
+        assert_eq!(cfg.timezone, "America/Los_Angeles");
+        assert_eq!(cfg.health.pod_restart_window_mins, 15);
+        assert_eq!(cfg.health.pod_restart_lifetime, 100);
+        assert_eq!(cfg.health.proc_cpu_share_failed, 90.0);
+        assert_eq!(cfg.health.proc_mem_degraded, 25.0);
+        assert_eq!(cfg.health.proc_mem_failed, 50.0);
+    }
+
+    #[test]
+    fn health_toml_override_changes_the_window() {
+        let cfg: Config = toml::from_str(
+            r#"
+            timezone = "UTC"
+            [health]
+            pod_restart_window_mins = 45
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.timezone, "UTC");
+        assert_eq!(cfg.health.pod_restart_window_mins, 45);
+        assert_eq!(cfg.health.pod_restart_lifetime, 100);
+        assert_eq!(cfg.health.proc_mem_degraded, 25.0);
+        assert!(toml::from_str::<Config>("[health]\npod_restart_window_mins = 0").is_ok());
+        let zero: Config = toml::from_str("[health]\npod_restart_window_mins = 0").unwrap();
+        assert!(zero.health.validate().is_err());
+        assert!(toml::from_str::<Config>("[health]\ntier = \"auto\"").is_err());
+        assert!(toml::from_str::<Config>("[health]\nscript_run = { allow = [] }").is_err());
     }
 
     #[test]

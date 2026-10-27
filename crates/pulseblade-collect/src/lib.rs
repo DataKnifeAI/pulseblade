@@ -25,8 +25,32 @@ pub use systemd::SystemdCollector;
 pub use user::UserCollector;
 
 use std::process::Command;
+use std::sync::Mutex;
 
-use pulseblade_core::Observation;
+use pulseblade_core::{HealthThresholds, Observation};
+
+/// Live health cutoffs. The collector thread replaces them when the hub
+/// document or the portal save changes; a failed read leaves the last copy.
+#[derive(Debug)]
+pub struct HealthGate {
+    inner: Mutex<HealthThresholds>,
+}
+
+impl HealthGate {
+    pub fn new(initial: HealthThresholds) -> Self {
+        Self {
+            inner: Mutex::new(initial),
+        }
+    }
+
+    pub fn get(&self) -> HealthThresholds {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub fn set(&self, next: HealthThresholds) {
+        *self.inner.lock().unwrap_or_else(|e| e.into_inner()) = next;
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum CollectError {
@@ -88,7 +112,10 @@ impl Default for CollectorOpts {
 }
 
 /// Collectors that make sense on this machine.
-pub fn default_collectors(opts: &CollectorOpts) -> Vec<Box<dyn Collector>> {
+pub fn default_collectors(
+    opts: &CollectorOpts,
+    health: std::sync::Arc<HealthGate>,
+) -> Vec<Box<dyn Collector>> {
     let host = hostname();
     let mut out: Vec<Box<dyn Collector>> = vec![Box::new(HostCollector::new(host.clone()))];
     if SystemdCollector::available() {
@@ -106,10 +133,13 @@ pub fn default_collectors(opts: &CollectorOpts) -> Vec<Box<dyn Collector>> {
     } else {
         tracing::info!("journalctl not found; journald collector disabled");
     }
-    out.push(Box::new(ProcessCollector::new(host.clone())));
+    out.push(Box::new(ProcessCollector::new(
+        host.clone(),
+        health.clone(),
+    )));
     push_docker(&mut out, &host, opts.docker);
     push_proxmox(&mut out, opts.proxmox.as_ref());
-    push_k8s(&mut out, opts.k8s.as_ref());
+    push_k8s(&mut out, opts.k8s.as_ref(), health);
     push_prometheus(&mut out, &host, &opts.prometheus);
     out
 }
@@ -154,7 +184,11 @@ fn push_proxmox(out: &mut Vec<Box<dyn Collector>>, target: Option<&ProxmoxTarget
     }
 }
 
-fn push_k8s(out: &mut Vec<Box<dyn Collector>>, target: Option<&K8sTarget>) {
+fn push_k8s(
+    out: &mut Vec<Box<dyn Collector>>,
+    target: Option<&K8sTarget>,
+    health: std::sync::Arc<HealthGate>,
+) {
     let Some(target) = target else {
         return;
     };
@@ -166,7 +200,7 @@ fn push_k8s(out: &mut Vec<Box<dyn Collector>>, target: Option<&K8sTarget>) {
         match k8s::LiveK8s::connect(target) {
             Ok(src) => {
                 let cluster = src.cluster().to_string();
-                out.push(Box::new(K8sCollector::new(cluster, src)));
+                out.push(Box::new(K8sCollector::with_health(cluster, src, health)));
             }
             Err(e) => {
                 tracing::info!(error = %e, "kubernetes API unavailable; k8s collector disabled")
@@ -175,7 +209,7 @@ fn push_k8s(out: &mut Vec<Box<dyn Collector>>, target: Option<&K8sTarget>) {
     }
     #[cfg(not(feature = "k8s"))]
     {
-        let _ = out;
+        let _ = (out, health);
         tracing::info!("k8s collector not compiled");
     }
 }
