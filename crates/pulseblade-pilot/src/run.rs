@@ -12,7 +12,8 @@ use crate::mcp::Tools;
 
 const SYSTEM: &str = "\
 You are the Pulseblade pilot. Investigate one incident using the tools. \
-The digest already includes the finding, recent changes, and prior notes. \
+The digest already includes the finding, recent changes, prior notes, and known remedies. \
+Prefer a known remedy from the digest when it fits this finding. \
 Use state_snapshot with no arguments or detail=brief, short metrics_query ranges, \
 and one resource_explain. Write a short conclusion with memory_note on the resource. \
 Propose remediation with action_plan and pass that finding's id as finding_id. \
@@ -31,6 +32,7 @@ struct OpenFinding {
     resource_id: String,
     summary: String,
     severity: String,
+    rule: String,
 }
 
 /// Record of one wake. Steady-state polls do not produce a run.
@@ -122,14 +124,104 @@ impl Session {
             fresh
         };
         let notes = prior_notes(tools, &focus);
-        let digest = digest(&focus, &change_list, &notes, seq);
-        let run = investigate(&self.config, tools, chat, &trigger, &digest, &focus);
+        let mut model_focus = Vec::new();
+        let mut filed = Vec::new();
+        let mut closest = Vec::new();
+        for finding in &focus {
+            if finding.rule.is_empty() {
+                model_focus.push(finding.clone());
+                continue;
+            }
+            let kind = pulseblade_core::resource_kind_of_id(&finding.resource_id).unwrap_or("");
+            let page = tools
+                .call(
+                    "remedies_list",
+                    json!({
+                        "rule": finding.rule,
+                        "kind": kind,
+                        "finding_id": finding.id,
+                        "resource_id": finding.resource_id,
+                    }),
+                )
+                .unwrap_or_else(|_| json!({}));
+            if page.get("open_plan").and_then(|v| v.as_bool()) == Some(true) {
+                continue;
+            }
+            if let Some(matched) = page.get("matched").filter(|row| {
+                row.get("action")
+                    .and_then(|action| action.as_str())
+                    .is_some_and(|action| !action.is_empty())
+            }) {
+                if let Some(action) = file_remedy(tools, finding, matched) {
+                    filed.push(action);
+                    continue;
+                }
+            }
+            if let Some(list) = page.get("closest").and_then(|rows| rows.as_array()) {
+                for row in list.iter().take(3) {
+                    if let Some(line) = remedy_line(row) {
+                        closest.push(line);
+                    }
+                }
+            }
+            model_focus.push(finding.clone());
+        }
         for finding in &open {
             self.seen.insert(finding.id.clone());
         }
         self.seq = seq;
+        if model_focus.is_empty() && !filed.is_empty() {
+            return Ok(Some(PilotRun {
+                trigger,
+                tier: String::new(),
+                endpoint: String::new(),
+                tool_calls: u32::try_from(filed.len()).unwrap_or(u32::MAX),
+                tokens: 0,
+                conclusion: format!("filed {}", filed.join(",")),
+                proposed: filed,
+                status: "remedy".into(),
+                detail: "action_plan".into(),
+            }));
+        }
+        // Every finding already has a plan. A change with no finding still investigates.
+        if model_focus.is_empty() && !focus.is_empty() {
+            return Ok(None);
+        }
+        let digest = digest(&model_focus, &change_list, &notes, &closest, seq);
+        let run = investigate(&self.config, tools, chat, &trigger, &digest, &model_focus);
         Ok(Some(run))
     }
+}
+
+/// File the known plan for this resource. Does not execute it.
+fn file_remedy<T: Tools>(tools: &mut T, finding: &OpenFinding, matched: &Value) -> Option<String> {
+    let action = matched.get("action")?.as_str()?.to_string();
+    let shape = matched.get("params").cloned().unwrap_or_else(|| json!({}));
+    let params = pulseblade_core::bind_remedy_params(&shape, &finding.resource_id)?;
+    let filed = tools
+        .call(
+            "action_plan",
+            json!({
+                "action": action,
+                "params": params,
+                "resource_id": finding.resource_id,
+                "finding_id": finding.id,
+            }),
+        )
+        .ok()?;
+    if filed.get("error").is_some() {
+        return None;
+    }
+    Some(action)
+}
+
+fn remedy_line(row: &Value) -> Option<String> {
+    let action = row.get("action")?.as_str()?;
+    let rule = row.get("rule").and_then(|v| v.as_str()).unwrap_or("");
+    let kind = row.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+    let tier = row.get("tier").and_then(|v| v.as_str()).unwrap_or("");
+    let params = row.get("params").cloned().unwrap_or_else(|| json!({}));
+    Some(format!("remedy {rule} {kind} {action} {tier} {params}"))
 }
 
 fn investigate<T: Tools, C: Chat>(
@@ -502,7 +594,13 @@ fn prior_notes<T: Tools>(tools: &mut T, focus: &[OpenFinding]) -> Vec<String> {
     out
 }
 
-fn digest(focus: &[OpenFinding], changes: &[Value], notes: &[String], seq: i64) -> String {
+fn digest(
+    focus: &[OpenFinding],
+    changes: &[Value],
+    notes: &[String],
+    remedies: &[String],
+    seq: i64,
+) -> String {
     let mut lines = vec![format!("as_of_seq {seq}")];
     for finding in focus.iter().take(5) {
         lines.push(format!(
@@ -524,6 +622,9 @@ fn digest(focus: &[OpenFinding], changes: &[Value], notes: &[String], seq: i64) 
     }
     for note in notes.iter().take(5) {
         lines.push(format!("note {note}"));
+    }
+    for remedy in remedies.iter().take(5) {
+        lines.push(remedy.clone());
     }
     let mut text = lines.join("\n");
     if text.chars().count() > 4000 {
@@ -577,6 +678,11 @@ fn open_findings(v: &Value) -> Vec<OpenFinding> {
                     .to_string(),
                 severity: f
                     .get("severity")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                rule: f
+                    .get("rule")
                     .and_then(|s| s.as_str())
                     .unwrap_or("")
                     .to_string(),
@@ -681,6 +787,7 @@ mod tests {
         calls: Vec<String>,
         plan_tier: &'static str,
         plan_args: Vec<Value>,
+        remedy: Value,
     }
 
     impl Tools for FakeTools {
@@ -693,6 +800,7 @@ mod tests {
                 "memory_note" => Ok(
                     json!({"id": "n1", "text": args.get("text").cloned().unwrap_or(Value::Null)}),
                 ),
+                "remedies_list" => Ok(self.remedy.clone()),
                 "action_plan" => {
                     self.plan_args.push(args);
                     Ok(json!({
@@ -797,6 +905,7 @@ mod tests {
             calls: Vec::new(),
             plan_tier: "approve",
             plan_args: Vec::new(),
+            remedy: json!({}),
         };
         let mut chat = ScriptChat {
             rounds: vec![],
@@ -817,6 +926,7 @@ mod tests {
             calls: Vec::new(),
             plan_tier: "approve",
             plan_args: Vec::new(),
+            remedy: json!({}),
         };
         let mut chat = ScriptChat {
             rounds: vec![
@@ -881,6 +991,7 @@ mod tests {
             calls: Vec::new(),
             plan_tier: "approve",
             plan_args: Vec::new(),
+            remedy: json!({}),
         };
         let mut chat = ScriptChat {
             rounds: vec![
@@ -920,6 +1031,7 @@ mod tests {
             calls: Vec::new(),
             plan_tier: "auto",
             plan_args: Vec::new(),
+            remedy: json!({}),
         };
         let mut chat = ScriptChat {
             rounds: vec![
@@ -958,6 +1070,7 @@ mod tests {
             calls: Vec::new(),
             plan_tier: "approve",
             plan_args: Vec::new(),
+            remedy: json!({}),
         };
         let forever = completion(
             json!([call(
@@ -992,6 +1105,7 @@ mod tests {
             calls: Vec::new(),
             plan_tier: "approve",
             plan_args: Vec::new(),
+            remedy: json!({}),
         };
         let mut chat = ScriptChat {
             rounds: vec![],
@@ -1027,6 +1141,7 @@ mod tests {
             calls: Vec::new(),
             plan_tier: "approve",
             plan_args: Vec::new(),
+            remedy: json!({}),
         };
         let mut chat = ScriptChat {
             rounds: vec![completion(json!([]), "quiet")],
@@ -1054,6 +1169,7 @@ mod tests {
             calls: Vec::new(),
             plan_tier: "approve",
             plan_args: Vec::new(),
+            remedy: json!({}),
         };
         let round = completion(json!([]), "seen");
         let mut chat = ScriptChat {
@@ -1087,6 +1203,7 @@ mod tests {
             calls: Vec::new(),
             plan_tier: "auto",
             plan_args: Vec::new(),
+            remedy: json!({}),
         };
         let mut chat = ScriptChat {
             rounds: vec![
@@ -1148,6 +1265,7 @@ mod tests {
             calls: Vec::new(),
             plan_tier: "approve",
             plan_args: Vec::new(),
+            remedy: json!({}),
         };
         let mut chat = ScriptChat {
             rounds: vec![
@@ -1193,6 +1311,7 @@ mod tests {
             calls: Vec::new(),
             plan_tier: "approve",
             plan_args: Vec::new(),
+            remedy: json!({}),
         }
     }
 
@@ -1317,5 +1436,107 @@ mod tests {
             .expect("an open finding should wake");
         assert_eq!(run.trigger, "finding:f1");
         assert!(!tools.calls.iter().any(|c| c == "action_execute"));
+    }
+
+    fn workload_page() -> Value {
+        json!({
+            "as_of_seq": 9,
+            "findings": [{
+                "id": "f-repeat",
+                "resource_id": "workload:poc-apps:other:deployment:api",
+                "severity": "critical",
+                "summary": "api is failed",
+                "rule": "health"
+            }]
+        })
+    }
+
+    fn rollout_remedy() -> Value {
+        json!({
+            "matched": {
+                "rule": "health",
+                "kind": "workload",
+                "action": "k8s.rollout_restart",
+                "params": {"kind": "$kind", "namespace": "$namespace", "name": "$name"},
+                "tier": "approve",
+                "outcome": "resolved"
+            }
+        })
+    }
+
+    #[test]
+    fn repeat_finding_files_the_known_plan_and_does_not_call_the_model() {
+        let mut session = Session::new(local_config(), Instant::now());
+        let mut tools = FakeTools {
+            findings: workload_page(),
+            changes: empty_changes(),
+            calls: Vec::new(),
+            plan_tier: "approve",
+            plan_args: Vec::new(),
+            remedy: rollout_remedy(),
+        };
+        let mut chat = ScriptChat {
+            rounds: vec![],
+            n: 0,
+            urls: vec![],
+        };
+        let run = session
+            .tick(&mut tools, &mut chat, Instant::now())
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.tokens, 0);
+        assert_eq!(run.status, "remedy");
+        assert_eq!(chat.n, 0);
+        assert!(tools.calls.iter().any(|c| c == "action_plan"));
+        assert!(!tools.calls.iter().any(|c| c == "action_execute"));
+        let args = &tools.plan_args[0];
+        assert_eq!(args["action"], "k8s.rollout_restart");
+        assert_eq!(args["finding_id"], "f-repeat");
+        assert_eq!(args["params"]["namespace"], "other");
+        assert_eq!(args["params"]["name"], "api");
+        assert_eq!(args["params"]["kind"], "deployment");
+        assert!(!args.to_string().contains("pb-fault-loop"));
+    }
+
+    #[test]
+    fn open_plan_suppresses_a_second_run() {
+        let mut session = Session::new(local_config(), Instant::now());
+        let mut tools = FakeTools {
+            findings: workload_page(),
+            changes: empty_changes(),
+            calls: Vec::new(),
+            plan_tier: "approve",
+            plan_args: Vec::new(),
+            remedy: json!({"open_plan": true}),
+        };
+        let mut chat = ScriptChat {
+            rounds: vec![],
+            n: 0,
+            urls: vec![],
+        };
+        let run = session.tick(&mut tools, &mut chat, Instant::now()).unwrap();
+        assert!(run.is_none());
+        assert_eq!(chat.n, 0);
+        assert!(!tools.calls.iter().any(|c| c == "action_plan"));
+        assert!(!tools.calls.iter().any(|c| c == "action_execute"));
+    }
+
+    #[test]
+    fn digest_includes_the_closest_remedies() {
+        let finding = OpenFinding {
+            id: "f1".into(),
+            resource_id: "workload:c:ns:deployment:api".into(),
+            summary: "api is failed".into(),
+            severity: "critical".into(),
+            rule: "health".into(),
+        };
+        let text = digest(
+            &[finding],
+            &[],
+            &[],
+            &["remedy health service systemd.restart approve {\"unit\":\"$unit\"}".into()],
+            3,
+        );
+        assert!(text.contains("remedy health service systemd.restart"));
     }
 }

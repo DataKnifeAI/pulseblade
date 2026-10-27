@@ -87,6 +87,9 @@ impl HubInner {
         let remembered = self.with_store(|store| store.plan_finding(&run.id))?;
         let run = remember_finding(run, remembered);
         if run.finding_outcome.is_some() {
+            if run.finding_outcome == Some(pulseblade_core::FindingOutcome::Resolved) {
+                self.with_store(|store| store.learn_remedy(&run))?;
+            }
             return Ok(run);
         }
         self.with_store(|store| store.attach_finding_outcome(run))

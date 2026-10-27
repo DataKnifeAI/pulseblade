@@ -14,6 +14,7 @@ mod history;
 mod hub;
 mod memory;
 mod pilot;
+mod remedies;
 mod sql;
 
 pub use actions::{ActionTransition, NewAction};
@@ -21,6 +22,7 @@ pub use history::{MetricBucket, StoredEvent, BUCKET_MS, DEFAULT_HISTORY_DAYS, HU
 pub use hub::{IngestResult, NodeBatch, NodeCursor, NodePush, RouteJob, StampedSample};
 pub use memory::{FindingDraft, FindingFilter};
 pub use pilot::{NewPilotRun, PilotRunRow};
+pub use remedies::{RemedyPage, RemedyRow};
 
 use pulseblade_core::{
     Aggregation, Change, ChangeKind, Checkpoint, CollectorRun, Health, HealthThresholds,
@@ -179,6 +181,17 @@ CREATE TABLE IF NOT EXISTS action_runs (
 );
 CREATE INDEX IF NOT EXISTS action_runs_key ON action_runs(idempotency_key, status);
 CREATE INDEX IF NOT EXISTS action_runs_resource ON action_runs(resource_id, created_at);
+
+CREATE TABLE IF NOT EXISTS remedies (
+    rule       TEXT NOT NULL,
+    kind       TEXT NOT NULL,
+    action     TEXT NOT NULL,
+    params     TEXT NOT NULL,
+    tier       TEXT NOT NULL,
+    outcome    TEXT NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (rule, kind, action)
+);
 
 CREATE TABLE IF NOT EXISTS audit (
     seq       INTEGER PRIMARY KEY,

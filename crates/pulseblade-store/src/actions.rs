@@ -390,7 +390,7 @@ fn clip_audit(s: &str) -> String {
     out
 }
 
-fn tier_str(tier: RiskTier) -> &'static str {
+pub(crate) fn tier_str(tier: RiskTier) -> &'static str {
     match tier {
         RiskTier::Auto => "auto",
         RiskTier::Approve => "approve",
@@ -481,6 +481,7 @@ impl Store {
             return Ok(run);
         };
         run.finding_outcome = Some(self.outcome_for(&fid, &run.resource_id, run.status)?);
+        self.learn_remedy(&run)?;
         Ok(run)
     }
 

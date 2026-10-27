@@ -659,6 +659,17 @@ CREATE TABLE IF NOT EXISTS action_runs (
 CREATE INDEX IF NOT EXISTS action_runs_key ON action_runs(idempotency_key, status);
 CREATE INDEX IF NOT EXISTS action_runs_resource ON action_runs(resource_id, created_at);
 
+CREATE TABLE IF NOT EXISTS remedies (
+    rule       TEXT NOT NULL,
+    kind       TEXT NOT NULL,
+    action     TEXT NOT NULL,
+    params     TEXT NOT NULL,
+    tier       TEXT NOT NULL,
+    outcome    TEXT NOT NULL,
+    updated_at BIGINT NOT NULL,
+    PRIMARY KEY (rule, kind, action)
+);
+
 CREATE TABLE IF NOT EXISTS audit (
     seq       BIGINT PRIMARY KEY,
     ts        BIGINT NOT NULL,

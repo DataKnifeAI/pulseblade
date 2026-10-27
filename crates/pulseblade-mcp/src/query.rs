@@ -1591,6 +1591,72 @@ pub fn findings_document(store: &Store) -> Result<String> {
     serde_json::to_string(&page).map_err(|e| QueryError::Invalid(e.to_string()))
 }
 
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct RemediesParams {
+    /// Finding rule, such as `health`.
+    #[serde(default)]
+    pub rule: Option<String>,
+    /// Resource kind, such as `workload`. Taken from `resource_id` when omitted.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// When set, `open_plan` is true if this finding already has a planned or waiting run.
+    #[serde(default)]
+    pub finding_id: Option<String>,
+    #[serde(default)]
+    pub resource_id: Option<String>,
+}
+
+/// A resolved finding and the action that cleared it. `params` is a shape.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct RemedyView {
+    pub rule: String,
+    pub kind: String,
+    pub action: String,
+    pub params: Value,
+    pub tier: String,
+    pub outcome: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct RemedyPage {
+    pub open_plan: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched: Option<RemedyView>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub closest: Vec<RemedyView>,
+}
+
+fn remedy_view(row: pulseblade_store::RemedyRow) -> RemedyView {
+    RemedyView {
+        rule: row.rule,
+        kind: row.kind,
+        action: row.action,
+        params: row.params,
+        tier: row.tier,
+        outcome: row.outcome,
+    }
+}
+
+/// Remedy rows for one rule and resource kind, plus whether this finding already has a plan.
+pub fn remedies(store: &Store, p: RemediesParams) -> Result<RemedyPage> {
+    let kind = p.kind.clone().or_else(|| {
+        p.resource_id
+            .as_deref()
+            .and_then(pulseblade_core::resource_kind_of_id)
+            .map(str::to_string)
+    });
+    let page = store.remedy_page(
+        p.rule.as_deref().unwrap_or(""),
+        kind.as_deref().unwrap_or(""),
+        p.finding_id.as_deref(),
+    )?;
+    Ok(RemedyPage {
+        open_plan: page.open_plan,
+        matched: page.matched.map(remedy_view),
+        closest: page.closest.into_iter().map(remedy_view).collect(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

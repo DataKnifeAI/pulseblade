@@ -19,7 +19,8 @@ use crate::query::{
     self, AckParams, AckResult, ChangeSet, ChangesParams, CheckpointParams, EventPage,
     EventSearchParams, ExplainParams, Explanation, ExportParams, FindingPage, FindingsParams,
     FleetOverview, FleetParams, HistoryParams, HistorySeries, LogPage, LogsParams, MetricsParams,
-    NotePage, NoteParams, SearchParams, Series, Snapshot, SnapshotParams,
+    NotePage, NoteParams, RemediesParams, RemedyPage, SearchParams, Series, Snapshot,
+    SnapshotParams,
 };
 
 /// Hub action calls. The node still plans and executes against its own policy.
@@ -467,6 +468,17 @@ impl PulsebladeServer {
             }
             Err(err) => Err(format!("internal error: {err}")),
         }
+    }
+
+    #[tool(
+        description = "Remedy table: actions that previously resolved a finding, matched by finding rule and resource kind. params is a shape ($namespace, $name, $kind), not a stored name. open_plan is true when finding_id already has a planned or awaiting_approval run. Does not call a model.",
+        annotations(title = "List remedies", read_only_hint = true)
+    )]
+    async fn remedies_list(
+        &self,
+        params: Parameters<RemediesParams>,
+    ) -> Result<Json<LiveOrStale<RemedyPage>>, String> {
+        self.read_out(move |s| query::remedies(s, params.0)).await
     }
 
     #[tool(
