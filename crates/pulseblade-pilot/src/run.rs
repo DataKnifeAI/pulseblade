@@ -14,6 +14,10 @@ const SYSTEM: &str = "\
 You are the Pulseblade pilot. Investigate one incident using the tools. \
 The digest already includes the finding, recent changes, prior notes, and known remedies. \
 Prefer a known remedy from the digest when it fits this finding. \
+When the workload attribute fault is readiness_port, plan k8s.set_readiness_port \
+with that container and container_port. Do not plan k8s.rollout_restart or k8s.scale \
+for a readiness port mismatch. Plan k8s.rollout_restart only when the container is \
+crash-looping or not running. \
 Use state_snapshot with no arguments or detail=brief, short metrics_query ranges, \
 and one resource_explain. Write a short conclusion with memory_note on the resource. \
 Propose remediation with action_plan and pass that finding's id as finding_id. \
@@ -126,6 +130,9 @@ impl Session {
             "changes".into()
         } else if wake_heart {
             "heartbeat".into()
+        } else if let Some(run) = file_open_probe_fixes(tools, &open) {
+            self.seq = seq;
+            return Ok(Some(run));
         } else {
             self.seq = seq;
             return Ok(None);
@@ -141,6 +148,10 @@ impl Session {
         let mut closest = Vec::new();
         let mut denials = Vec::new();
         for finding in &focus {
+            if let Some(action) = file_probe_fix(tools, finding) {
+                filed.push(action);
+                continue;
+            }
             if finding.rule.is_empty() {
                 model_focus.push(finding.clone());
                 continue;
@@ -224,6 +235,94 @@ fn finding_signature(finding: &OpenFinding) -> String {
         "{}\n{}\n{}\n{}\n{}",
         finding.id, finding.resource_id, finding.rule, finding.severity, finding.summary
     )
+}
+
+fn file_open_probe_fixes<T: Tools>(tools: &mut T, open: &[OpenFinding]) -> Option<PilotRun> {
+    let mut filed = Vec::new();
+    for finding in open {
+        if let Some(action) = file_probe_fix(tools, finding) {
+            filed.push(action);
+        }
+    }
+    if filed.is_empty() {
+        return None;
+    }
+    Some(PilotRun {
+        trigger: "spec".into(),
+        tier: String::new(),
+        endpoint: String::new(),
+        tool_calls: u32::try_from(filed.len()).unwrap_or(u32::MAX),
+        tokens: 0,
+        conclusion: format!("filed {}", filed.join(",")),
+        proposed: filed,
+        status: "remedy".into(),
+        detail: "action_plan".into(),
+    })
+}
+
+/// A readiness probe aimed at the wrong port is fixed from the resource attributes.
+/// No model call, and not a restart.
+fn file_probe_fix<T: Tools>(tools: &mut T, finding: &OpenFinding) -> Option<String> {
+    if pulseblade_core::resource_kind_of_id(&finding.resource_id) != Some("workload") {
+        return None;
+    }
+    let explained = tools
+        .call("resource_explain", json!({"id": finding.resource_id}))
+        .ok()?;
+    let attrs = explained.pointer("/resource/attrs")?;
+    if attrs.get("fault").and_then(|v| v.as_str()) != Some("readiness_port") {
+        return None;
+    }
+    let port = attrs
+        .get("container_port")
+        .and_then(|v| v.as_u64())
+        .filter(|port| (1..=65535).contains(port))?;
+    let container = attrs
+        .get("container")
+        .and_then(|v| v.as_str())
+        .filter(|name| !name.is_empty())?;
+    let page = tools
+        .call(
+            "remedies_list",
+            json!({
+                "rule": finding.rule,
+                "kind": "workload",
+                "finding_id": finding.id,
+                "resource_id": finding.resource_id,
+            }),
+        )
+        .unwrap_or_else(|_| json!({}));
+    if page.get("open_plan").and_then(|v| v.as_bool()) == Some(true) {
+        return None;
+    }
+    if denial_reason(&page, "k8s.set_readiness_port").is_some() {
+        return None;
+    }
+    let fields = pulseblade_core::resource_fields(&finding.resource_id);
+    let namespace = fields.get("namespace")?.clone();
+    let name = fields.get("name")?.clone();
+    let kind = fields.get("kind")?.clone();
+    let filed = tools
+        .call(
+            "action_plan",
+            json!({
+                "action": "k8s.set_readiness_port",
+                "params": {
+                    "namespace": namespace,
+                    "name": name,
+                    "kind": kind,
+                    "container": container,
+                    "port": port,
+                },
+                "resource_id": finding.resource_id,
+                "finding_id": finding.id,
+            }),
+        )
+        .ok()?;
+    if filed.get("error").is_some() {
+        return None;
+    }
+    Some("k8s.set_readiness_port".into())
 }
 
 fn denial_reason(page: &Value, action: &str) -> Option<String> {
@@ -840,6 +939,7 @@ mod tests {
         plan_tier: &'static str,
         plan_args: Vec<Value>,
         remedy: Value,
+        explain: Value,
     }
 
     impl Tools for FakeTools {
@@ -870,7 +970,11 @@ mod tests {
                     "finding_outcome": "still_open"
                 })),
                 "resource_explain" => {
-                    Ok(json!({"id": "unit:web1:sshd.service", "health": "failed"}))
+                    if self.explain.get("resource").is_some() {
+                        Ok(self.explain.clone())
+                    } else {
+                        Ok(json!({"id": "unit:web1:sshd.service", "health": "failed"}))
+                    }
                 }
                 "logs_query" => Ok(json!({"lines": [{"message": "Failed to start sshd"}]})),
                 other => Ok(json!({"tool": other})),
@@ -958,6 +1062,7 @@ mod tests {
             plan_tier: "approve",
             plan_args: Vec::new(),
             remedy: json!({}),
+            explain: json!({}),
         };
         let mut chat = ScriptChat {
             rounds: vec![],
@@ -979,6 +1084,7 @@ mod tests {
             plan_tier: "approve",
             plan_args: Vec::new(),
             remedy: json!({}),
+            explain: json!({}),
         };
         let mut chat = ScriptChat {
             rounds: vec![
@@ -1044,6 +1150,7 @@ mod tests {
             plan_tier: "approve",
             plan_args: Vec::new(),
             remedy: json!({}),
+            explain: json!({}),
         };
         let mut chat = ScriptChat {
             rounds: vec![
@@ -1084,6 +1191,7 @@ mod tests {
             plan_tier: "auto",
             plan_args: Vec::new(),
             remedy: json!({}),
+            explain: json!({}),
         };
         let mut chat = ScriptChat {
             rounds: vec![
@@ -1123,6 +1231,7 @@ mod tests {
             plan_tier: "approve",
             plan_args: Vec::new(),
             remedy: json!({}),
+            explain: json!({}),
         };
         let forever = completion(
             json!([call(
@@ -1158,6 +1267,7 @@ mod tests {
             plan_tier: "approve",
             plan_args: Vec::new(),
             remedy: json!({}),
+            explain: json!({}),
         };
         let mut chat = ScriptChat {
             rounds: vec![],
@@ -1194,6 +1304,7 @@ mod tests {
             plan_tier: "approve",
             plan_args: Vec::new(),
             remedy: json!({}),
+            explain: json!({}),
         };
         let mut chat = ScriptChat {
             rounds: vec![completion(json!([]), "quiet")],
@@ -1222,6 +1333,7 @@ mod tests {
             plan_tier: "approve",
             plan_args: Vec::new(),
             remedy: json!({}),
+            explain: json!({}),
         };
         let round = completion(json!([]), "seen");
         let mut chat = ScriptChat {
@@ -1270,6 +1382,7 @@ mod tests {
             plan_tier: "auto",
             plan_args: Vec::new(),
             remedy: json!({}),
+            explain: json!({}),
         };
         let mut chat = ScriptChat {
             rounds: vec![
@@ -1343,6 +1456,7 @@ mod tests {
             plan_tier: "approve",
             plan_args: Vec::new(),
             remedy: json!({}),
+            explain: json!({}),
         };
         let mut chat = ScriptChat {
             rounds: vec![
@@ -1389,6 +1503,7 @@ mod tests {
             plan_tier: "approve",
             plan_args: Vec::new(),
             remedy: json!({}),
+            explain: json!({}),
         }
     }
 
@@ -1551,6 +1666,7 @@ mod tests {
             plan_tier: "approve",
             plan_args: Vec::new(),
             remedy: rollout_remedy(),
+            explain: json!({}),
         };
         let mut chat = ScriptChat {
             rounds: vec![],
@@ -1585,6 +1701,7 @@ mod tests {
             plan_tier: "approve",
             plan_args: Vec::new(),
             remedy: json!({"open_plan": true}),
+            explain: json!({}),
         };
         let mut chat = ScriptChat {
             rounds: vec![],
@@ -1632,6 +1749,7 @@ mod tests {
             plan_tier: "approve",
             plan_args: Vec::new(),
             remedy: json!({}),
+            explain: json!({}),
         };
         let mut chat = ScriptChat {
             rounds: vec![
@@ -1670,6 +1788,7 @@ mod tests {
             plan_tier: "approve",
             plan_args: Vec::new(),
             remedy: json!({}),
+            explain: json!({}),
         };
         let mut chat = ScriptChat {
             rounds: vec![],
@@ -1713,6 +1832,7 @@ mod tests {
                 },
                 "rejections": [{"action": "k8s.rollout_restart", "reason": "port is closed"}]
             }),
+            explain: json!({}),
         };
         let mut chat = ScriptChat {
             rounds: vec![completion(json!([]), "pick another action")],
@@ -1726,5 +1846,49 @@ mod tests {
         assert_eq!(chat.n, 1);
         assert_ne!(run.status, "remedy");
         assert!(!tools.calls.iter().any(|c| c == "action_plan"));
+    }
+
+    #[test]
+    fn readiness_port_mismatch_files_a_probe_fix_without_a_model() {
+        let mut session = Session::new(local_config(), Instant::now());
+        let mut tools = FakeTools {
+            findings: workload_page(),
+            changes: empty_changes(),
+            calls: Vec::new(),
+            plan_tier: "approve",
+            plan_args: Vec::new(),
+            remedy: rollout_remedy(),
+            explain: json!({
+                "resource": {
+                    "id": "workload:poc-apps:other:deployment:api",
+                    "attrs": {
+                        "fault": "readiness_port",
+                        "probe_port": 81,
+                        "container_port": 80,
+                        "container": "nginx"
+                    }
+                }
+            }),
+        };
+        let mut chat = ScriptChat {
+            rounds: vec![completion(json!([]), "should not run")],
+            n: 0,
+            urls: vec![],
+        };
+        let run = session
+            .tick(&mut tools, &mut chat, Instant::now())
+            .unwrap()
+            .unwrap();
+        assert_eq!(chat.n, 0);
+        assert_eq!(run.status, "remedy");
+        assert_eq!(run.proposed, vec!["k8s.set_readiness_port".to_string()]);
+        let args = &tools.plan_args[0];
+        assert_eq!(args["action"], "k8s.set_readiness_port");
+        assert_eq!(args["params"]["namespace"], "other");
+        assert_eq!(args["params"]["name"], "api");
+        assert_eq!(args["params"]["kind"], "deployment");
+        assert_eq!(args["params"]["container"], "nginx");
+        assert_eq!(args["params"]["port"], 80);
+        assert!(!args["action"].as_str().unwrap().contains("rollout"));
     }
 }

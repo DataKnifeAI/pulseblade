@@ -206,11 +206,20 @@ fn incidents(
 }
 
 fn health_incident(resource: &Resource, severity: Severity) -> Incident {
+    let summary = match resource
+        .attrs
+        .get("unready")
+        .and_then(|value| value.as_str())
+        .filter(|why| !why.is_empty())
+    {
+        Some(why) => format!("{} is {}: {}", resource.name, resource.health.as_str(), why),
+        None => format!("{} is {}", resource.name, resource.health.as_str()),
+    };
     Incident {
         rule: "health".into(),
         resource_id: resource.id.clone(),
         severity,
-        summary: format!("{} is {}", resource.name, resource.health.as_str()),
+        summary,
     }
 }
 

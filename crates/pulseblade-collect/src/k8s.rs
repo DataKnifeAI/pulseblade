@@ -40,6 +40,48 @@ pub struct K8sWorkload {
     pub name: String,
     pub replicas: u64,
     pub ready: u64,
+    /// `readiness_port` when the HTTP probe targets a port the container does not declare.
+    pub fault: String,
+    pub container: String,
+    pub probe_port: u16,
+    pub container_port: u16,
+}
+
+struct ProbeMismatch {
+    container: String,
+    probe_port: u16,
+    container_port: u16,
+}
+
+fn fault_fields(mismatch: Option<ProbeMismatch>) -> (String, String, u16, u16) {
+    match mismatch {
+        Some(mismatch) => (
+            "readiness_port".into(),
+            mismatch.container,
+            mismatch.probe_port,
+            mismatch.container_port,
+        ),
+        None => (String::new(), String::new(), 0, 0),
+    }
+}
+
+/// HTTP readiness port that is not one of the container's declared ports.
+fn mismatch_from_ports(
+    container: &str,
+    probe_port: u16,
+    declared: &[u16],
+) -> Option<ProbeMismatch> {
+    if container.is_empty() || probe_port == 0 || declared.is_empty() {
+        return None;
+    }
+    if declared.contains(&probe_port) {
+        return None;
+    }
+    Some(ProbeMismatch {
+        container: container.to_string(),
+        probe_port,
+        container_port: declared[0],
+    })
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -169,14 +211,27 @@ pub fn observe_k8s(
         } else {
             Health::Ok
         };
-        obs.resources.push(
-            Resource::new(&id, ResourceKind::Workload, name)
-                .health(health)
-                .label("cluster", cluster)
-                .label("namespace", ns)
-                .attr("kind", kind.clone())
-                .attr("ready", format!("{}/{}", wl.ready, wl.replicas)),
-        );
+        let mut resource = Resource::new(&id, ResourceKind::Workload, name)
+            .health(health)
+            .label("cluster", cluster)
+            .label("namespace", ns)
+            .attr("kind", kind.clone())
+            .attr("ready", format!("{}/{}", wl.ready, wl.replicas));
+        if wl.fault == "readiness_port" {
+            resource = resource
+                .attr("fault", "readiness_port")
+                .attr("probe_port", wl.probe_port)
+                .attr("container_port", wl.container_port)
+                .attr("container", wl.container.clone())
+                .attr(
+                    "unready",
+                    format!(
+                        "readiness probe port {}, container {} listens on {}",
+                        wl.probe_port, wl.container, wl.container_port
+                    ),
+                );
+        }
+        obs.resources.push(resource);
         obs.samples
             .push(Sample::new(&id, "k8s.replicas", wl.replicas as f64));
         obs.samples
@@ -385,6 +440,8 @@ pub fn parse_lists(
             if name.is_empty() {
                 continue;
             }
+            let (fault, container, probe_port, container_port) =
+                fault_fields(probe_from_spec(item));
             view.workloads.push(K8sWorkload {
                 kind: kind.into(),
                 namespace: if namespace.is_empty() {
@@ -395,6 +452,10 @@ pub fn parse_lists(
                 name,
                 replicas: num_at(item, &["spec", "replicas"]) as u64,
                 ready: num_at(item, &["status", "readyReplicas"]) as u64,
+                fault,
+                container,
+                probe_port,
+                container_port,
             });
         }
     }
@@ -441,6 +502,38 @@ pub fn parse_lists(
         });
     }
     view
+}
+
+#[cfg(test)]
+fn probe_from_spec(item: &Value) -> Option<ProbeMismatch> {
+    let containers = item.pointer("/spec/template/spec/containers")?.as_array()?;
+    for container in containers {
+        let name = container.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let Some(probe_port) = container
+            .pointer("/readinessProbe/httpGet/port")
+            .and_then(|v| v.as_u64())
+            .filter(|port| *port <= u64::from(u16::MAX))
+            .map(|port| port as u16)
+        else {
+            continue;
+        };
+        let declared = container
+            .get("ports")
+            .and_then(|v| v.as_array())
+            .map(|ports| {
+                ports
+                    .iter()
+                    .filter_map(|port| port.get("containerPort").and_then(|v| v.as_u64()))
+                    .filter(|port| *port <= u64::from(u16::MAX))
+                    .map(|port| port as u16)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if let Some(mismatch) = mismatch_from_ports(name, probe_port, &declared) {
+            return Some(mismatch);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -629,23 +722,37 @@ async fn fetch_view(client: kube::Client) -> Result<K8sView, CollectError> {
         });
     }
     for item in deployments {
+        let mismatch = item.spec.as_ref().and_then(|spec| {
+            spec.template
+                .spec
+                .as_ref()
+                .and_then(|pod| probe_mismatch_containers(&pod.containers))
+        });
         if let Some(wl) = workload_of(
             "Deployment",
             item.metadata.name,
             item.metadata.namespace,
             item.spec.and_then(|s| s.replicas),
             item.status.and_then(|s| s.ready_replicas),
+            mismatch,
         ) {
             view.workloads.push(wl);
         }
     }
     for item in statefulsets {
+        let mismatch = item.spec.as_ref().and_then(|spec| {
+            spec.template
+                .spec
+                .as_ref()
+                .and_then(|pod| probe_mismatch_containers(&pod.containers))
+        });
         if let Some(wl) = workload_of(
             "StatefulSet",
             item.metadata.name,
             item.metadata.namespace,
             item.spec.and_then(|s| s.replicas),
             item.status.and_then(|s| s.ready_replicas),
+            mismatch,
         ) {
             view.workloads.push(wl);
         }
@@ -661,12 +768,22 @@ async fn fetch_view(client: kube::Client) -> Result<K8sView, CollectError> {
         let Some(name) = item.metadata.name else {
             continue;
         };
+        let mismatch = item
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.template.spec.as_ref())
+            .and_then(|pod| probe_mismatch_containers(&pod.containers));
+        let (fault, container, probe_port, container_port) = fault_fields(mismatch);
         view.workloads.push(K8sWorkload {
             kind: "DaemonSet".into(),
             namespace: item.metadata.namespace.unwrap_or_else(|| "default".into()),
             name,
             replicas,
             ready,
+            fault,
+            container,
+            probe_port,
+            container_port,
         });
     }
     for pod in pods {
@@ -724,15 +841,61 @@ fn workload_of(
     namespace: Option<String>,
     replicas: Option<i32>,
     ready: Option<i32>,
+    mismatch: Option<ProbeMismatch>,
 ) -> Option<K8sWorkload> {
     let name = name?;
+    let (fault, container, probe_port, container_port) = fault_fields(mismatch);
     Some(K8sWorkload {
         kind: kind.into(),
         namespace: namespace.unwrap_or_else(|| "default".into()),
         name,
         replicas: replicas.unwrap_or(0).max(0) as u64,
         ready: ready.unwrap_or(0).max(0) as u64,
+        fault,
+        container,
+        probe_port,
+        container_port,
     })
+}
+
+#[cfg(feature = "k8s")]
+fn probe_mismatch_containers(
+    containers: &[k8s_openapi::api::core::v1::Container],
+) -> Option<ProbeMismatch> {
+    use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
+    for container in containers {
+        let Some(port) = container
+            .readiness_probe
+            .as_ref()
+            .and_then(|probe| probe.http_get.as_ref())
+            .map(|http| &http.port)
+        else {
+            continue;
+        };
+        let IntOrString::Int(probe_port) = port else {
+            continue;
+        };
+        if *probe_port <= 0 || *probe_port > i32::from(u16::MAX) {
+            continue;
+        }
+        let declared = container
+            .ports
+            .as_ref()
+            .map(|ports| {
+                ports
+                    .iter()
+                    .map(|port| port.container_port)
+                    .filter(|port| *port > 0 && *port <= i32::from(u16::MAX))
+                    .map(|port| port as u16)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if let Some(mismatch) = mismatch_from_ports(&container.name, *probe_port as u16, &declared)
+        {
+            return Some(mismatch);
+        }
+    }
+    None
 }
 
 #[cfg(feature = "k8s")]
@@ -854,6 +1017,51 @@ mod tests {
             .logs
             .iter()
             .any(|l| l.resource_id == "pod:demo:demo:bad" && l.message.contains("BackOff")));
+    }
+
+    #[test]
+    fn readiness_probe_on_the_wrong_port_is_a_fault() {
+        let view = parse_lists(
+            &json!({"items": []}),
+            &json!({"items": []}),
+            &json!({"items": [{
+                "metadata": {"name": "pb-fault-loop", "namespace": "pb-fault"},
+                "spec": {
+                    "replicas": 1,
+                    "template": {"spec": {"containers": [{
+                        "name": "nginx",
+                        "ports": [{"containerPort": 80}],
+                        "readinessProbe": {"httpGet": {"path": "/", "port": 81}}
+                    }]}}
+                },
+                "status": {"readyReplicas": 0}
+            }]}),
+            &json!({"items": []}),
+            &json!({"items": []}),
+            &json!({"items": []}),
+        );
+        let obs = observe_k8s("poc-apps", &view, &HealthThresholds::default(), Utc::now());
+        let wl = obs
+            .resources
+            .iter()
+            .find(|r| r.id == "workload:poc-apps:pb-fault:deployment:pb-fault-loop")
+            .unwrap();
+        assert_eq!(
+            wl.attrs.get("fault").and_then(|v| v.as_str()),
+            Some("readiness_port")
+        );
+        assert_eq!(
+            wl.attrs.get("probe_port").and_then(|v| v.as_u64()),
+            Some(81)
+        );
+        assert_eq!(
+            wl.attrs.get("container_port").and_then(|v| v.as_u64()),
+            Some(80)
+        );
+        assert_eq!(
+            wl.attrs.get("container").and_then(|v| v.as_str()),
+            Some("nginx")
+        );
     }
 
     fn pod_at(name: &str, phase: &str, statuses: Value) -> Value {

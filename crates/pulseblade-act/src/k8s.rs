@@ -29,6 +29,14 @@ impl Default for K8sEndpoint {
 pub trait K8sApi: Send + Sync {
     fn rollout_restart(&self, kind: &str, namespace: &str, name: &str) -> Result<(), String>;
     fn scale(&self, kind: &str, namespace: &str, name: &str, replicas: u32) -> Result<(), String>;
+    fn set_readiness_port(
+        &self,
+        kind: &str,
+        namespace: &str,
+        name: &str,
+        container: &str,
+        port: u16,
+    ) -> Result<(), String>;
 }
 
 /// Used when `[k8s]` is empty or the client could not be built.
@@ -44,10 +52,17 @@ impl K8sApi for IdleK8s {
     fn scale(&self, _: &str, _: &str, _: &str, _: u32) -> Result<(), String> {
         Err(self.message.clone())
     }
+
+    fn set_readiness_port(&self, _: &str, _: &str, _: &str, _: &str, _: u16) -> Result<(), String> {
+        Err(self.message.clone())
+    }
 }
 
 pub fn is_k8s(name: &str) -> bool {
-    matches!(name, "k8s.rollout_restart" | "k8s.scale")
+    matches!(
+        name,
+        "k8s.rollout_restart" | "k8s.scale" | "k8s.set_readiness_port"
+    )
 }
 
 pub fn description(name: &str) -> &'static str {
@@ -57,6 +72,9 @@ pub fn description(name: &str) -> &'static str {
         }
         "k8s.scale" => {
             "Set replicas on a Deployment or StatefulSet. Waits for approval by default."
+        }
+        "k8s.set_readiness_port" => {
+            "Point a container's HTTP readiness probe at the port it listens on. Waits for approval by default."
         }
         _ => "",
     }
@@ -89,6 +107,18 @@ pub fn schema(name: &str) -> serde_json::Value {
                 "replicas": {"type": "integer", "minimum": 0, "maximum": 1000}
             }
         }),
+        "k8s.set_readiness_port" => serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["namespace", "name", "container", "port"],
+            "properties": {
+                "namespace": {"type": "string", "minLength": 1, "maxLength": 63},
+                "name": {"type": "string", "minLength": 1, "maxLength": 253},
+                "kind": kind,
+                "container": {"type": "string", "minLength": 1, "maxLength": 253},
+                "port": {"type": "integer", "minimum": 1, "maximum": 65535}
+            }
+        }),
         _ => serde_json::json!({"type": "object"}),
     }
 }
@@ -104,6 +134,13 @@ pub fn preconditions(name: &str) -> &'static [&'static str] {
             "namespace and name are single DNS labels (no slashes)",
             "kind is deployment or statefulset",
             "replicas is between 0 and 1000",
+            "the node calls the API only after approval",
+        ],
+        "k8s.set_readiness_port" => &[
+            "namespace and name are single DNS labels (no slashes)",
+            "kind is deployment, statefulset, or daemonset",
+            "container is the container whose HTTP readiness probe is wrong",
+            "port is a declared container port from 1 to 65535",
             "the node calls the API only after approval",
         ],
         _ => &[],
@@ -175,6 +212,24 @@ pub fn perform(name: &str, params: &serde_json::Value, api: &dyn K8sApi) -> Resu
             api.scale(&kind, &namespace, &workload, replicas)?;
             Ok(format!(
                 "scaled {kind}/{namespace}/{workload} to {replicas}"
+            ))
+        }
+        "k8s.set_readiness_port" => {
+            let container = label(
+                params
+                    .get("container")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(""),
+            )
+            .map_err(|e| e.to_string())?;
+            let port = params
+                .get("port")
+                .and_then(|v| v.as_u64())
+                .filter(|port| (1..=65535).contains(port))
+                .ok_or("port must be from 1 to 65535")? as u16;
+            api.set_readiness_port(&kind, &namespace, &workload, &container, port)?;
+            Ok(format!(
+                "set readiness port of {container} on {kind}/{namespace}/{workload} to {port}"
             ))
         }
         other => Err(format!("unknown action `{other}`")),
@@ -317,6 +372,30 @@ impl K8sApi for KubeApi {
         let name = name.to_string();
         self.call(async move {
             let body = serde_json::json!({"spec": {"replicas": replicas}});
+            patch(&client, &kind, &namespace, &name, body).await
+        })?
+    }
+
+    fn set_readiness_port(
+        &self,
+        kind: &str,
+        namespace: &str,
+        name: &str,
+        container: &str,
+        port: u16,
+    ) -> Result<(), String> {
+        let client = self.client.clone();
+        let kind = kind.to_string();
+        let namespace = namespace.to_string();
+        let name = name.to_string();
+        let container = container.to_string();
+        self.call(async move {
+            let body = serde_json::json!({
+                "spec": {"template": {"spec": {"containers": [{
+                    "name": container,
+                    "readinessProbe": {"httpGet": {"port": port}}
+                }]}}}
+            });
             patch(&client, &kind, &namespace, &name, body).await
         })?
     }

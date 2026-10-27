@@ -616,6 +616,7 @@ impl Registry {
             "proxmox.migrate" => self.config.proxmox_migrate.tier,
             "k8s.rollout_restart" => self.config.k8s_rollout_restart.tier,
             "k8s.scale" => self.config.k8s_scale.tier,
+            "k8s.set_readiness_port" => self.config.k8s_set_readiness_port.tier,
             _ => None,
         };
         over.unwrap_or(match name {
@@ -635,6 +636,7 @@ impl Registry {
             "proxmox.migrate" => self.config.proxmox_migrate.rate_per_hour,
             "k8s.rollout_restart" => self.config.k8s_rollout_restart.rate_per_hour,
             "k8s.scale" => self.config.k8s_scale.rate_per_hour,
+            "k8s.set_readiness_port" => self.config.k8s_set_readiness_port.rate_per_hour,
             _ => 0,
         }
     }
@@ -710,6 +712,7 @@ const NAMES: &[&str] = &[
     "proxmox.migrate",
     "k8s.rollout_restart",
     "k8s.scale",
+    "k8s.set_readiness_port",
 ];
 
 fn plan_of(run: &ActionRun) -> PlanResult {
@@ -744,7 +747,9 @@ fn applies_to(name: &str) -> Vec<ResourceKind> {
         "proxmox.start" | "proxmox.stop" | "proxmox.migrate" => {
             vec![ResourceKind::Vm, ResourceKind::Container]
         }
-        "k8s.rollout_restart" | "k8s.scale" => vec![ResourceKind::Workload],
+        "k8s.rollout_restart" | "k8s.scale" | "k8s.set_readiness_port" => {
+            vec![ResourceKind::Workload]
+        }
         _ => vec![ResourceKind::Host],
     }
 }
@@ -1530,6 +1535,20 @@ mod tests {
                 .push(format!("scale {kind}/{namespace}/{name} {replicas}"));
             Ok(())
         }
+
+        fn set_readiness_port(
+            &self,
+            kind: &str,
+            namespace: &str,
+            name: &str,
+            container: &str,
+            port: u16,
+        ) -> Result<(), String> {
+            self.calls.lock().unwrap().push(format!(
+                "readiness {kind}/{namespace}/{name} {container} {port}"
+            ));
+            Ok(())
+        }
     }
 
     fn k8s_endpoint() -> K8sEndpoint {
@@ -1595,6 +1614,46 @@ mod tests {
             )
             .unwrap_err();
         assert!(err.to_string().contains("not configured"));
+    }
+
+    #[test]
+    fn readiness_port_waits_and_patches_only_after_approval() {
+        let api = Arc::new(RecK8s {
+            calls: Mutex::new(Vec::new()),
+        });
+        let reg = Registry::new(ActionsConfig::default(), Arc::new(FakeRunner::ok()))
+            .unwrap()
+            .with_k8s(k8s_endpoint(), api.clone());
+        let store = Store::open_in_memory().unwrap();
+        let planned = reg
+            .plan(
+                &store,
+                PlanParams {
+                    action: "k8s.set_readiness_port".into(),
+                    params: json!({
+                        "namespace": "pb-fault",
+                        "name": "pb-fault-loop",
+                        "kind": "deployment",
+                        "container": "nginx",
+                        "port": 80
+                    }),
+                    resource_id: None,
+                    idempotency_key: None,
+                    dry_run: false,
+                    finding_id: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(planned.tier, RiskTier::Approve);
+        assert!(api.calls.lock().unwrap().is_empty());
+        let waiting = reg.execute(&store, &planned.plan_id).unwrap();
+        assert_eq!(waiting.status, ActionRunStatus::AwaitingApproval);
+        assert!(api.calls.lock().unwrap().is_empty());
+        reg.approve(&store, &planned.plan_id).unwrap();
+        assert_eq!(
+            api.calls.lock().unwrap().as_slice(),
+            ["readiness deployment/pb-fault/pb-fault-loop nginx 80"]
+        );
     }
 
     #[cfg(feature = "k8s")]

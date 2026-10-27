@@ -50,6 +50,11 @@ impl Store {
         if run.dry_run || run.status != ActionRunStatus::Succeeded {
             return Ok(());
         }
+        // The port and container belong to this spec. Reusing them on the next
+        // failed workload would point a healthy probe at the wrong port.
+        if run.action == "k8s.set_readiness_port" {
+            return Ok(());
+        }
         if run.finding_outcome != Some(FindingOutcome::Resolved) {
             return Ok(());
         }
