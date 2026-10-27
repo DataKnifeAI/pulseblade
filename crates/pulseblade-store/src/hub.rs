@@ -664,11 +664,35 @@ impl Store {
         // retry covers Postgres 40P01.
         let result = self
             .transaction(|sql| ingest_batch(sql, node_id, batch, &changes, interval, pushed_ms));
-        if matches!(&result, Err(err) if is_deadlock(err)) {
+        let result = if matches!(&result, Err(err) if is_deadlock(err)) {
             self.transaction(|sql| ingest_batch(sql, node_id, batch, &changes, interval, pushed_ms))
         } else {
             result
+        };
+        // A push can be the first time this journal sees the resource healthy.
+        // Health findings are not part of the node batch, so close them here.
+        if result.is_ok() {
+            self.resolve_recovered_health(Utc::now())?;
         }
+        result
+    }
+
+    /// Close health findings whose resource is present and healthy.
+    ///
+    /// Node detection does not push findings. A health finding copied onto the
+    /// hub would otherwise stay open after the workload recovers.
+    pub fn resolve_recovered_health(&self, now: DateTime<Utc>) -> crate::Result<usize> {
+        self.with_sql(|sql| {
+            sql.execute(
+                "UPDATE findings SET status = 'resolved', updated_at = ?1
+                 WHERE status IN ('open', 'acked')
+                   AND rule = 'health'
+                   AND resource_id IN (
+                     SELECT id FROM resources WHERE present = 1 AND health = 'ok'
+                   )",
+                &[SqlVal::Int(now.timestamp_millis())],
+            )
+        })
     }
 
     /// Samples with `ts` strictly after `after_ms`, oldest first.
@@ -1515,5 +1539,98 @@ mod tests {
         assert_eq!(opened[0].rule, OFFLINE_RULE);
         assert!(opened[0].summary.contains("offline"));
         assert!(store.sync_offline_hosts(now).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_healthy_resource_closes_its_health_finding() {
+        use pulseblade_core::{FindingStatus, Severity};
+
+        let store = Store::open_in_memory().unwrap();
+        let now = Utc::now();
+        let id = "workload:demo:ns:deployment:api";
+        store
+            .ingest_node(
+                "web1",
+                &NodeBatch {
+                    changes: vec![change(1, id, ChangeKind::Appeared)],
+                    resources: vec![
+                        Resource::new(id, ResourceKind::Workload, "api").health(Health::Failed)
+                    ],
+                    ..NodeBatch::default()
+                },
+            )
+            .unwrap();
+        store
+            .reconcile_findings(
+                &[
+                    FindingDraft {
+                        dedupe_key: format!("health:{id}"),
+                        resource_id: id.into(),
+                        rule: "health".into(),
+                        severity: Severity::Critical,
+                        summary: "api is failed".into(),
+                        context: vec![],
+                        logs: vec![],
+                    },
+                    FindingDraft {
+                        dedupe_key: format!("threshold:{id}"),
+                        resource_id: id.into(),
+                        rule: "disk.used_pct".into(),
+                        severity: Severity::Warning,
+                        summary: "api disk.used_pct is 91".into(),
+                        context: vec![],
+                        logs: vec![],
+                    },
+                ],
+                now,
+            )
+            .unwrap();
+        store
+            .ingest_node(
+                "web1",
+                &NodeBatch {
+                    changes: vec![change(2, id, ChangeKind::Changed)],
+                    resources: vec![
+                        Resource::new(id, ResourceKind::Workload, "api").health(Health::Degraded)
+                    ],
+                    ..NodeBatch::default()
+                },
+            )
+            .unwrap();
+        let (open, _) = store
+            .findings(
+                &crate::FindingFilter {
+                    status: Some(FindingStatus::Open),
+                    resource_id: Some(id.into()),
+                    ..Default::default()
+                },
+                10,
+            )
+            .unwrap();
+        assert_eq!(open.len(), 2, "degraded still keeps the health finding");
+        store
+            .ingest_node(
+                "web1",
+                &NodeBatch {
+                    changes: vec![change(3, id, ChangeKind::Changed)],
+                    resources: vec![
+                        Resource::new(id, ResourceKind::Workload, "api").health(Health::Ok)
+                    ],
+                    ..NodeBatch::default()
+                },
+            )
+            .unwrap();
+        let (left, _) = store
+            .findings(
+                &crate::FindingFilter {
+                    status: Some(FindingStatus::Open),
+                    resource_id: Some(id.into()),
+                    ..Default::default()
+                },
+                10,
+            )
+            .unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].rule, "disk.used_pct");
     }
 }

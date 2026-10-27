@@ -245,7 +245,13 @@ impl ActionRoute for HubInner {
     }
 
     fn dismiss(&self, run_id: &str) -> Result<pulseblade_core::ActionRun, String> {
-        self.routed_decision(run_id, "dismiss", serde_json::json!({ "run_id": run_id }))
+        match self.routed_decision(run_id, "dismiss", serde_json::json!({ "run_id": run_id })) {
+            Ok(run) => self.note_dismissed(run),
+            // The collector database is an emptyDir. A rollout drops the row
+            // while the hub still shows the cached copy.
+            Err(err) if err.contains("unknown action run") => self.dismiss_cached(run_id),
+            Err(err) => Err(err),
+        }
     }
 
     fn recheck(&self, run_id: &str) -> Result<pulseblade_core::ActionRun, String> {
@@ -281,6 +287,60 @@ impl HubInner {
         let cached = serde_json::to_value(&run).map_err(|e| e.to_string())?;
         self.with_store(|store| store.cache_run(&run.id, &node, &cached))?;
         Ok(run)
+    }
+
+    /// An already-expired node reply still says "approval window elapsed".
+    /// Record the dismiss on the cached copy so the waiting list drops it.
+    fn note_dismissed(
+        &self,
+        mut run: pulseblade_core::ActionRun,
+    ) -> Result<pulseblade_core::ActionRun, String> {
+        if run.status != pulseblade_core::ActionRunStatus::Expired
+            || run.output.as_deref() == Some("dismissed")
+        {
+            return Ok(run);
+        }
+        run.output = Some("dismissed".into());
+        self.write_cached(&run)?;
+        Ok(run)
+    }
+
+    /// Close the hub's cached copy when the node no longer has the run.
+    fn dismiss_cached(&self, run_id: &str) -> Result<pulseblade_core::ActionRun, String> {
+        let Some((node, body)) = self.with_store(|store| store.cached_run(run_id))? else {
+            return Err(format!("unknown action run `{run_id}`"));
+        };
+        let mut run: pulseblade_core::ActionRun =
+            serde_json::from_value(body).map_err(|e| e.to_string())?;
+        if !matches!(
+            run.status,
+            pulseblade_core::ActionRunStatus::AwaitingApproval
+                | pulseblade_core::ActionRunStatus::Expired
+        ) {
+            return Err(format!(
+                "run {run_id} is {}, not awaiting approval",
+                run.status.as_str()
+            ));
+        }
+        run.status = pulseblade_core::ActionRunStatus::Expired;
+        run.output = Some("dismissed".into());
+        let cached = serde_json::to_value(&run).map_err(|e| e.to_string())?;
+        self.with_store(|store| store.cache_run(&run.id, &node, &cached))?;
+        Ok(run)
+    }
+
+    fn write_cached(&self, run: &pulseblade_core::ActionRun) -> Result<(), String> {
+        let node = match self.with_store(|store| store.cached_run(&run.id))? {
+            Some((node, _)) => node,
+            None => self
+                .with_store(|store| store.plan_node(&run.id))?
+                .unwrap_or_default(),
+        };
+        if node.is_empty() {
+            return Ok(());
+        }
+        let cached = serde_json::to_value(run).map_err(|e| e.to_string())?;
+        self.with_store(|store| store.cache_run(&run.id, &node, &cached))
     }
 }
 
@@ -613,8 +673,15 @@ pub async fn supervise(
                 next_maintain = tokio::time::Instant::now() + Duration::from_secs(15);
                 let Some(store) = journal.store() else { continue };
                 let checked = store.clone();
-                match tokio::task::spawn_blocking(move || checked.sync_offline_hosts(chrono::Utc::now())).await {
-                    Ok(Ok(opened)) => {
+                match tokio::task::spawn_blocking(move || {
+                    let now = chrono::Utc::now();
+                    let opened = checked.sync_offline_hosts(now)?;
+                    let closed = checked.resolve_recovered_health(now)?;
+                    Ok::<_, StoreError>((opened, closed))
+                })
+                .await
+                {
+                    Ok(Ok((opened, closed))) => {
                         for finding in opened {
                             tracing::info!(
                                 id = %finding.id,
@@ -622,6 +689,9 @@ pub async fn supervise(
                                 summary = %finding.summary,
                                 "finding"
                             );
+                        }
+                        if closed > 0 {
+                            tracing::info!(closed, "resolved health findings");
                         }
                     }
                     Ok(Err(err)) => {
@@ -2243,5 +2313,109 @@ mod tests {
 
         shutdown.cancel();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dismiss_closes_a_cached_run_the_node_lost() {
+        use pulseblade_core::{ActionRun, ActionRunStatus, FindingOutcome};
+
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = CancellationToken::new();
+        let hub = new_hub(
+            store.clone(),
+            vec![("web1".into(), "token-web1".into())],
+            Duration::from_secs(3),
+        );
+        let stop_serve = shutdown.clone();
+        let served = hub.clone();
+        tokio::spawn(async move {
+            serve(
+                listener,
+                served,
+                vec!["127.0.0.1".into()],
+                stop_serve,
+                Arc::new(Registry::builtin()),
+                None,
+                PortalDefaults::default(),
+            )
+            .await
+            .ok();
+        });
+        let base = format!("http://{addr}");
+        let client = HubClient::plain(&base, "token-web1");
+        let node = Arc::new(Store::open_in_memory().unwrap());
+        let stop = Arc::new(AtomicBool::new(false));
+        let drainer = spawn_drainer(client, node, Arc::new(Registry::builtin()), stop.clone());
+        let expired = ActionRun {
+            id: "a1a17b4835310".into(),
+            action: "k8s.rollout_restart".into(),
+            resource_id: "workload:demo:ns:deployment:api".into(),
+            params: json!({"kind": "deployment", "name": "api", "namespace": "ns"}),
+            idempotency_key: "old".into(),
+            tier: RiskTier::Approve,
+            status: ActionRunStatus::Expired,
+            created_at: chrono::Utc::now(),
+            dry_run: false,
+            expires_at: Some(chrono::Utc::now()),
+            output: Some("approval window elapsed".into()),
+            finding_id: Some("fc13a29631a17b47555a0".into()),
+            finding_outcome: Some(FindingOutcome::StillOpen),
+        };
+        store
+            .remember_plan(
+                &expired.id,
+                "web1",
+                expired.finding_id.as_deref(),
+                Some(&expired.resource_id),
+            )
+            .unwrap();
+        store
+            .cache_run(
+                &expired.id,
+                "web1",
+                &serde_json::to_value(&expired).unwrap(),
+            )
+            .unwrap();
+        let closed = hub.dismiss(&expired.id).unwrap();
+        assert_eq!(closed.status, ActionRunStatus::Expired);
+        assert_eq!(closed.output.as_deref(), Some("dismissed"));
+        let listed: serde_json::Value = ureq::get(&format!("{base}/api/v1/actions"))
+            .call()
+            .unwrap()
+            .into_json()
+            .unwrap();
+        let row = listed["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == expired.id)
+            .expect("cached run");
+        assert_eq!(row["output"], "dismissed");
+
+        let done = ActionRun {
+            id: "a-done".into(),
+            status: ActionRunStatus::Succeeded,
+            output: Some("restarted".into()),
+            ..expired
+        };
+        store
+            .remember_plan(
+                &done.id,
+                "web1",
+                done.finding_id.as_deref(),
+                Some(&done.resource_id),
+            )
+            .unwrap();
+        store
+            .cache_run(&done.id, "web1", &serde_json::to_value(&done).unwrap())
+            .unwrap();
+        let err = hub.dismiss(&done.id).unwrap_err();
+        assert!(err.contains("not awaiting approval"), "{err}");
+
+        stop.store(true, Ordering::Relaxed);
+        let _ = drainer.join();
+        shutdown.cancel();
     }
 }

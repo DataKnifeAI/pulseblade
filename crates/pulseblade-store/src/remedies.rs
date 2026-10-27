@@ -58,6 +58,11 @@ impl Store {
         if run.finding_outcome != Some(FindingOutcome::Resolved) {
             return Ok(());
         }
+        // A later success is what cleared the finding. Learning this older run
+        // would teach the pilot a restart that left the failure in place.
+        if self.later_success(run)? {
+            return Ok(());
+        }
         let Some(finding_id) = run.finding_id.as_deref().filter(|id| !id.is_empty()) else {
             return Ok(());
         };
@@ -81,6 +86,42 @@ impl Store {
             tier: tier_str(run.tier).to_string(),
             outcome: "resolved".into(),
         })
+    }
+
+    /// True when a newer succeeded run is tied to the same finding.
+    fn later_success(&self, run: &ActionRun) -> crate::Result<bool> {
+        let Some(finding_id) = run.finding_id.as_deref().filter(|id| !id.is_empty()) else {
+            return Ok(false);
+        };
+        let created = run.created_at.timestamp_millis();
+        let local = self.with_sql(|sql| {
+            sql.query_opt(
+                "SELECT id FROM action_runs
+                 WHERE finding_id = ?1 AND status = 'succeeded' AND id <> ?2 AND created_at > ?3
+                 LIMIT 1",
+                &[
+                    SqlVal::text(finding_id),
+                    SqlVal::text(&run.id),
+                    SqlVal::Int(created),
+                ],
+                |row| row.text(0),
+            )
+        })?;
+        if local.is_some() {
+            return Ok(true);
+        }
+        for other in self.routed_runs()? {
+            if other.id == run.id || other.status != ActionRunStatus::Succeeded {
+                continue;
+            }
+            if other.finding_id.as_deref() != Some(finding_id) {
+                continue;
+            }
+            if other.created_at > run.created_at {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub fn remedy_page(
@@ -351,6 +392,59 @@ mod tests {
         assert_eq!(later.finding_outcome, Some(FindingOutcome::Resolved));
         assert!(store
             .remedy_page("health", "workload", Some(&finding_id), None)
+            .unwrap()
+            .matched
+            .is_none());
+    }
+
+    #[test]
+    fn an_older_restart_is_not_learned_after_a_later_success() {
+        let store = Store::open_in_memory().unwrap();
+        let finding_id = workload_finding(&store);
+        let now = Utc::now();
+        let older = store.insert_action(&rollout(&finding_id), now).unwrap();
+        store
+            .transition_action(
+                &older.id,
+                ActionTransition {
+                    from: ActionRunStatus::Planned,
+                    to: ActionRunStatus::Succeeded,
+                    output: Some("restarted"),
+                    expires_at: None,
+                    event: "finish",
+                },
+            )
+            .unwrap();
+        let mut later = rollout(&finding_id);
+        later.action = "k8s.set_readiness_port".into();
+        later.idempotency_key = "port-1".into();
+        later.params = json!({
+            "namespace": "pb-fault",
+            "name": "pb-fault-loop",
+            "kind": "deployment",
+            "container": "nginx",
+            "port": 80
+        });
+        let port = store
+            .insert_action(&later, now + chrono::Duration::seconds(5))
+            .unwrap();
+        store
+            .transition_action(
+                &port.id,
+                ActionTransition {
+                    from: ActionRunStatus::Planned,
+                    to: ActionRunStatus::Succeeded,
+                    output: Some("set port"),
+                    expires_at: None,
+                    event: "finish",
+                },
+            )
+            .unwrap();
+        store.reconcile_findings(&[], now).unwrap();
+        let _ = store.action(&older.id).unwrap().unwrap();
+        let _ = store.action(&port.id).unwrap().unwrap();
+        assert!(store
+            .remedy_page("health", "workload", None, None)
             .unwrap()
             .matched
             .is_none());

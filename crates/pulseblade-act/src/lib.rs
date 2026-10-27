@@ -441,11 +441,25 @@ impl Registry {
     pub fn dismiss(&self, store: &Store, run_id: &str) -> Result<ActionRun, ActError> {
         self.sweep(store)?;
         let run = self.load(store, run_id)?;
-        if matches!(
-            run.status,
-            ActionRunStatus::Expired | ActionRunStatus::Rejected
-        ) {
+        if run.status == ActionRunStatus::Rejected {
             return Ok(run);
+        }
+        // An expired request is still on the waiting list while the finding is
+        // open. Dismiss has to record itself or the same button stays forever.
+        if run.status == ActionRunStatus::Expired {
+            if run.output.as_deref() == Some("dismissed") {
+                return Ok(run);
+            }
+            return Ok(store.transition_action(
+                &run.id,
+                pulseblade_store::ActionTransition {
+                    from: ActionRunStatus::Expired,
+                    to: ActionRunStatus::Expired,
+                    output: Some("dismissed"),
+                    expires_at: None,
+                    event: "dismiss",
+                },
+            )?);
         }
         if run.status != ActionRunStatus::AwaitingApproval {
             return Err(ActError::Invalid(format!(
@@ -2090,6 +2104,40 @@ mod tests {
             .unwrap()
             .matched
             .is_none());
+        assert!(api.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn dismiss_marks_an_already_expired_run() {
+        let api = Arc::new(RecK8s {
+            calls: Mutex::new(Vec::new()),
+        });
+        let reg = k8s_reg(api.clone());
+        let store = Store::open_in_memory().unwrap();
+        put_workload(&store, pulseblade_core::Health::Failed, "0/1", "deployment");
+        let finding = open_workload_finding(&store);
+        let held = waiting_rollout(&reg, &store, &finding, "roll-expired-dismiss");
+        store
+            .transition_action(
+                &held.id,
+                pulseblade_store::ActionTransition {
+                    from: ActionRunStatus::AwaitingApproval,
+                    to: ActionRunStatus::Expired,
+                    output: Some("approval window elapsed"),
+                    expires_at: None,
+                    event: "expire",
+                },
+            )
+            .unwrap();
+        let closed = reg.dismiss(&store, &held.id).unwrap();
+        assert_eq!(closed.status, ActionRunStatus::Expired);
+        assert_eq!(closed.output.as_deref(), Some("dismissed"));
+        let again = reg.dismiss(&store, &held.id).unwrap();
+        assert_eq!(again.output.as_deref(), Some("dismissed"));
+        assert!(
+            store.finding(&finding).unwrap().unwrap().status
+                == pulseblade_core::FindingStatus::Open
+        );
         assert!(api.calls.lock().unwrap().is_empty());
     }
 

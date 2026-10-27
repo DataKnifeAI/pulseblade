@@ -896,6 +896,7 @@ function changesView() {
 }
 
 function actionable(a) {
+  if (!a || a.output === "dismissed") return false;
   return a.status === "awaiting_approval" || (a.status === "expired" && a.finding_outcome === "still_open");
 }
 function actionsView() {
@@ -904,7 +905,7 @@ function actionsView() {
   const tone = { succeeded: "ok", failed: "failed", rejected: "unknown", expired: "unknown", running: "degraded", planned: "unknown" };
   const card = (a) => {
     const r = byId.get(a.resource_id), f = (D.findings.findings || []).find((x) => x.resource_id === a.resource_id);
-    const exp = a.expires_at ? `expires in ${ago((Date.parse(a.expires_at) - Date.now()) / 1000)}` : "no expiry";
+    const exp = a.status === "expired" ? "expired" : (a.expires_at ? `expires in ${ago((Date.parse(a.expires_at) - Date.now()) / 1000)}` : "no expiry");
     return `<div class="appr"><div class="top"><b>${esc(a.action)}</b><span class="muted small">on</span><button type="button" class="linkish" data-res="${esc(a.resource_id)}">${esc(r ? r.name : a.resource_id)}</button>
         <span class="right">${esc(exp)}</span></div>
       <div class="small muted">${esc(scopeText(scopeOf(r)))} · requested ${agoTs(a.created_at)} ago · tier ${esc(a.tier)} · <span class="mono">${esc(a.id)}</span></div>
@@ -1074,7 +1075,7 @@ function resourceView(id) {
       <div class="muted">${esc(x.rule)} · opened ${agoTs(x.opened_at)} ago</div>${(x.logs || []).length ? `<pre>${x.logs.slice(0, 3).map((l) => esc(l.message)).join("\n")}</pre>` : ""}${decisionControl(wait)}</div>`;
     }).join("")}
     ${acts.filter(actionable).map((a) => `<div class="callout approval"><div class="lbl">${a.status === "awaiting_approval" ? "Waiting for approval" : "Approval expired"}</div><div class="mono">${esc(a.action)}</div>
-      <div class="muted">requested ${agoTs(a.created_at)} ago${a.expires_at ? ` · expires in ${ago((Date.parse(a.expires_at) - Date.now()) / 1000)}` : ""}</div>${decisionControl(a)}</div>`).join("")}
+      <div class="muted">requested ${agoTs(a.created_at)} ago${a.status === "expired" ? " · expired" : (a.expires_at ? ` · expires in ${ago((Date.parse(a.expires_at) - Date.now()) / 1000)}` : "")}</div>${decisionControl(a)}</div>`).join("")}
     ${r.kind === "workload" ? `<h3>Pods</h3>${podsOf(r).sort((a, b) => (RANK[a.health] ?? 9) - (RANK[b.health] ?? 9)).map(rrow).join("") || `<div class="empty">No pods linked. Without an owner label, pods group by name prefix.</div>`}` : ""}
     ${metricBlock(r, false)}
     <h3>Details</h3><dl class="kv">${kv || `<dt class="muted">—</dt><dd class="faint">no attributes</dd>`}</dl>
