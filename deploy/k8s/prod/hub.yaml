@@ -257,7 +257,7 @@ spec:
         fsGroup: 65532
       containers:
         - name: pulseblade
-          image: harbor.dataknife.net/library/pulseblade:0.1.0@sha256:c59cdf3a586bc1327099bc135d30073134bb48e0dc904bc15d90a484d5409869
+          image: harbor.dataknife.net/library/pulseblade:0.1.0@sha256:a0d91a1d019e553067a938688b65645a8e36c271313a7e2351488ad9d9593653
           imagePullPolicy: IfNotPresent
           command:
             - pulseblade
@@ -456,7 +456,7 @@ spec:
             - name: hub-cache
               mountPath: /var/lib/pulseblade-cache
         - name: pilot
-          image: harbor.dataknife.net/library/pulseblade:0.1.0@sha256:c59cdf3a586bc1327099bc135d30073134bb48e0dc904bc15d90a484d5409869
+          image: harbor.dataknife.net/library/pulseblade:0.1.0@sha256:a0d91a1d019e553067a938688b65645a8e36c271313a7e2351488ad9d9593653
           imagePullPolicy: IfNotPresent
           command:
             - pulseblade
