@@ -137,6 +137,10 @@ pub struct HubConfig {
     /// Environment variable holding the server CA PEM. Empty uses a non-TLS connection.
     #[serde(default)]
     pub database_ca_env: String,
+    /// File for the last summary snapshot. Empty keeps it in memory.
+    /// Not the Postgres volume and not the old SQLite PVC.
+    #[serde(default)]
+    pub snapshot_cache: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -181,6 +185,7 @@ impl Default for HubConfig {
             database_user_env: String::new(),
             database_password_env: String::new(),
             database_ca_env: String::new(),
+            snapshot_cache: String::new(),
         }
     }
 }

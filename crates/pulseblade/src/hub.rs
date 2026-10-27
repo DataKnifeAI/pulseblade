@@ -18,6 +18,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use pulseblade_act::Registry;
 use pulseblade_core::host_of_id;
+use pulseblade_mcp::journal::{self, Journal, WriteError};
+use pulseblade_mcp::query::{self, SnapshotParams};
 use pulseblade_mcp::{build_router, ActionRoute};
 use pulseblade_store::{
     ChangeFilter, IngestResult, NodeBatch, NodeCursor, RouteJob, Store, StoreError,
@@ -30,7 +32,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::HubTls;
 
 pub struct HubInner {
-    store: Arc<Store>,
+    journal: Arc<Journal>,
     /// Node id to bearer token.
     tokens: Vec<(String, String)>,
     waiters: Mutex<HashMap<String, mpsc::Sender<Result<Value, String>>>>,
@@ -62,9 +64,7 @@ impl HubInner {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(id.clone(), tx);
-        self.store
-            .enqueue_route(&id, node_id, op, &body)
-            .map_err(|e| e.to_string())?;
+        self.with_store(|store| store.enqueue_route(&id, node_id, op, &body))?;
         self.notify.notify_waiters();
         match rx.recv_timeout(self.action_wait) {
             Ok(result) => result,
@@ -81,13 +81,30 @@ impl HubInner {
     fn annotate_run(
         &self,
         run: pulseblade_core::ActionRun,
-    ) -> Result<pulseblade_core::ActionRun, StoreError> {
-        let remembered = self.store.plan_finding(&run.id)?;
+    ) -> Result<pulseblade_core::ActionRun, String> {
+        let remembered = self.with_store(|store| store.plan_finding(&run.id))?;
         let run = remember_finding(run, remembered);
         if run.finding_outcome.is_some() {
             return Ok(run);
         }
-        self.store.attach_finding_outcome(run)
+        self.with_store(|store| store.attach_finding_outcome(run))
+    }
+
+    fn with_store<T>(&self, f: impl FnOnce(&Store) -> Result<T, StoreError>) -> Result<T, String> {
+        self.journal
+            .try_store(f)
+            .map_err(|err| write_error(&self.journal, err))
+    }
+}
+
+fn write_error(journal: &Journal, err: WriteError) -> String {
+    match err {
+        WriteError::Unavailable => "database unavailable".into(),
+        WriteError::Store(err) if journal::is_down(&err) => {
+            journal.mark_down();
+            "database unavailable".into()
+        }
+        WriteError::Store(err) => err.to_string(),
     }
 }
 
@@ -98,7 +115,11 @@ impl ActionRoute for HubInner {
     ) -> Result<pulseblade_act::PlanResult, String> {
         let finding_id = params.finding_id.clone();
         let resource_id = params.resource_id.clone();
-        let node = route_node(&self.store, params.resource_id.as_deref(), &self.tokens)?;
+        let store = self
+            .journal
+            .store()
+            .ok_or_else(|| "database unavailable".to_string())?;
+        let node = route_node(&store, params.resource_id.as_deref(), &self.tokens)?;
         let value = self.call(
             &node,
             "plan",
@@ -109,14 +130,14 @@ impl ActionRoute for HubInner {
         if planned.finding_id.is_none() {
             planned.finding_id = finding_id;
         }
-        self.store
-            .remember_plan(
+        self.with_store(|store| {
+            store.remember_plan(
                 &planned.plan_id,
                 &node,
                 planned.finding_id.as_deref(),
                 resource_id.as_deref(),
             )
-            .map_err(|e| e.to_string())?;
+        })?;
         Ok(planned)
     }
 
@@ -125,9 +146,7 @@ impl ActionRoute for HubInner {
         params: pulseblade_act::ExecuteParams,
     ) -> Result<pulseblade_core::ActionRun, String> {
         let node = self
-            .store
-            .plan_node(&params.plan_id)
-            .map_err(|e| e.to_string())?
+            .with_store(|store| store.plan_node(&params.plan_id))?
             .ok_or_else(|| format!("unknown plan {}", params.plan_id))?;
         let value = self.call(
             &node,
@@ -138,9 +157,7 @@ impl ActionRoute for HubInner {
             serde_json::from_value(value).map_err(|e| e.to_string())?;
         let run = self.annotate_run(run).map_err(|e| e.to_string())?;
         let body = serde_json::to_value(&run).map_err(|e| e.to_string())?;
-        self.store
-            .cache_run(&run.id, &node, &body)
-            .map_err(|e| e.to_string())?;
+        self.with_store(|store| store.cache_run(&run.id, &node, &body))?;
         Ok(run)
     }
 
@@ -148,25 +165,16 @@ impl ActionRoute for HubInner {
         &self,
         params: pulseblade_act::StatusParams,
     ) -> Result<pulseblade_core::ActionRun, String> {
-        let tied = self
-            .store
-            .plan_finding(&params.run_id)
-            .map_err(|e| e.to_string())?;
+        let tied = self.with_store(|store| store.plan_finding(&params.run_id))?;
         // A finished run's output does not change. A finding tied to it does:
         // approval can still be waiting, then the finding can clear.
         if tied.is_none() {
-            if let Some((_, body)) = self
-                .store
-                .cached_run(&params.run_id)
-                .map_err(|e| e.to_string())?
-            {
+            if let Some((_, body)) = self.with_store(|store| store.cached_run(&params.run_id))? {
                 return serde_json::from_value(body).map_err(|e| e.to_string());
             }
         }
         let node = self
-            .store
-            .plan_node(&params.run_id)
-            .map_err(|e| e.to_string())?
+            .with_store(|store| store.plan_node(&params.run_id))?
             .ok_or_else(|| format!("unknown run {}", params.run_id))?;
         match self.call(
             &node,
@@ -178,25 +186,18 @@ impl ActionRoute for HubInner {
                     serde_json::from_value(value).map_err(|e| e.to_string())?;
                 let run = self.annotate_run(run).map_err(|e| e.to_string())?;
                 let body = serde_json::to_value(&run).map_err(|e| e.to_string())?;
-                self.store
-                    .cache_run(&run.id, &node, &body)
-                    .map_err(|e| e.to_string())?;
+                self.with_store(|store| store.cache_run(&run.id, &node, &body))?;
                 Ok(run)
             }
             Err(err) => {
-                if let Some((_, body)) = self
-                    .store
-                    .cached_run(&params.run_id)
-                    .map_err(|e| e.to_string())?
+                if let Some((_, body)) =
+                    self.with_store(|store| store.cached_run(&params.run_id))?
                 {
                     let run: pulseblade_core::ActionRun =
                         serde_json::from_value(body).map_err(|e| e.to_string())?;
                     let mut run = remember_finding(run, tied);
                     run.finding_outcome = None;
-                    return self
-                        .store
-                        .attach_finding_outcome(run)
-                        .map_err(|e| e.to_string());
+                    return self.with_store(|store| store.attach_finding_outcome(run));
                 }
                 Err(err)
             }
@@ -351,13 +352,22 @@ pub fn apply_job(reg: &Registry, store: &Store, job: &RouteJob) -> Result<Value,
     }
 }
 
+#[cfg(test)]
 pub fn new_hub(
     store: Arc<Store>,
     tokens: Vec<(String, String)>,
     action_wait: Duration,
 ) -> Arc<HubInner> {
+    new_hub_journal(Journal::always(store), tokens, action_wait)
+}
+
+pub fn new_hub_journal(
+    journal: Arc<Journal>,
+    tokens: Vec<(String, String)>,
+    action_wait: Duration,
+) -> Arc<HubInner> {
     Arc::new(HubInner {
-        store,
+        journal,
         tokens,
         waiters: Mutex::new(HashMap::new()),
         notify: tokio::sync::Notify::new(),
@@ -374,7 +384,7 @@ pub async fn serve(
     actions: Arc<Registry>,
     tls: Option<Arc<rustls::ServerConfig>>,
 ) -> anyhow::Result<()> {
-    let store = hub.store.clone();
+    let journal = hub.journal.clone();
     let extra = Router::new()
         .route("/hub/v1/cursor", get(cursor))
         .route("/hub/v1/push", post(push))
@@ -382,7 +392,7 @@ pub async fn serve(
         .route("/hub/v1/result", post(result))
         .with_state(hub.clone());
     let router = build_router(
-        store,
+        journal,
         allowed_hosts,
         shutdown.clone(),
         actions,
@@ -390,7 +400,7 @@ pub async fn serve(
         extra,
     );
     let bound = listener.local_addr()?;
-    tracing::info!(%bound, "hub listening");
+    tracing::info!(%bound, "hub serving");
     if let Some(config) = tls {
         let listener = TlsListen {
             inner: listener,
@@ -407,21 +417,71 @@ pub async fn serve(
     Ok(())
 }
 
-/// Open a `host offline` finding after three missed pushes, and keep raw samples
-/// for one day. Five-minute buckets and the event index stay for `history_days`.
-pub async fn maintain(
-    store: Arc<Store>,
+/// How the hub opens its journal. Retried in the background; a failure does not
+/// stop the listener.
+#[derive(Clone)]
+pub enum DbOpener {
+    Postgres { url: String, ca: Option<String> },
+    Sqlite(std::path::PathBuf),
+}
+
+impl DbOpener {
+    pub fn open(&self) -> anyhow::Result<Store> {
+        match self {
+            Self::Postgres { url, ca } => Store::open_postgres(url, ca.as_deref())
+                .context("opening the hub postgres database"),
+            Self::Sqlite(path) => {
+                if let Some(dir) = path.parent() {
+                    std::fs::create_dir_all(dir)
+                        .with_context(|| format!("creating {}", dir.display()))?;
+                }
+                Store::open(path).with_context(|| format!("opening {}", path.display()))
+            }
+        }
+    }
+}
+
+fn note_down(journal: &Journal, err: &StoreError) {
+    if journal::is_down(err) {
+        journal.mark_down();
+    }
+}
+
+/// Retry the pool, then keep offline findings and retention while it is up.
+/// A successful summary read refreshes the snapshot cache.
+pub async fn supervise(
+    journal: Arc<Journal>,
+    opener: DbOpener,
     shutdown: CancellationToken,
     history_days: u64,
     change_days: u64,
 ) {
-    let mut tick = tokio::time::interval(Duration::from_secs(15));
+    let mut tick = tokio::time::interval(Duration::from_secs(2));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut next_maintain = tokio::time::Instant::now();
     let mut next_prune = tokio::time::Instant::now();
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
             _ = tick.tick() => {
+                if !journal.is_up() {
+                    let opener = opener.clone();
+                    match tokio::task::spawn_blocking(move || opener.open()).await {
+                        Ok(Ok(store)) => journal.install(Arc::new(store)),
+                        Ok(Err(err)) => {
+                            tracing::warn!(error = %err, "hub database unavailable; retrying");
+                        }
+                        Err(err) => tracing::warn!(error = %err, "hub database unavailable; retrying"),
+                    }
+                    if !journal.is_up() {
+                        continue;
+                    }
+                }
+                if tokio::time::Instant::now() < next_maintain {
+                    continue;
+                }
+                next_maintain = tokio::time::Instant::now() + Duration::from_secs(15);
+                let Some(store) = journal.store() else { continue };
                 let checked = store.clone();
                 match tokio::task::spawn_blocking(move || checked.sync_offline_hosts(chrono::Utc::now())).await {
                     Ok(Ok(opened)) => {
@@ -434,11 +494,43 @@ pub async fn maintain(
                             );
                         }
                     }
-                    Ok(Err(e)) => tracing::warn!(error = %e, "offline check failed"),
-                    Err(e) => tracing::warn!(error = %e, "offline check failed"),
+                    Ok(Err(err)) => {
+                        note_down(&journal, &err);
+                        tracing::warn!(error = %err, "offline check failed");
+                    }
+                    Err(err) => tracing::warn!(error = %err, "offline check failed"),
+                }
+                let refreshed = journal.clone();
+                match tokio::task::spawn_blocking(move || {
+                    let Some(store) = refreshed.store() else {
+                        return Ok(());
+                    };
+                    match query::snapshot(
+                        &store,
+                        SnapshotParams {
+                            detail: Some(query::Detail::Summary),
+                            ..Default::default()
+                        },
+                    ) {
+                        Ok(snap) => {
+                            refreshed.remember(&snap);
+                            Ok(())
+                        }
+                        Err(query::QueryError::Store(err)) => Err(err),
+                        Err(err) => Err(StoreError::Invalid(err.to_string())),
+                    }
+                })
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => {
+                        note_down(&journal, &err);
+                        tracing::warn!(error = %err, "snapshot cache refresh failed");
+                    }
+                    Err(err) => tracing::warn!(error = %err, "snapshot cache refresh failed"),
                 }
                 if tokio::time::Instant::now() >= next_prune {
-                    let pruned = store.clone();
+                    let Some(pruned) = journal.store() else { continue };
                     let history_days = history_days.max(1);
                     let change_days = change_days.max(1);
                     match tokio::task::spawn_blocking(move || {
@@ -454,8 +546,11 @@ pub async fn maintain(
                         Ok(Ok((samples, changes))) => {
                             tracing::info!(samples, changes, "pruned");
                         }
-                        Ok(Err(e)) => tracing::warn!(error = %e, "hub prune failed"),
-                        Err(e) => tracing::warn!(error = %e, "hub prune failed"),
+                        Ok(Err(err)) => {
+                            note_down(&journal, &err);
+                            tracing::warn!(error = %err, "hub prune failed");
+                        }
+                        Err(err) => tracing::warn!(error = %err, "hub prune failed"),
                     }
                     next_prune = tokio::time::Instant::now() + Duration::from_secs(3600);
                 }
@@ -537,16 +632,23 @@ fn load_key(path: &str) -> anyhow::Result<rustls::pki_types::PrivateKeyDer<'stat
         .ok_or_else(|| anyhow::anyhow!("no private key in {path}"))
 }
 
+fn unavailable(err: &WriteError) -> bool {
+    matches!(err, WriteError::Unavailable)
+}
+
 async fn cursor(
     State(hub): State<Arc<HubInner>>,
     headers: HeaderMap,
 ) -> Result<Json<NodeCursor>, StatusCode> {
     let node = authorize(&hub, &headers)?;
-    let cursor = tokio::task::spawn_blocking(move || hub.store.node_cursor(&node))
+    let journal = hub.journal.clone();
+    match tokio::task::spawn_blocking(move || journal.try_store(|store| store.node_cursor(&node)))
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(cursor))
+    {
+        Ok(Ok(cursor)) => Ok(Json(cursor)),
+        Ok(Err(err)) if unavailable(&err) => Err(StatusCode::SERVICE_UNAVAILABLE),
+        _ => Err(StatusCode::INTERNAL_SERVER_ERROR),
+    }
 }
 
 async fn push(
@@ -555,17 +657,20 @@ async fn push(
     Json(batch): Json<NodeBatch>,
 ) -> Result<Json<IngestResult>, (StatusCode, String)> {
     let node = authorize(&hub, &headers).map_err(|s| (s, "unauthorized".into()))?;
-    let result = tokio::task::spawn_blocking(move || hub.store.ingest_node(&node, &batch))
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .map_err(|e| {
-            let code = if matches!(e, StoreError::Gap { .. }) {
-                StatusCode::CONFLICT
-            } else {
-                StatusCode::BAD_REQUEST
-            };
-            (code, e.to_string())
-        })?;
+    let journal = hub.journal.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        journal.try_store(|store| store.ingest_node(&node, &batch))
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(|e| match e {
+        WriteError::Unavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "database unavailable".into(),
+        ),
+        WriteError::Store(err @ StoreError::Gap { .. }) => (StatusCode::CONFLICT, err.to_string()),
+        WriteError::Store(err) => (StatusCode::BAD_REQUEST, err.to_string()),
+    })?;
     Ok(Json(result))
 }
 
@@ -585,12 +690,19 @@ async fn poll(
     let deadline = tokio::time::Instant::now() + wait;
     loop {
         let jobs = {
-            let hub = hub.clone();
+            let journal = hub.journal.clone();
             let node = node.clone();
-            tokio::task::spawn_blocking(move || hub.store.poll_routes(&node, 20))
-                .await
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            match tokio::task::spawn_blocking(move || {
+                journal.try_store(|store| store.poll_routes(&node, 20))
+            })
+            .await
+            {
+                Ok(Ok(jobs)) => jobs,
+                Ok(Err(err)) if unavailable(&err) => {
+                    return Err(StatusCode::SERVICE_UNAVAILABLE);
+                }
+                _ => return Err(StatusCode::INTERNAL_SERVER_ERROR),
+            }
         };
         if !jobs.is_empty() || wait.is_zero() || tokio::time::Instant::now() >= deadline {
             let body = jobs
@@ -602,12 +714,19 @@ async fn poll(
         let notified = hub.notify.notified();
         tokio::pin!(notified);
         let again = {
-            let hub = hub.clone();
+            let journal = hub.journal.clone();
             let node = node.clone();
-            tokio::task::spawn_blocking(move || hub.store.poll_routes(&node, 1))
-                .await
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            match tokio::task::spawn_blocking(move || {
+                journal.try_store(|store| store.poll_routes(&node, 1))
+            })
+            .await
+            {
+                Ok(Ok(jobs)) => jobs,
+                Ok(Err(err)) if unavailable(&err) => {
+                    return Err(StatusCode::SERVICE_UNAVAILABLE);
+                }
+                _ => return Err(StatusCode::INTERNAL_SERVER_ERROR),
+            }
         };
         if !again.is_empty() {
             continue;
@@ -638,13 +757,18 @@ async fn result(
         json!({ "error": body.body })
     };
     let updated = {
-        let hub = hub.clone();
+        let journal = hub.journal.clone();
         let id = body.id.clone();
         let node = node.clone();
-        tokio::task::spawn_blocking(move || hub.store.finish_route(&id, &node, &value))
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        match tokio::task::spawn_blocking(move || {
+            journal.try_store(|store| store.finish_route(&id, &node, &value))
+        })
+        .await
+        {
+            Ok(Ok(updated)) => updated,
+            Ok(Err(err)) if unavailable(&err) => return Err(StatusCode::SERVICE_UNAVAILABLE),
+            _ => return Err(StatusCode::INTERNAL_SERVER_ERROR),
+        }
     };
     if !updated {
         return Err(StatusCode::NOT_FOUND);
@@ -1584,6 +1708,153 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("401"), "{err}");
+        shutdown.cancel();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recovery_serves_cached_snapshot_then_accepts_push() {
+        let dir = std::env::temp_dir().join(format!(
+            "pb-recover-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_millis()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = dir.join("snapshot.json");
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        store
+            .apply(
+                "host",
+                chrono::Utc::now(),
+                &Observation {
+                    resources: vec![Resource::new("host:cached", ResourceKind::Host, "cached")
+                        .health(Health::Ok)
+                        .label("host", "cached")],
+                    samples: vec![],
+                    logs: vec![],
+                },
+            )
+            .unwrap();
+        let summary = query::snapshot(
+            &store,
+            query::SnapshotParams {
+                detail: Some(query::Detail::Summary),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let seq = summary.as_of_seq;
+        assert!(seq > 0, "{seq}");
+        let journal = pulseblade_mcp::journal::Journal::recover(&cache);
+        journal.remember(&summary);
+        let cached = std::fs::read(&cache).unwrap();
+        assert!(!journal.is_up());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = CancellationToken::new();
+        let hub = new_hub_journal(
+            journal.clone(),
+            vec![("web1".into(), "token".into())],
+            Duration::from_secs(2),
+        );
+        let stop = shutdown.clone();
+        tokio::spawn(async move {
+            serve(
+                listener,
+                hub,
+                vec!["127.0.0.1".into()],
+                stop,
+                Arc::new(Registry::builtin()),
+                None,
+            )
+            .await
+            .ok();
+        });
+        let base = format!("http://{addr}");
+        let snapshot = format!("{base}/api/v1/snapshot");
+        let mut body = None;
+        for _ in 0..50 {
+            if let Ok(resp) = ureq::get(&snapshot).call() {
+                body = Some(resp.into_json::<serde_json::Value>().unwrap());
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let body = body.expect("hub did not bind");
+        assert_eq!(body["stale"], true);
+        assert_eq!(body["as_of_seq"], seq);
+        let status: serde_json::Value = ureq::get(&format!("{base}/api/v1/status"))
+            .call()
+            .unwrap()
+            .into_json()
+            .unwrap();
+        assert_eq!(status["stale"], true);
+        assert_eq!(status["as_of_seq"], seq);
+        let findings: serde_json::Value = ureq::get(&format!("{base}/api/v1/findings"))
+            .call()
+            .unwrap()
+            .into_json()
+            .unwrap();
+        assert_eq!(findings["stale"], true);
+        let metrics = ureq::get(&format!("{base}/metrics"))
+            .call()
+            .unwrap()
+            .into_string()
+            .unwrap();
+        let metrics: serde_json::Value = serde_json::from_str(&metrics).unwrap();
+        assert_eq!(metrics["stale"], true);
+        assert_eq!(metrics["as_of_seq"], seq);
+
+        let node = Store::open_in_memory().unwrap();
+        node.apply(
+            "host",
+            chrono::Utc::now(),
+            &Observation {
+                resources: vec![Resource::new("host:web1", ResourceKind::Host, "web1")
+                    .health(Health::Degraded)
+                    .label("host", "web1")],
+                samples: vec![],
+                logs: vec![],
+            },
+        )
+        .unwrap();
+        let client = HubClient::plain(&base, "token");
+        let err = client.push_store(&node).unwrap_err().to_string();
+        assert!(err.contains("503"), "{err}");
+        assert_eq!(store.current_seq().unwrap(), seq);
+        assert!(store.resource("host:web1").unwrap().is_none());
+        assert_eq!(std::fs::read(&cache).unwrap(), cached);
+
+        let pushed = batch_since(
+            &node,
+            NodeCursor {
+                seq: 0,
+                sample_ms: 0,
+                bucket_ms: 0,
+                event_id: 0,
+            },
+        )
+        .unwrap();
+        let rejected = ureq::post(&format!("{base}/hub/v1/push"))
+            .set("Authorization", "Bearer token")
+            .send_json(serde_json::to_value(&pushed).unwrap());
+        match rejected {
+            Err(ureq::Error::Status(503, _)) => {}
+            other => panic!("push during recovery was not 503: {other:?}"),
+        }
+        assert_eq!(store.current_seq().unwrap(), seq);
+
+        journal.install(store.clone());
+        client.push_store(&node).unwrap();
+        assert!(store.current_seq().unwrap() > seq);
+        let healed = store.resource("host:web1").unwrap().unwrap();
+        assert_eq!(healed.resource.health, Health::Degraded);
+        let live: serde_json::Value = ureq::get(&snapshot).call().unwrap().into_json().unwrap();
+        assert!(live.get("stale").is_none(), "{live}");
+        assert!(live["as_of_seq"].as_i64().unwrap() > seq);
+
         shutdown.cancel();
         let _ = std::fs::remove_dir_all(&dir);
     }

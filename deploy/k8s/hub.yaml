@@ -25,6 +25,28 @@ data:
       "pb-hub-poc.dataknife.net",
     ]
 
+    # Pilot talks to this hub's MCP. The key value lives in the
+    # pulseblade-openrouter Secret, not in this file. POC mounts the dev key.
+    [pilot]
+    enabled = true
+    local_only = false
+    execute_auto = false
+    wake_on = ["findings"]
+    mcp_url = "http://127.0.0.1:7170/mcp"
+
+    [[pilot.tiers]]
+    name = "investigate"
+    [[pilot.tiers.endpoints]]
+    kind = "openai_compatible"
+    base_url = "https://openrouter.ai/api/v1"
+    model = "anthropic/claude-sonnet-5.5"
+    api_key_env = "OPENROUTER_API_KEY"
+    [[pilot.tiers.endpoints]]
+    kind = "openai_compatible"
+    base_url = "https://openrouter.ai/api/v1"
+    model = "anthropic/claude-haiku-5.5"
+    api_key_env = "OPENROUTER_API_KEY"
+
     [hub]
     listen = "0.0.0.0:7170"
     action_wait_secs = 20
@@ -32,6 +54,8 @@ data:
     database_user_env = "PULSEBLADE_DATABASE_USER"
     database_password_env = "PULSEBLADE_DATABASE_PASSWORD"
     database_ca_env = "PULSEBLADE_DATABASE_CA"
+    # Local emptyDir. Not the Postgres volume and not the NFS SQLite PVC.
+    snapshot_cache = "/var/lib/pulseblade-cache/snapshot.json"
 
     [[hub.nodes]]
     id = "poc-apps-1"
@@ -225,6 +249,30 @@ spec:
               readOnly: true
             - name: state
               mountPath: /var/lib/pulseblade
+            - name: hub-cache
+              mountPath: /var/lib/pulseblade-cache
+        - name: pilot
+          image: harbor.dataknife.net/library/pulseblade:poc
+          imagePullPolicy: Always
+          command:
+            - pulseblade
+            - pilot
+            - --config
+            - /etc/pulseblade/pulseblade.toml
+          env:
+            - name: XDG_STATE_HOME
+              value: /var/lib/pulseblade-pilot
+            - name: OPENROUTER_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: pulseblade-openrouter
+                  key: api_key
+          volumeMounts:
+            - name: config
+              mountPath: /etc/pulseblade
+              readOnly: true
+            - name: pilot-state
+              mountPath: /var/lib/pulseblade-pilot
       volumes:
         - name: config
           configMap:
@@ -232,3 +280,7 @@ spec:
         - name: state
           persistentVolumeClaim:
             claimName: pulseblade-hub
+        - name: pilot-state
+          emptyDir: {}
+        - name: hub-cache
+          emptyDir: {}

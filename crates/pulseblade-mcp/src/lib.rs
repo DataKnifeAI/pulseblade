@@ -2,6 +2,7 @@
 //! HTTP surface (JSON API, Prometheus exposition, dashboard).
 
 pub mod http;
+pub mod journal;
 pub mod prom;
 pub mod query;
 mod server;
@@ -13,6 +14,8 @@ use axum::Router;
 use chrono::Utc;
 use pulseblade_act::Registry;
 use pulseblade_store::Store;
+
+use crate::journal::Journal;
 use rmcp::transport::streamable_http_server::{
     session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
 };
@@ -53,7 +56,7 @@ pub async fn serve_listener(
     actions: Arc<Registry>,
 ) -> anyhow::Result<()> {
     let router = build_router(
-        store,
+        Journal::always(store),
         allowed_hosts,
         shutdown.clone(),
         actions,
@@ -71,7 +74,7 @@ pub async fn serve_listener(
 /// Dashboard, JSON API, `/mcp`, and optional extra routes. Every route sits behind
 /// the host allow-list. `route` replaces local action execution with a hub router.
 pub fn build_router(
-    store: Arc<Store>,
+    journal: Arc<Journal>,
     allowed_hosts: Vec<String>,
     shutdown: CancellationToken,
     actions: Arc<Registry>,
@@ -84,13 +87,13 @@ pub fn build_router(
     if !allowed_hosts.is_empty() {
         config = config.with_allowed_hosts(allowed_hosts.clone());
     }
-    let mcp_store = store.clone();
+    let mcp_journal = journal.clone();
     let mcp_actions = actions.clone();
     let mcp_route = route.clone();
     let service = StreamableHttpService::new(
         move || {
-            Ok(PulsebladeServer::with_route(
-                mcp_store.clone(),
+            Ok(PulsebladeServer::with_journal(
+                mcp_journal.clone(),
                 mcp_actions.clone(),
                 mcp_route.clone(),
             ))
@@ -98,7 +101,7 @@ pub fn build_router(
         Arc::new(LocalSessionManager::default()),
         config,
     );
-    http::router_with(store, Utc::now(), actions)
+    http::router_with_journal(journal, Utc::now(), actions)
         .merge(extra)
         .nest_service("/mcp", service)
         .route("/healthz", axum::routing::get(|| async { "ok" }))

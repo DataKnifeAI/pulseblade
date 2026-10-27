@@ -12,7 +12,9 @@ use rmcp::{
     service::{RequestContext, RoleServer, SubscriptionContext},
     tool, tool_handler, tool_router, ErrorData as McpError, Json, ServerHandler,
 };
+use serde::Serialize;
 
+use crate::journal::{self, Journal, LiveOrStale, Read};
 use crate::query::{
     self, AckParams, AckResult, ChangeSet, ChangesParams, CheckpointParams, EventPage,
     EventSearchParams, ExplainParams, Explanation, ExportParams, FindingPage, FindingsParams,
@@ -81,7 +83,7 @@ MCP resources pulseblade://state and pulseblade://findings notify on change.";
 /// MCP handler exposing Pulseblade's read tools.
 #[derive(Clone)]
 pub struct PulsebladeServer {
-    store: Arc<Store>,
+    journal: Arc<Journal>,
     actions: Arc<pulseblade_act::Registry>,
     route: Option<Arc<dyn ActionRoute>>,
     tool_router: ToolRouter<Self>,
@@ -104,24 +106,59 @@ impl PulsebladeServer {
         actions: Arc<pulseblade_act::Registry>,
         route: Option<Arc<dyn ActionRoute>>,
     ) -> Self {
+        Self::with_journal(Journal::always(store), actions, route)
+    }
+
+    pub fn with_journal(
+        journal: Arc<Journal>,
+        actions: Arc<pulseblade_act::Registry>,
+        route: Option<Arc<dyn ActionRoute>>,
+    ) -> Self {
         Self {
-            store,
+            journal,
             actions,
             route,
             tool_router: Self::tool_router(),
         }
     }
 
+    /// Writes fail closed. A database outage is not a successful ack or note.
     async fn run<T, F>(&self, f: F) -> Result<T, String>
     where
         T: Send + 'static,
         F: FnOnce(&Store) -> query::Result<T> + Send + 'static,
     {
-        let store = self.store.clone();
-        tokio::task::spawn_blocking(move || f(&store))
+        let journal = self.journal.clone();
+        tokio::task::spawn_blocking(move || match journal.store() {
+            Some(store) => match f(&store) {
+                Ok(value) => Ok(value),
+                Err(query::QueryError::Store(err)) if journal::is_down(&err) => {
+                    journal.mark_down();
+                    Err("database unavailable".to_string())
+                }
+                Err(err) => Err(err.to_string()),
+            },
+            None => Err("database unavailable".to_string()),
+        })
+        .await
+        .map_err(|e| format!("internal error: {e}"))?
+    }
+
+    /// Reads return the cached summary when the database is down.
+    async fn read_out<T, F>(&self, f: F) -> Result<Json<LiveOrStale<T>>, String>
+    where
+        T: Serialize + schemars::JsonSchema + Send + 'static,
+        F: FnOnce(&Store) -> query::Result<T> + Send + 'static,
+    {
+        let journal = self.journal.clone();
+        let read = tokio::task::spawn_blocking(move || journal.read(f))
             .await
             .map_err(|e| format!("internal error: {e}"))?
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        Ok(Json(match read {
+            Read::Live(value) => LiveOrStale::Live(value),
+            Read::Stale(snap) => LiveOrStale::Stale(snap),
+        }))
     }
 
     #[tool(
@@ -132,9 +169,21 @@ impl PulsebladeServer {
         &self,
         params: Parameters<SnapshotParams>,
     ) -> Result<Json<Snapshot>, String> {
-        self.run(move |s| query::snapshot(s, params.0))
-            .await
-            .map(Json)
+        let journal = self.journal.clone();
+        let read = tokio::task::spawn_blocking(move || {
+            let read = journal.read(|s| query::snapshot(s, params.0))?;
+            if let Read::Live(snap) = &read {
+                journal.remember(snap);
+            }
+            Ok::<_, query::QueryError>(read)
+        })
+        .await
+        .map_err(|e| format!("internal error: {e}"))?
+        .map_err(|e| e.to_string())?;
+        Ok(Json(match read {
+            Read::Live(snap) => snap,
+            Read::Stale(snap) => snap,
+        }))
     }
 
     #[tool(
@@ -144,10 +193,8 @@ impl PulsebladeServer {
     async fn resource_explain(
         &self,
         params: Parameters<ExplainParams>,
-    ) -> Result<Json<Explanation>, String> {
-        self.run(move |s| query::explain(s, params.0))
-            .await
-            .map(Json)
+    ) -> Result<Json<LiveOrStale<Explanation>>, String> {
+        self.read_out(move |s| query::explain(s, params.0)).await
     }
 
     #[tool(
@@ -157,10 +204,8 @@ impl PulsebladeServer {
     async fn metrics_query(
         &self,
         params: Parameters<MetricsParams>,
-    ) -> Result<Json<Series>, String> {
-        self.run(move |s| query::metrics(s, params.0))
-            .await
-            .map(Json)
+    ) -> Result<Json<LiveOrStale<Series>>, String> {
+        self.read_out(move |s| query::metrics(s, params.0)).await
     }
 
     #[tool(
@@ -170,10 +215,8 @@ impl PulsebladeServer {
     async fn history(
         &self,
         params: Parameters<HistoryParams>,
-    ) -> Result<Json<HistorySeries>, String> {
-        self.run(move |s| query::history(s, params.0))
-            .await
-            .map(Json)
+    ) -> Result<Json<LiveOrStale<HistorySeries>>, String> {
+        self.read_out(move |s| query::history(s, params.0)).await
     }
 
     #[tool(
@@ -183,10 +226,8 @@ impl PulsebladeServer {
     async fn search(
         &self,
         params: Parameters<EventSearchParams>,
-    ) -> Result<Json<EventPage>, String> {
-        self.run(move |s| query::search(s, params.0))
-            .await
-            .map(Json)
+    ) -> Result<Json<LiveOrStale<EventPage>>, String> {
+        self.read_out(move |s| query::search(s, params.0)).await
     }
 
     #[tool(
@@ -214,10 +255,8 @@ impl PulsebladeServer {
     async fn changes_since(
         &self,
         params: Parameters<ChangesParams>,
-    ) -> Result<Json<ChangeSet>, String> {
-        self.run(move |s| query::changes(s, params.0))
-            .await
-            .map(Json)
+    ) -> Result<Json<LiveOrStale<ChangeSet>>, String> {
+        self.read_out(move |s| query::changes(s, params.0)).await
     }
 
     #[tool(
@@ -225,7 +264,18 @@ impl PulsebladeServer {
         annotations(title = "Bulk export", read_only_hint = true)
     )]
     async fn export_bulk(&self, params: Parameters<ExportParams>) -> Result<String, String> {
-        self.run(move |s| query::export(s, params.0)).await
+        let journal = self.journal.clone();
+        let read =
+            tokio::task::spawn_blocking(move || journal.read(|s| query::export(s, params.0)))
+                .await
+                .map_err(|e| format!("internal error: {e}"))?
+                .map_err(|e| e.to_string())?;
+        match read {
+            Read::Live(text) => Ok(text),
+            Read::Stale(snap) => {
+                serde_json::to_string(&snap).map_err(|e| format!("internal error: {e}"))
+            }
+        }
     }
 
     #[tool(
@@ -235,10 +285,8 @@ impl PulsebladeServer {
     async fn findings_list(
         &self,
         params: Parameters<FindingsParams>,
-    ) -> Result<Json<FindingPage>, String> {
-        self.run(move |s| query::findings(s, params.0))
-            .await
-            .map(Json)
+    ) -> Result<Json<LiveOrStale<FindingPage>>, String> {
+        self.read_out(move |s| query::findings(s, params.0)).await
     }
 
     #[tool(
@@ -281,18 +329,20 @@ impl PulsebladeServer {
     async fn memory_search(
         &self,
         params: Parameters<SearchParams>,
-    ) -> Result<Json<NotePage>, String> {
-        self.run(move |s| query::memory_search(s, params.0))
+    ) -> Result<Json<LiveOrStale<NotePage>>, String> {
+        self.read_out(move |s| query::memory_search(s, params.0))
             .await
-            .map(Json)
     }
 
     #[tool(
         description = "Recent error log lines for one resource, newest first. Default window 1h, capped. Does not return a bulk journal.",
         annotations(title = "Query logs", read_only_hint = true)
     )]
-    async fn logs_query(&self, params: Parameters<LogsParams>) -> Result<Json<LogPage>, String> {
-        self.run(move |s| query::logs(s, params.0)).await.map(Json)
+    async fn logs_query(
+        &self,
+        params: Parameters<LogsParams>,
+    ) -> Result<Json<LiveOrStale<LogPage>>, String> {
+        self.read_out(move |s| query::logs(s, params.0)).await
     }
 
     #[tool(
@@ -319,19 +369,25 @@ impl PulsebladeServer {
         &self,
         params: Parameters<pulseblade_act::PlanParams>,
     ) -> Result<Json<pulseblade_act::PlanResult>, String> {
+        if !self.journal.is_up() {
+            return Err("database unavailable".into());
+        }
         if let Some(route) = self.route.clone() {
             return tokio::task::spawn_blocking(move || route.plan(params.0))
                 .await
                 .map_err(|e| format!("internal error: {e}"))?
                 .map(Json);
         }
-        let store = self.store.clone();
+        let Some(store) = self.journal.store() else {
+            return Err("database unavailable".into());
+        };
+        let journal = self.journal.clone();
         let actions = self.actions.clone();
         tokio::task::spawn_blocking(move || actions.plan(&store, params.0))
             .await
             .map_err(|e| format!("internal error: {e}"))?
             .map(Json)
-            .map_err(|e| e.to_string())
+            .map_err(|e| map_act(&journal, e))
     }
 
     #[tool(
@@ -347,20 +403,26 @@ impl PulsebladeServer {
         &self,
         params: Parameters<pulseblade_act::ExecuteParams>,
     ) -> Result<Json<pulseblade_core::ActionRun>, String> {
+        if !self.journal.is_up() {
+            return Err("database unavailable".into());
+        }
         if let Some(route) = self.route.clone() {
             return tokio::task::spawn_blocking(move || route.execute(params.0))
                 .await
                 .map_err(|e| format!("internal error: {e}"))?
                 .map(Json);
         }
-        let store = self.store.clone();
+        let Some(store) = self.journal.store() else {
+            return Err("database unavailable".into());
+        };
+        let journal = self.journal.clone();
         let actions = self.actions.clone();
         let plan_id = params.0.plan_id;
         tokio::task::spawn_blocking(move || actions.execute(&store, &plan_id))
             .await
             .map_err(|e| format!("internal error: {e}"))?
             .map(Json)
-            .map_err(|e| e.to_string())
+            .map_err(|e| map_act(&journal, e))
     }
 
     #[tool(
@@ -370,21 +432,35 @@ impl PulsebladeServer {
     async fn action_status(
         &self,
         params: Parameters<pulseblade_act::StatusParams>,
-    ) -> Result<Json<pulseblade_core::ActionRun>, String> {
-        if let Some(route) = self.route.clone() {
-            return tokio::task::spawn_blocking(move || route.status(params.0))
-                .await
-                .map_err(|e| format!("internal error: {e}"))?
-                .map(Json);
+    ) -> Result<Json<LiveOrStale<pulseblade_core::ActionRun>>, String> {
+        if !self.journal.is_up() {
+            return Ok(Json(LiveOrStale::Stale(self.journal.stale())));
         }
-        let store = self.store.clone();
+        if let Some(route) = self.route.clone() {
+            let run = tokio::task::spawn_blocking(move || route.status(params.0))
+                .await
+                .map_err(|e| format!("internal error: {e}"))??;
+            return Ok(Json(LiveOrStale::Live(run)));
+        }
+        let Some(store) = self.journal.store() else {
+            return Ok(Json(LiveOrStale::Stale(self.journal.stale())));
+        };
+        let journal = self.journal.clone();
         let actions = self.actions.clone();
         let run_id = params.0.run_id;
-        tokio::task::spawn_blocking(move || actions.status(&store, &run_id))
-            .await
-            .map_err(|e| format!("internal error: {e}"))?
-            .map(Json)
-            .map_err(|e| e.to_string())
+        match tokio::task::spawn_blocking(move || actions.status(&store, &run_id)).await {
+            Ok(Ok(run)) => Ok(Json(LiveOrStale::Live(run))),
+            Ok(Err(err)) => {
+                if let pulseblade_act::ActError::Store(inner) = &err {
+                    if journal::is_down(inner) {
+                        journal.mark_down();
+                        return Ok(Json(LiveOrStale::Stale(journal.stale())));
+                    }
+                }
+                Err(err.to_string())
+            }
+            Err(err) => Err(format!("internal error: {err}")),
+        }
     }
 
     #[tool(
@@ -394,10 +470,9 @@ impl PulsebladeServer {
     async fn fleet_overview(
         &self,
         params: Parameters<FleetParams>,
-    ) -> Result<Json<FleetOverview>, String> {
-        self.run(move |s| query::fleet_overview(s, params.0))
+    ) -> Result<Json<LiveOrStale<FleetOverview>>, String> {
+        self.read_out(move |s| query::fleet_overview(s, params.0))
             .await
-            .map(Json)
     }
 }
 
@@ -442,17 +517,31 @@ impl ServerHandler for PulsebladeServer {
         _context: RequestContext<RoleServer>,
     ) -> Result<rmcp::model::ReadResourceResponse, McpError> {
         let uri = request.uri;
-        let document = if uri == STATE_URI {
-            self.run(query::state_document).await
-        } else if uri == FINDINGS_URI {
-            self.run(query::findings_document).await
-        } else {
+        if uri != STATE_URI && uri != FINDINGS_URI {
             return Err(McpError::resource_not_found(
                 format!("unknown resource `{uri}`"),
                 None,
             ));
+        }
+        let journal = self.journal.clone();
+        let which = uri.clone();
+        let read = tokio::task::spawn_blocking(move || {
+            journal.read(|store| {
+                if which == STATE_URI {
+                    query::state_document(store)
+                } else {
+                    query::findings_document(store)
+                }
+            })
+        })
+        .await
+        .map_err(|e| McpError::internal_error(e.to_string(), None))?
+        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let text = match read {
+            Read::Live(text) => text,
+            Read::Stale(snap) => serde_json::to_string(&snap)
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?,
         };
-        let text = document.map_err(|e| McpError::internal_error(e, None))?;
         Ok(ReadResourceResult::new(vec![
             ResourceContents::text(text, uri).with_mime_type("application/json")
         ])
@@ -474,14 +563,14 @@ impl ServerHandler for PulsebladeServer {
     }
 
     async fn listen(&self, context: SubscriptionContext) -> Result<(), McpError> {
-        let store = self.store.clone();
-        let mut prev = read_revision(store.clone()).await.unwrap_or((0, 0));
+        let journal = self.journal.clone();
+        let mut prev = read_revision(journal.clone()).await.unwrap_or((0, 0));
         loop {
             tokio::select! {
                 () = context.cancelled() => return Ok(()),
                 () = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
             }
-            let Ok(next) = read_revision(store.clone()).await else {
+            let Ok(next) = read_revision(journal.clone()).await else {
                 continue;
             };
             let uris = context
@@ -511,17 +600,17 @@ impl ServerHandler for PulsebladeServer {
             )));
         }
         let uri = request.uri;
-        let store = self.store.clone();
+        let journal = self.journal.clone();
         let peer = context.peer.clone();
         let ct = context.ct.clone();
         tokio::spawn(async move {
-            let mut prev = read_revision(store.clone()).await.unwrap_or((0, 0));
+            let mut prev = read_revision(journal.clone()).await.unwrap_or((0, 0));
             loop {
                 tokio::select! {
                     () = ct.cancelled() => break,
                     () = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
                 }
-                let Ok(next) = read_revision(store.clone()).await else {
+                let Ok(next) = read_revision(journal.clone()).await else {
                     continue;
                 };
                 let changed = (uri == STATE_URI && next.0 != prev.0)
@@ -540,13 +629,35 @@ impl ServerHandler for PulsebladeServer {
     }
 }
 
-async fn read_revision(store: Arc<Store>) -> Result<(i64, i64), String> {
-    tokio::task::spawn_blocking(move || {
-        Ok::<_, pulseblade_store::StoreError>((store.current_seq()?, store.findings_token()?))
+fn map_act(journal: &Journal, err: pulseblade_act::ActError) -> String {
+    if let pulseblade_act::ActError::Store(inner) = &err {
+        if journal::is_down(inner) {
+            journal.mark_down();
+            return "database unavailable".into();
+        }
+    }
+    err.to_string()
+}
+
+async fn read_revision(journal: Arc<Journal>) -> Result<(i64, i64), String> {
+    let Some(store) = journal.store() else {
+        return Err("database unavailable".into());
+    };
+    let read = tokio::task::spawn_blocking(move || {
+        store
+            .current_seq()
+            .and_then(|seq| Ok((seq, store.findings_token()?)))
     })
     .await
-    .map_err(|e| e.to_string())?
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+    match read {
+        Ok(pair) => Ok(pair),
+        Err(err) if journal::is_down(&err) => {
+            journal.mark_down();
+            Err("database unavailable".into())
+        }
+        Err(err) => Err(err.to_string()),
+    }
 }
 
 #[cfg(test)]

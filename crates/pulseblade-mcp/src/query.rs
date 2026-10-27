@@ -68,7 +68,7 @@ fn is_zero(n: &usize) -> bool {
 // collector health and status
 
 /// Compact collector health, embedded in snapshots.
-#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CollectorHealth {
     pub source: String,
     /// Last pass succeeded and is recent.
@@ -188,7 +188,7 @@ pub struct Status {
 }
 
 /// One node's cursor on the hub, plus whether it has stopped pushing.
-#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct NodePushStatus {
     pub node: String,
     pub seq: i64,
@@ -306,7 +306,7 @@ impl SnapshotParams {
     }
 }
 
-#[derive(Debug, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ResourceBrief {
     pub id: String,
     pub kind: ResourceKind,
@@ -325,7 +325,7 @@ pub struct ResourceBrief {
     pub attrs: Option<BTreeMap<String, Value>>,
 }
 
-#[derive(Debug, Default, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct KindCounts {
     pub total: usize,
     #[serde(default, skip_serializing_if = "is_zero")]
@@ -334,7 +334,7 @@ pub struct KindCounts {
     pub degraded: usize,
 }
 
-#[derive(Debug, Default, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct Snapshot {
     /// Journal position this snapshot reflects; pass to `changes_since` or `if_changed_since`.
     pub as_of_seq: i64,
@@ -365,6 +365,9 @@ pub struct Snapshot {
     /// Hub nodes that have missed three push intervals. Empty on a node.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub nodes: Vec<NodePushStatus>,
+    /// The database was unavailable. This is the last successful summary, at `as_of_seq`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stale: bool,
 }
 
 pub fn snapshot(store: &Store, p: SnapshotParams) -> Result<Snapshot> {
@@ -446,6 +449,7 @@ pub fn snapshot(store: &Store, p: SnapshotParams) -> Result<Snapshot> {
         total: Some(total),
         truncated: total > limit,
         nodes,
+        stale: false,
     })
 }
 

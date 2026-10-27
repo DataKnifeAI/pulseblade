@@ -176,10 +176,10 @@ fn parse_detail(s: &str) -> Result<query::Detail, String> {
         .map_err(|_| "expected summary, brief, or full".to_string())
 }
 
-async fn open_hub_store(config: &Config, path: &Path) -> anyhow::Result<Arc<Store>> {
+fn hub_opener(config: &Config, path: &Path) -> anyhow::Result<hub::DbOpener> {
     let url_env = config.hub.database_url_env.trim();
     if url_env.is_empty() {
-        return open_store(path);
+        return Ok(hub::DbOpener::Sqlite(path.to_path_buf()));
     }
     let url = std::env::var(url_env).with_context(|| format!("reading {url_env}"))?;
     let url = config::inject_database_user(
@@ -189,14 +189,31 @@ async fn open_hub_store(config: &Config, path: &Path) -> anyhow::Result<Arc<Stor
     )?;
     let ca = config::optional_env(config.hub.database_ca_env.trim())?;
     tracing::info!("hub journal is postgres");
-    // This is the #[tokio::main] thread. postgres::Client::drop starts its
-    // own runtime and panics here, so the open runs on a blocking thread.
-    let opened = tokio::task::spawn_blocking(move || {
-        Store::open_postgres(&url, ca.as_deref()).context("opening the hub postgres database")
-    })
-    .await
-    .context("opening the hub postgres database")??;
-    Ok(Arc::new(opened))
+    Ok(hub::DbOpener::Postgres { url, ca })
+}
+
+/// Open the node SQLite file, retrying the same path until it works.
+/// A missing volume must not exit the process, and the retry stays on `path`
+/// (the collector emptyDir, not the hub's NFS PVC).
+fn open_sqlite_until(path: &Path, shutdown: &CancellationToken) -> anyhow::Result<Arc<Store>> {
+    let mut pause = std::time::Duration::from_millis(200);
+    loop {
+        if shutdown.is_cancelled() {
+            anyhow::bail!("shutting down before the database opened");
+        }
+        match open_store(path) {
+            Ok(store) => return Ok(store),
+            Err(err) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "sqlite open failed; retrying"
+                );
+                std::thread::sleep(pause);
+                pause = (pause * 2).min(std::time::Duration::from_secs(5));
+            }
+        }
+    }
 }
 
 fn open_store(path: &Path) -> anyhow::Result<Arc<Store>> {
@@ -406,7 +423,15 @@ async fn main() -> anyhow::Result<()> {
             if no_collect {
                 anyhow::ensure!(db.exists(), "database {} does not exist", db.display());
             }
-            let store = open_store(&db)?;
+            let shutdown = CancellationToken::new();
+            watch_shutdown(shutdown.clone());
+            let store = if no_collect {
+                open_store(&db)?
+            } else {
+                let path = db.clone();
+                let stop = shutdown.clone();
+                tokio::task::spawn_blocking(move || open_sqlite_until(&path, &stop)).await??
+            };
             let lock = if no_collect {
                 tracing::info!(db = %db.display(), "serving without collecting");
                 None
@@ -425,10 +450,8 @@ async fn main() -> anyhow::Result<()> {
                     .parse()
                     .with_context(|| format!("invalid listen address `{}`", config.listen))?,
             };
-            let shutdown = CancellationToken::new();
             let collector =
                 lock.map(|lock| spawn_collector(store.clone(), &config, lock, shutdown.clone()));
-            watch_shutdown(shutdown.clone());
             let allowed = http_allowed_hosts(&config, addr);
             let actions = action_registry(&config)?;
             let upstream =
@@ -462,8 +485,11 @@ async fn main() -> anyhow::Result<()> {
             served
         }
         Command::Mcp { dashboard, listen } => {
-            let store = open_store(&db)?;
             let shutdown = CancellationToken::new();
+            let path = db.clone();
+            let stop = shutdown.clone();
+            let store =
+                tokio::task::spawn_blocking(move || open_sqlite_until(&path, &stop)).await??;
             let dashboard_addr = mcp_dashboard_addr(dashboard, listen, &config)?;
             let collector = match CollectorLock::try_acquire(&db)? {
                 Some(lock) => Some(spawn_collector(
@@ -521,7 +547,7 @@ async fn main() -> anyhow::Result<()> {
             served
         }
         Command::Hub => {
-            let store = open_hub_store(&config, &db).await?;
+            let opener = hub_opener(&config, &db)?;
             let tokens = hub_tokens(&config)?;
             let addr: SocketAddr =
                 config.hub.listen.parse().with_context(|| {
@@ -537,17 +563,28 @@ async fn main() -> anyhow::Result<()> {
             };
             let shutdown = CancellationToken::new();
             watch_shutdown(shutdown.clone());
-            let maintained = shutdown.clone();
-            let maintain_store = store.clone();
+            let journal = pulseblade_mcp::journal::Journal::recover(&config.hub.snapshot_cache);
+            let first = opener.clone();
+            match tokio::task::spawn_blocking(move || first.open()).await {
+                Ok(Ok(store)) => journal.install(std::sync::Arc::new(store)),
+                Ok(Err(err)) => {
+                    tracing::warn!(error = %err, "hub database unavailable; serving cached snapshot");
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "hub database unavailable; serving cached snapshot");
+                }
+            }
+            let supervised = shutdown.clone();
             let history_days = config.history_days;
             let change_days = config.change_retention_days;
+            let retry = journal.clone();
             tokio::spawn(async move {
-                hub::maintain(maintain_store, maintained, history_days, change_days).await;
+                hub::supervise(retry, opener, supervised, history_days, change_days).await;
             });
             let allowed = http_allowed_hosts(&config, listener.local_addr()?);
             let actions = action_registry(&config)?;
-            let inner = hub::new_hub(
-                store.clone(),
+            let inner = hub::new_hub_journal(
+                journal,
                 tokens,
                 std::time::Duration::from_secs(config.hub.action_wait_secs.max(1)),
             );
@@ -555,12 +592,15 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Pilot { mcp_url, once } => {
             let url = pilot_mcp_url(&config, mcp_url);
-            let store = open_store(&db)?;
+            let shutdown = CancellationToken::new();
+            let path = db.clone();
+            let stop = shutdown.clone();
+            let store =
+                tokio::task::spawn_blocking(move || open_sqlite_until(&path, &stop)).await??;
             let pilot_cfg = config.pilot.clone();
             if once {
                 run_pilot(store, pilot_cfg, url, None)
             } else {
-                let shutdown = CancellationToken::new();
                 watch_shutdown(shutdown.clone());
                 tokio::task::spawn_blocking(move || {
                     run_pilot(store, pilot_cfg, url, Some(shutdown))
@@ -742,7 +782,7 @@ fn run_pilot(
                 }
             }
             Ok(Some(run)) => {
-                let id = store.insert_pilot_run(
+                let stored = store.insert_pilot_run(
                     &pulseblade_store::NewPilotRun {
                         trigger: run.trigger.clone(),
                         tier: run.tier.clone(),
@@ -755,7 +795,20 @@ fn run_pilot(
                         detail: run.detail.clone(),
                     },
                     chrono::Utc::now(),
-                )?;
+                );
+                let id = match stored {
+                    Ok(id) => id,
+                    Err(err) => {
+                        if shutdown.is_none() {
+                            return Err(err.into());
+                        }
+                        // The sidecar's own sqlite must not exit the process.
+                        // The hub container is separate; a crash here still
+                        // marks the pod unready and pulls the hub out of service.
+                        tracing::warn!(error = %err, "pilot run was not stored");
+                        continue;
+                    }
+                };
                 print_json(&serde_json::json!({
                     "id": id,
                     "status": run.status,
@@ -857,6 +910,30 @@ mod tests {
             mcp_dashboard_addr(false, Some(flag), &config).unwrap(),
             Some(flag)
         );
+    }
+
+    #[test]
+    fn sqlite_open_retries_until_the_parent_is_a_directory() {
+        let dir = std::env::temp_dir().join(format!("pb-sqlite-open-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let blocker = dir.join("blocked");
+        std::fs::write(&blocker, b"x").unwrap();
+        let db = blocker.join("pulseblade.db");
+        let shutdown = CancellationToken::new();
+        let stop = shutdown.clone();
+        let path = db.clone();
+        let handle = std::thread::spawn(move || open_sqlite_until(&path, &stop));
+        std::thread::sleep(std::time::Duration::from_millis(350));
+        assert!(
+            !handle.is_finished(),
+            "sqlite open exited before the path could be created"
+        );
+        std::fs::remove_file(&blocker).unwrap();
+        let store = handle.join().unwrap().unwrap();
+        assert_eq!(store.current_seq().unwrap(), 0);
+        shutdown.cancel();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

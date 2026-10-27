@@ -481,6 +481,9 @@ impl Store {
         };
         let pool = r2d2::Pool::builder()
             .max_size(8)
+            // A dead database must fail the checkout quickly so the hub can
+            // serve its cached snapshot instead of sitting on the 30s default.
+            .connection_timeout(std::time::Duration::from_secs(3))
             .build(PgManager { config, tls })
             .map_err(|e| StoreError::Database(e.to_string()))?;
         let store = Self {

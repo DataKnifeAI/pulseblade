@@ -20,6 +20,7 @@ use pulseblade_store::{Store, StoreError};
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::journal::{self, Journal, Read};
 use crate::prom;
 use crate::query::{self, Detail, QueryError};
 
@@ -28,7 +29,7 @@ const FAVICON_PNG: &[u8] = include_bytes!("../../../docs/assets/dashboard/favico
 
 #[derive(Clone)]
 struct AppState {
-    store: Arc<Store>,
+    journal: Arc<Journal>,
     started: DateTime<Utc>,
     actions: Arc<pulseblade_act::Registry>,
 }
@@ -45,6 +46,15 @@ pub fn router(store: Arc<Store>, started: DateTime<Utc>) -> Router {
 /// Same routes with the node's action registry (approval and the action list).
 pub fn router_with(
     store: Arc<Store>,
+    started: DateTime<Utc>,
+    actions: Arc<pulseblade_act::Registry>,
+) -> Router {
+    router_with_journal(journal::Journal::always(store), started, actions)
+}
+
+/// Same routes, using a hub journal that can serve a stale snapshot.
+pub fn router_with_journal(
+    journal: Arc<Journal>,
     started: DateTime<Utc>,
     actions: Arc<pulseblade_act::Registry>,
 ) -> Router {
@@ -68,7 +78,7 @@ pub fn router_with(
         .route("/metrics", get(prometheus))
         .nest("/api/v1", api)
         .with_state(AppState {
-            store,
+            journal,
             started,
             actions,
         })
@@ -111,16 +121,28 @@ impl From<QueryRejection> for ApiError {
     }
 }
 
-async fn blocking<T, F>(state: &AppState, f: F) -> Result<T, ApiError>
+async fn read_on<T, F>(journal: Arc<Journal>, f: F) -> Result<Read<T>, ApiError>
 where
     T: Send + 'static,
     F: FnOnce(&Store) -> query::Result<T> + Send + 'static,
 {
-    let store = state.store.clone();
-    tokio::task::spawn_blocking(move || f(&store))
-        .await
-        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .map_err(Into::into)
+    match tokio::task::spawn_blocking(move || journal.read(f)).await {
+        Ok(Ok(read)) => Ok(read),
+        Ok(Err(err)) => Err(err.into()),
+        Err(err) => Err(ApiError(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())),
+    }
+}
+
+/// Live JSON, or the cached summary when the database is down.
+async fn blocking<T, F>(state: &AppState, f: F) -> ApiResult
+where
+    T: serde::Serialize + Send + 'static,
+    F: FnOnce(&Store) -> query::Result<T> + Send + 'static,
+{
+    match read_on(state.journal.clone(), f).await? {
+        Read::Live(value) => ok(value),
+        Read::Stale(snap) => ok(snap),
+    }
 }
 
 type ApiResult = Result<Response, ApiError>;
@@ -131,7 +153,7 @@ fn ok<T: serde::Serialize>(v: T) -> ApiResult {
 
 async fn status(State(st): State<AppState>) -> ApiResult {
     let started = st.started;
-    ok(blocking(&st, move |s| query::status(s, Some(started))).await?)
+    blocking(&st, move |s| query::status(s, Some(started))).await
 }
 
 #[derive(Debug, Deserialize)]
@@ -171,7 +193,14 @@ async fn snapshot(
         unhealthy_only: q.unhealthy_only,
         limit: q.limit,
     };
-    ok(blocking(&st, move |s| query::snapshot(s, params)).await?)
+    let journal = st.journal.clone();
+    match read_on(journal.clone(), move |s| query::snapshot(s, params)).await? {
+        Read::Live(snap) => {
+            journal.remember(&snap);
+            ok(snap)
+        }
+        Read::Stale(snap) => ok(snap),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -189,7 +218,7 @@ async fn resource(
         id,
         changes_limit: q.changes_limit,
     };
-    ok(blocking(&st, move |s| query::explain(s, params)).await?)
+    blocking(&st, move |s| query::explain(s, params)).await
 }
 
 async fn metrics(
@@ -197,7 +226,7 @@ async fn metrics(
     q: Result<Query<query::MetricsParams>, QueryRejection>,
 ) -> ApiResult {
     let Query(params) = q?;
-    ok(blocking(&st, move |s| query::metrics(s, params)).await?)
+    blocking(&st, move |s| query::metrics(s, params)).await
 }
 
 async fn history(
@@ -205,7 +234,7 @@ async fn history(
     q: Result<Query<query::HistoryParams>, QueryRejection>,
 ) -> ApiResult {
     let Query(params) = q?;
-    ok(blocking(&st, move |s| query::history(s, params)).await?)
+    blocking(&st, move |s| query::history(s, params)).await
 }
 
 async fn search_events(
@@ -213,7 +242,7 @@ async fn search_events(
     q: Result<Query<query::EventSearchParams>, QueryRejection>,
 ) -> ApiResult {
     let Query(params) = q?;
-    ok(blocking(&st, move |s| query::search(s, params)).await?)
+    blocking(&st, move |s| query::search(s, params)).await
 }
 
 #[derive(Debug, Deserialize)]
@@ -238,11 +267,11 @@ async fn changes(
         limit: q.limit,
         compact: q.compact,
     };
-    ok(blocking(&st, move |s| query::changes(s, params)).await?)
+    blocking(&st, move |s| query::changes(s, params)).await
 }
 
 async fn checkpoints(State(st): State<AppState>) -> ApiResult {
-    ok(blocking(&st, query::checkpoints).await?)
+    blocking(&st, query::checkpoints).await
 }
 
 #[derive(Debug, Deserialize)]
@@ -264,7 +293,7 @@ async fn findings(
         limit: q.limit,
         detail: q.detail,
     };
-    ok(blocking(&st, move |s| query::findings(s, params)).await?)
+    blocking(&st, move |s| query::findings(s, params)).await
 }
 
 #[derive(Debug, Deserialize)]
@@ -275,10 +304,10 @@ struct LogsQuery {
 }
 
 async fn actions_list(State(st): State<AppState>) -> ApiResult {
-    ok(blocking(&st, |s| {
+    blocking(&st, |s| {
         Ok(serde_json::json!({ "runs": s.recent_actions(None, 20)? }))
     })
-    .await?)
+    .await
 }
 
 async fn approve_action(
@@ -300,11 +329,28 @@ async fn approve_action(
         }
     }
     let actions = st.actions.clone();
-    let store = st.store.clone();
-    let run = tokio::task::spawn_blocking(move || actions.approve(&store, &id))
-        .await
-        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .map_err(act_error)?;
+    let journal = st.journal.clone();
+    let run = tokio::task::spawn_blocking(move || {
+        let Some(store) = journal.store() else {
+            return Err(ApiError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "database unavailable".into(),
+            ));
+        };
+        match actions.approve(&store, &id) {
+            Ok(run) => Ok(run),
+            Err(pulseblade_act::ActError::Store(err)) if journal::is_down(&err) => {
+                journal.mark_down();
+                Err(ApiError(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "database unavailable".into(),
+                ))
+            }
+            Err(err) => Err(act_error(err)),
+        }
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
     ok(run)
 }
 
@@ -340,7 +386,7 @@ async fn logs(
         since: q.since,
         limit: q.limit,
     };
-    ok(blocking(&st, move |s| query::logs(s, params)).await?)
+    blocking(&st, move |s| query::logs(s, params)).await
 }
 
 async fn favicon() -> Response {
@@ -355,8 +401,12 @@ async fn favicon() -> Response {
 }
 
 async fn prometheus(State(st): State<AppState>) -> ApiResult {
-    let text = blocking(&st, prom::render).await?;
-    Ok(([(header::CONTENT_TYPE, prom::CONTENT_TYPE)], text).into_response())
+    match read_on(st.journal.clone(), prom::render).await? {
+        Read::Live(text) => {
+            Ok(([(header::CONTENT_TYPE, prom::CONTENT_TYPE)], text).into_response())
+        }
+        Read::Stale(snap) => ok(snap),
+    }
 }
 
 /// Reject requests whose `Host` is not in `allowed` (DNS-rebinding protection).
