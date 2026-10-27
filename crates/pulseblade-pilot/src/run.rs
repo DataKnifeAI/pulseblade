@@ -115,15 +115,16 @@ impl Session {
         let wake_findings = self.config.wakes_on("findings") && !fresh.is_empty();
         let wake_changes = self.config.wakes_on("changes") && !change_list.is_empty();
         // An unchanged heartbeat is not a recheck. Every open finding that still
-        // has the signature from the last investigate stays quiet.
+        // has the signature from the last investigate stays quiet. No open
+        // finding means no model call: ordinary cluster changes are not a wake
+        // unless `wake_on` includes changes, and that path is `wake_changes`.
         let signatures_hold = !open.is_empty()
             && open.iter().all(|finding| {
                 self.signatures
                     .get(&finding.id)
                     .is_some_and(|sig| sig == &finding_signature(finding))
             });
-        let wake_heart =
-            heartbeat_due && !signatures_hold && (!open.is_empty() || !change_list.is_empty());
+        let wake_heart = heartbeat_due && !open.is_empty() && !signatures_hold;
         let trigger = if wake_findings {
             format!("finding:{}", fresh[0].id)
         } else if wake_changes {
@@ -1540,6 +1541,43 @@ mod tests {
             .is_none());
         assert!(chat.urls.is_empty());
         assert!(!tools.calls.iter().any(|c| c == "action_execute"));
+    }
+
+    #[test]
+    fn heartbeat_does_not_call_the_model_without_a_finding() {
+        let mut config = local_config();
+        config.wake_on = vec!["findings".into()];
+        config.heartbeat_secs = 10;
+        let start = Instant::now();
+        let mut session = Session::new(config, start);
+        let mut tools = quiet_tools(
+            json!({"as_of_seq": 8, "findings": []}),
+            json!({
+                "as_of_seq": 8,
+                "changes": [{
+                    "resource_id": "workload:c:ns:deployment:api",
+                    "kind": "changed",
+                    "field": "health",
+                    "before": "ok",
+                    "after": "failed"
+                }]
+            }),
+        );
+        let mut chat = ScriptChat {
+            rounds: vec![],
+            n: 0,
+            urls: vec![],
+        };
+        assert!(session
+            .tick(&mut tools, &mut chat, start)
+            .unwrap()
+            .is_none());
+        assert!(session
+            .tick(&mut tools, &mut chat, start + Duration::from_secs(11))
+            .unwrap()
+            .is_none());
+        assert_eq!(chat.n, 0);
+        assert!(chat.urls.is_empty());
     }
 
     #[test]
