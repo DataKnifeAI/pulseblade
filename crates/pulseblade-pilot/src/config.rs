@@ -36,12 +36,24 @@ pub struct TierConfig {
     pub endpoints: Vec<EndpointConfig>,
 }
 
+/// Per-run limits, then spend caps across runs. The caps count the pilot's own
+/// recorded runs, so a restart does not reset them. Zero blocks every model
+/// call for that cap, except `failure_backoff_secs`, where zero means retry on
+/// the next poll.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct BudgetConfig {
     pub max_tool_calls: u32,
     pub max_tokens: u32,
     pub max_wall_secs: u64,
+    /// Tokens across every run in a rolling 24 hours.
+    pub max_tokens_per_day: u32,
+    /// Model runs in a rolling hour.
+    pub max_runs_per_hour: u32,
+    /// Model runs that include one resource in a rolling 24 hours.
+    pub max_runs_per_resource_per_day: u32,
+    /// Wait after a run where no endpoint answered. Doubles per failure, up to 6 hours.
+    pub failure_backoff_secs: u64,
 }
 
 impl Default for BudgetConfig {
@@ -50,6 +62,10 @@ impl Default for BudgetConfig {
             max_tool_calls: 12,
             max_tokens: 20_000,
             max_wall_secs: 120,
+            max_tokens_per_day: 200_000,
+            max_runs_per_hour: 6,
+            max_runs_per_resource_per_day: 2,
+            failure_backoff_secs: 600,
         }
     }
 }
@@ -126,6 +142,10 @@ mod tests {
             max_tool_calls = 12
             max_tokens = 20000
             max_wall_secs = 120
+            max_tokens_per_day = 200000
+            max_runs_per_hour = 6
+            max_runs_per_resource_per_day = 2
+            failure_backoff_secs = 600
 
             [[tiers]]
             name = "triage"

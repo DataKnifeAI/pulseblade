@@ -180,6 +180,7 @@ External agent runtimes such as Hermes Agent do not need the pilot at all: they 
 - **Start from summaries and cursors.** Summary snapshot, `changes_since` from the last seen `as_of_seq`, `if_changed_since` on re-checks.
 - **Cap tool outputs** (limits, `detail=brief` at most, short `metrics_query` ranges) and truncate anything that still exceeds a per-call ceiling.
 - **Budgets per investigation:** max tool calls, tokens, and wall time; token usage reported by the endpoint is recorded per run.
+- **Spend caps across runs:** tokens per rolling day, runs per hour, runs per resource per day, and a doubling backoff after no endpoint answered. Caps are rebuilt from recorded runs at start. A provider-side limit on each API key is the backstop.
 - **Prompt-cache friendly:** a stable system prompt and tool definitions first, variable context last.
 - **Memory over re-derivation:** prior investigation notes on a resource are loaded before re-investigating it.
 

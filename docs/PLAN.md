@@ -42,7 +42,7 @@ Cargo workspace, CI (`make vet`, `make test`), Makefile, license, README, archit
 ### M4 — Pilot (done, [#6](https://github.com/DataKnifeAI/pulseblade/issues/6))
 
 - `pulseblade-pilot` crate and `pulseblade pilot` command: an MCP client driven by any OpenAI-compatible endpoint, local (e.g. Ollama, vLLM) or remote (e.g. OpenRouter), with tiered routing and fallback ([design](ARCHITECTURE.md#pilot-planned-m4)).
-- Event-driven: wakes on new findings and a slow heartbeat, never per collection pass.
+- Event-driven: wakes on a new or changed finding and on a health failure, never on a timer or per collection pass.
 - Investigates with the read tools, writes conclusions as notes, proposes actions through `action_plan`; `auto`-tier actions only if the operator enables it.
 - Budgets: max tool calls, tokens, and wall time per investigation; every run recorded.
 - Works against a node or a hub without changes.
@@ -63,6 +63,17 @@ Cargo workspace, CI (`make vet`, `make test`), Makefile, license, README, archit
 - Collector and actions (`k8s.rollout_restart`, `k8s.scale`) behind a `k8s` feature (`kube`). Ids: `knode:<cluster>:<name>`, `workload:<cluster>:<ns>:<kind>:<name>`, `pod:<cluster>:<ns>:<name>`. Warning events are log lines on the involved object. An empty API URL leaves the collector off.
 - DaemonSet and Helm chart under `deploy/k8s` and `deploy/helm/pulseblade`.
 - Prometheus interop: `[[prometheus]]` scrapes text `/metrics` targets into `prom:<host>:<name>` samples (exposing `/metrics` shipped in M1.1).
+
+### M8 — LLM spend guardrails (in progress)
+
+A model call is never the default. Every path that can reach a provider has a cap, and the caps hold across restarts.
+
+- Wake only on a new or changed finding, or a health failure. A timer, a routine journal line, and a number that changes in a finding summary are not a wake. One look per incident, including after an escalate or error.
+- Caps in `[pilot.budget]`, checked before every call: tokens per rolling day, runs per rolling hour, runs per resource per day, and a doubling backoff (up to 6 hours) after no endpoint answered. Counted from recorded `pilot_runs`, so a restart does not reset them. A held wake is recorded once as `capped` with zero tokens.
+- Per-run limits stay: tool calls, tokens, and wall time.
+- Backstop outside Pulseblade: a spend limit on every provider API key (for example, a credit limit on each OpenRouter key), one key per environment, so a bug cannot bill past that limit.
+- Next: estimated dollars per run from configured per-model prices, a dollar cap per day, cap state on `/api/v1/status` and the dashboard, and an alert when a cap holds a wake.
+- Next: a cheap triage tier before the investigation model, so a known or noisy finding never reaches the expensive model.
 
 ### Later
 

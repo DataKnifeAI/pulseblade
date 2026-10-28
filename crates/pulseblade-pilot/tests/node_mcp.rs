@@ -159,6 +159,7 @@ fn failed_unit_notes_and_plans_a_restart_over_mcp() {
                 proposed: run.proposed,
                 status: run.status,
                 detail: run.detail,
+                subjects: run.subjects,
             },
             Utc::now(),
         )

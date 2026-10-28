@@ -21,7 +21,7 @@ pub use actions::{ActionTransition, NewAction};
 pub use history::{MetricBucket, StoredEvent, BUCKET_MS, DEFAULT_HISTORY_DAYS, HUB_RAW_HOURS};
 pub use hub::{IngestResult, NodeBatch, NodeCursor, NodePush, RouteJob, StampedSample};
 pub use memory::{FindingDraft, FindingFilter};
-pub use pilot::{NewPilotRun, PilotRunRow};
+pub use pilot::{NewPilotRun, PilotRunRow, PilotSpend};
 pub use remedies::{ActionRejection, RemedyPage, RemedyRow};
 
 use pulseblade_core::{
@@ -404,6 +404,7 @@ pub(crate) fn ensure_later_columns(sql: &mut dyn sql::Sql) -> Result<()> {
     ensure_column(sql, "action_runs", "basis", "TEXT")?;
     ensure_column(sql, "route_plans", "finding_id", "TEXT")?;
     ensure_column(sql, "route_plans", "resource_id", "TEXT")?;
+    ensure_column(sql, "pilot_runs", "subjects", "TEXT NOT NULL DEFAULT ''")?;
     sql.execute(
         "CREATE INDEX IF NOT EXISTS route_plans_resource ON route_plans(resource_id)",
         &[],

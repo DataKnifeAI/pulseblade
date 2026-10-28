@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 use crate::chat::{parse_completion, Chat};
 use crate::config::{is_loopback, EndpointConfig, PilotConfig, TierConfig};
 use crate::mcp::Tools;
+use crate::spend::{Ledger, SpendRecord};
 
 const SYSTEM: &str = "\
 You are the Pulseblade pilot. Investigate one incident using the tools. \
@@ -51,6 +52,8 @@ pub struct PilotRun {
     pub proposed: Vec<String>,
     pub status: String,
     pub detail: String,
+    /// Resource ids a model run looked at. Empty when no model was called.
+    pub subjects: Vec<String>,
 }
 
 pub struct Session {
@@ -61,6 +64,9 @@ pub struct Session {
     signatures: BTreeMap<String, String>,
     /// Failure changes already sent to the model. A replay is not a new failure.
     change_seen: BTreeSet<String>,
+    spend: Ledger,
+    /// The cap reason already reported, so a held wake is recorded once.
+    capped: Option<String>,
 }
 
 impl Session {
@@ -71,7 +77,14 @@ impl Session {
             seen: BTreeSet::new(),
             signatures: BTreeMap::new(),
             change_seen: BTreeSet::new(),
+            spend: Ledger::default(),
+            capped: None,
         }
+    }
+
+    /// Model runs already recorded, so the spend caps survive a restart.
+    pub fn seed_spend(&mut self, records: Vec<SpendRecord>, now: Instant) {
+        self.spend.seed(records, now);
     }
 
     /// Poll MCP. Returns `Ok(None)` when nothing needs a model.
@@ -79,7 +92,7 @@ impl Session {
         &mut self,
         tools: &mut T,
         chat: &mut C,
-        _now: Instant,
+        now: Instant,
     ) -> Result<Option<PilotRun>, String> {
         let findings = tools.call(
             "findings_list",
@@ -200,16 +213,41 @@ impl Session {
             }
             model_focus.push(finding.clone());
         }
+        // A resource that already had its runs today is not sent again, even
+        // when its finding text changes.
+        let budget = &self.config.budget;
+        model_focus.retain(|f| !self.spend.resource_spent(budget, &f.resource_id, now));
+        let change_list: Vec<Value> = change_list
+            .into_iter()
+            .filter(|c| !self.spend.resource_spent(budget, change_resource(c), now))
+            .collect();
+        let wants_model = !model_focus.is_empty() || !change_list.is_empty();
+        let held = if wants_model {
+            self.spend.blocked(budget, now)
+        } else {
+            None
+        };
+        // A wake held by a cap stays unseen, so it runs once the cap clears.
+        let deferred: BTreeSet<&str> = if held.is_some() {
+            model_focus.iter().map(|f| f.id.as_str()).collect()
+        } else {
+            BTreeSet::new()
+        };
         for finding in &open {
+            if deferred.contains(finding.id.as_str()) {
+                continue;
+            }
             self.seen.insert(finding.id.clone());
             self.signatures
                 .insert(finding.id.clone(), finding_signature(finding));
         }
-        for change in &change_list {
-            self.change_seen.insert(change_signature(change));
+        if held.is_none() {
+            for change in &change_list {
+                self.change_seen.insert(change_signature(change));
+            }
+            self.seq = seq;
         }
-        self.seq = seq;
-        if change_list.is_empty() && model_focus.is_empty() && !filed.is_empty() {
+        if !filed.is_empty() && (held.is_some() || !wants_model) {
             return Ok(Some(PilotRun {
                 trigger,
                 tier: String::new(),
@@ -220,16 +258,63 @@ impl Session {
                 proposed: filed,
                 status: "remedy".into(),
                 detail: "action_plan".into(),
+                subjects: Vec::new(),
             }));
         }
-        // Every finding already has a plan, and nothing new failed.
-        if change_list.is_empty() && model_focus.is_empty() && !focus.is_empty() {
+        if let Some(reason) = held {
+            if self.capped.as_deref() == Some(reason_kind(&reason)) {
+                return Ok(None);
+            }
+            self.capped = Some(reason_kind(&reason).to_string());
+            return Ok(Some(PilotRun {
+                trigger,
+                tier: String::new(),
+                endpoint: String::new(),
+                tool_calls: 0,
+                tokens: 0,
+                conclusion: format!("model call held: {reason}"),
+                proposed: Vec::new(),
+                status: "capped".into(),
+                detail: String::new(),
+                subjects: Vec::new(),
+            }));
+        }
+        self.capped = None;
+        if !wants_model {
             return Ok(None);
         }
+        let mut subjects: Vec<String> = model_focus
+            .iter()
+            .map(|f| f.resource_id.clone())
+            .chain(change_list.iter().map(|c| change_resource(c).to_string()))
+            .collect();
+        subjects.sort();
+        subjects.dedup();
         let digest = digest(&model_focus, &change_list, &notes, &closest, &denials, seq);
-        let run = investigate(&self.config, tools, chat, &trigger, &digest, &model_focus);
+        let mut run = investigate(&self.config, tools, chat, &trigger, &digest, &model_focus);
+        run.subjects = subjects;
+        self.spend
+            .record(now, run.tokens, run.subjects.clone(), run.status == "error");
         Ok(Some(run))
     }
+}
+
+/// The cap that held a wake, without the counts that change every poll.
+fn reason_kind(reason: &str) -> &str {
+    if reason.contains("no endpoint answer") {
+        "failure"
+    } else if reason.contains("tokens") {
+        "tokens"
+    } else {
+        "runs"
+    }
+}
+
+fn change_resource(change: &Value) -> &str {
+    change
+        .get("resource_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
 }
 
 fn change_signature(change: &Value) -> String {
@@ -245,10 +330,25 @@ fn change_signature(change: &Value) -> String {
     )
 }
 
+/// Numbers in a summary are not a change. `no push for 19s` and `no push for
+/// 54s` are the same incident.
 fn finding_signature(finding: &OpenFinding) -> String {
+    let mut summary = String::with_capacity(finding.summary.len());
+    let mut in_number = false;
+    for ch in finding.summary.chars() {
+        if ch.is_ascii_digit() {
+            if !in_number {
+                summary.push('#');
+            }
+            in_number = true;
+        } else {
+            summary.push(ch);
+            in_number = false;
+        }
+    }
     format!(
         "{}\n{}\n{}\n{}\n{}",
-        finding.id, finding.resource_id, finding.rule, finding.severity, finding.summary
+        finding.id, finding.resource_id, finding.rule, finding.severity, summary
     )
 }
 
@@ -272,6 +372,7 @@ fn file_open_probe_fixes<T: Tools>(tools: &mut T, open: &[OpenFinding]) -> Optio
         proposed: filed,
         status: "remedy".into(),
         detail: "action_plan".into(),
+        subjects: Vec::new(),
     })
 }
 
@@ -403,6 +504,7 @@ fn investigate<T: Tools, C: Chat>(
         proposed: Vec::new(),
         status: "error".into(),
         detail: String::new(),
+        subjects: Vec::new(),
     };
     if tiers.is_empty() {
         run.detail = "no usable endpoint".into();
@@ -1915,12 +2017,136 @@ mod tests {
             .is_none());
         assert!(chat.urls.is_empty());
         tools.findings["findings"][0]["summary"] = json!("sshd.service failed differently");
-        let woke = session
+        let held = session
             .tick(&mut tools, &mut chat, start + Duration::from_secs(22))
+            .unwrap()
+            .unwrap();
+        assert_eq!(held.status, "capped");
+        assert_eq!(held.tokens, 0);
+        assert!(session
+            .tick(&mut tools, &mut chat, start + Duration::from_secs(60))
+            .unwrap()
+            .is_none());
+        let woke = session
+            .tick(&mut tools, &mut chat, start + Duration::from_secs(611))
             .unwrap()
             .unwrap();
         assert_eq!(woke.trigger, "finding:f1");
         assert_eq!(woke.status, "error");
+    }
+
+    #[test]
+    fn a_counting_summary_is_one_incident() {
+        let mut session = Session::new(local_config(), Instant::now());
+        let mut tools = quiet_tools(
+            json!({
+                "as_of_seq": 4,
+                "findings": [{
+                    "id": "f-off",
+                    "resource_id": "host:lee-cachy",
+                    "severity": "critical",
+                    "summary": "lee-cachy offline (last health ok); no push for 19s",
+                    "rule": "host offline"
+                }]
+            }),
+            empty_changes(),
+        );
+        let mut chat = ScriptChat {
+            rounds: vec![completion(json!([]), "offline")],
+            n: 0,
+            urls: vec![],
+        };
+        let start = Instant::now();
+        assert!(session
+            .tick(&mut tools, &mut chat, start)
+            .unwrap()
+            .is_some());
+        let calls = chat.n;
+        for age in [54, 17789, 18079] {
+            tools.findings["findings"][0]["summary"] = json!(format!(
+                "lee-cachy offline (last health ok); no push for {age}s"
+            ));
+            assert!(session
+                .tick(&mut tools, &mut chat, start + Duration::from_secs(age))
+                .unwrap()
+                .is_none());
+        }
+        assert_eq!(chat.n, calls);
+    }
+
+    #[test]
+    fn a_resource_is_not_investigated_past_its_daily_cap() {
+        let mut config = local_config();
+        config.budget.max_runs_per_resource_per_day = 1;
+        let start = Instant::now();
+        let mut session = Session::new(config, start);
+        session.seed_spend(
+            vec![SpendRecord {
+                age: Duration::from_secs(600),
+                tokens: 9000,
+                subjects: vec!["unit:web1:sshd.service".into()],
+                failed: false,
+            }],
+            start,
+        );
+        let mut tools = quiet_tools(finding_page(), empty_changes());
+        let mut chat = ScriptChat {
+            rounds: vec![completion(json!([]), "should not run")],
+            n: 0,
+            urls: vec![],
+        };
+        assert!(session
+            .tick(&mut tools, &mut chat, start)
+            .unwrap()
+            .is_none());
+        tools.findings["findings"][0]["summary"] = json!("sshd.service failed differently");
+        assert!(session
+            .tick(&mut tools, &mut chat, start)
+            .unwrap()
+            .is_none());
+        assert_eq!(chat.n, 0);
+    }
+
+    #[test]
+    fn the_daily_token_cap_holds_a_new_finding_until_it_clears() {
+        let mut config = local_config();
+        config.budget.max_tokens_per_day = 10_000;
+        let start = Instant::now();
+        let mut session = Session::new(config, start);
+        session.seed_spend(
+            vec![SpendRecord {
+                age: Duration::from_secs(3600),
+                tokens: 10_000,
+                subjects: vec!["host:other".into()],
+                failed: false,
+            }],
+            start,
+        );
+        let mut tools = quiet_tools(finding_page(), empty_changes());
+        let mut chat = ScriptChat {
+            rounds: vec![completion(json!([]), "after the cap")],
+            n: 0,
+            urls: vec![],
+        };
+        let held = session.tick(&mut tools, &mut chat, start).unwrap().unwrap();
+        assert_eq!(held.status, "capped");
+        assert!(held.conclusion.contains("tokens"));
+        assert!(session
+            .tick(&mut tools, &mut chat, start + Duration::from_secs(30))
+            .unwrap()
+            .is_none());
+        assert_eq!(chat.n, 0);
+        let run = session
+            .tick(
+                &mut tools,
+                &mut chat,
+                start + Duration::from_secs(23 * 3600 + 1),
+            )
+            .unwrap()
+            .expect("the held finding runs once the cap clears");
+        assert_eq!(run.trigger, "finding:f1");
+        assert_eq!(run.subjects, vec!["unit:web1:sshd.service".to_string()]);
+        assert_eq!(chat.n, 1);
     }
 
     #[test]

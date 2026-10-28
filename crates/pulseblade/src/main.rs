@@ -814,7 +814,22 @@ fn run_pilot(
     mcp_url: String,
     shutdown: Option<CancellationToken>,
 ) -> anyhow::Result<()> {
-    let mut session = pulseblade_pilot::Session::new(config.clone(), std::time::Instant::now());
+    let started = std::time::Instant::now();
+    let mut session = pulseblade_pilot::Session::new(config.clone(), started);
+    let wall = chrono::Utc::now();
+    let spent = store.pilot_spend_since(wall - chrono::Duration::hours(24))?;
+    session.seed_spend(
+        spent
+            .into_iter()
+            .map(|row| pulseblade_pilot::SpendRecord {
+                age: (wall - row.ts).to_std().unwrap_or_default(),
+                tokens: row.tokens,
+                subjects: row.subjects,
+                failed: row.status == "error",
+            })
+            .collect(),
+        started,
+    );
     let mut chat = pulseblade_pilot::HttpChat;
     let poll = std::time::Duration::from_secs(config.poll_secs.max(1));
     loop {
@@ -841,6 +856,7 @@ fn run_pilot(
                         proposed: run.proposed.clone(),
                         status: run.status.clone(),
                         detail: run.detail.clone(),
+                        subjects: run.subjects.clone(),
                     },
                     chrono::Utc::now(),
                 );
