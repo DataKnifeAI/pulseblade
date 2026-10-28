@@ -86,3 +86,11 @@ Not built, until access is sorted:
 - iDRAC hosts `idrac01`, `idrac02`, and `idrac05`
 
 Also still later: cloud collectors (AWS, Azure, GCP) and hub-of-hubs.
+
+To revisit: push updates to downstream agents. Today each node is upgraded by hand (a DaemonSet image roll per cluster, or a rebuilt binary and a systemd restart), so nodes drift: some clusters and the local workstation still run older builds without later fixes. Look at:
+
+- The hub showing each node's version and build, and flagging nodes behind the hub.
+- The hub offering a target version, with the node pulling and applying it over its existing outbound connection (no inbound ports), and the node's own policy deciding whether to accept.
+- A staged rollout: one node first, then the rest, with a pause and automatic stop if the updated node goes offline or unhealthy.
+- Suppressing the host-offline findings (and the pilot model calls they trigger) caused by a planned restart.
+- Signed artifacts and a rollback to the previous build.
