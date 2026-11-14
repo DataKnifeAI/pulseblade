@@ -660,15 +660,19 @@ impl Store {
             Ok(())
         })?;
         // Same-node pushes serialize on the cursor row. Overlapping keys from
-        // other nodes can still deadlock; the upserts are sorted and one
-        // retry covers Postgres 40P01.
-        let result = self
+        // other nodes can still deadlock; the upserts are sorted and a short
+        // retry covers Postgres 40P01. A leftover deadlock stays a request
+        // error and does not take the hub down.
+        let mut result = self
             .transaction(|sql| ingest_batch(sql, node_id, batch, &changes, interval, pushed_ms));
-        let result = if matches!(&result, Err(err) if is_deadlock(err)) {
-            self.transaction(|sql| ingest_batch(sql, node_id, batch, &changes, interval, pushed_ms))
-        } else {
-            result
-        };
+        for _ in 0..3 {
+            if !matches!(&result, Err(err) if is_deadlock(err)) {
+                break;
+            }
+            result = self.transaction(|sql| {
+                ingest_batch(sql, node_id, batch, &changes, interval, pushed_ms)
+            });
+        }
         // Only resources in this batch. An empty push must not close a health
         // finding the caller opened against a resource that is already ok.
         if result.is_ok() {

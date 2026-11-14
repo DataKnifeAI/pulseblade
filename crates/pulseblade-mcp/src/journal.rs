@@ -127,6 +127,7 @@ impl Journal {
         match f(&store) {
             Ok(v) => Ok(Read::Live(v)),
             Err(QueryError::Store(err)) if is_down(&err) => {
+                tracing::warn!(error = %err, "hub database connection failed");
                 self.mark_down();
                 Ok(Read::Stale(self.stale()))
             }
@@ -145,6 +146,7 @@ impl Journal {
         match f(&store) {
             Ok(v) => Ok(v),
             Err(err) if is_down(&err) => {
+                tracing::warn!(error = %err, "hub database connection failed");
                 self.mark_down();
                 Err(WriteError::Unavailable)
             }
@@ -153,8 +155,33 @@ impl Journal {
     }
 }
 
+/// The pool should be dropped only when Postgres itself cannot be reached.
+/// A deadlock, a constraint failure, or a checkout that waited out the pool
+/// are request errors. Treating them as an outage takes the hub offline while
+/// the primary is fine.
 pub fn is_down(err: &StoreError) -> bool {
-    matches!(err, StoreError::Database(_))
+    let StoreError::Database(message) = err else {
+        return false;
+    };
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("timed out waiting for connection") {
+        return false;
+    }
+    match sqlstate(&lower) {
+        Some(code) => {
+            code.starts_with("08") || matches!(code, "57p01" | "57p02" | "57p03")
+        }
+        None => true,
+    }
+}
+
+fn sqlstate(message: &str) -> Option<&str> {
+    let code = message.split(':').next()?.trim();
+    if code.len() == 5 && code.chars().all(|c| c.is_ascii_alphanumeric()) {
+        Some(code)
+    } else {
+        None
+    }
 }
 
 fn load_cache(path: &Path) -> Option<Snapshot> {
@@ -218,6 +245,26 @@ mod tests {
     use super::*;
     use crate::query::{snapshot, SnapshotParams};
     use pulseblade_core::{Health, Observation, Resource, ResourceKind};
+
+    #[test]
+    fn a_deadlock_or_a_busy_pool_is_not_an_outage() {
+        assert!(is_down(&StoreError::Database(
+            "error communicating with the server: connection reset".into()
+        )));
+        assert!(is_down(&StoreError::Database(
+            "57P01: terminating connection due to administrator command".into()
+        )));
+        assert!(!is_down(&StoreError::Database(
+            "40P01: deadlock detected".into()
+        )));
+        assert!(!is_down(&StoreError::Database(
+            "23505: duplicate key value violates unique constraint".into()
+        )));
+        assert!(!is_down(&StoreError::Database(
+            "timed out waiting for connection".into()
+        )));
+        assert!(!is_down(&StoreError::Invalid("database".into())));
+    }
 
     #[test]
     fn cache_file_round_trips_and_serves_stale() {
