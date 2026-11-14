@@ -168,9 +168,7 @@ pub fn is_down(err: &StoreError) -> bool {
         return false;
     }
     match sqlstate(&lower) {
-        Some(code) => {
-            code.starts_with("08") || matches!(code, "57p01" | "57p02" | "57p03")
-        }
+        Some(code) => code.starts_with("08") || matches!(code, "57p01" | "57p02" | "57p03"),
         None => true,
     }
 }
