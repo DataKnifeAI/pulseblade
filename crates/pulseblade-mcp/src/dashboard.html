@@ -590,7 +590,7 @@ function reason(r) {
     case "workload": return `${a.ready || (m["k8s.ready"] != null ? m["k8s.ready"] + "/" + (m["k8s.replicas"] ?? "?") : "?")} ready`;
     case "disk":
       if (m["disk.temp_c"] != null && m["disk.used_pct"] == null) return `${fmt("disk.temp_c", m["disk.temp_c"])}°C${a.pool ? " · " + a.pool : ""}`;
-      if (a.read_only && r.name === "/") return "read-only";
+      if (a.read_only && r.name === "/") return "root is ro";
       return `${fmt("disk.used_pct", m["disk.used_pct"])} full · ${bytes(m["disk.available_bytes"])} free${m["disk.inode_pct"] >= 90 ? " · inodes " + fmt("disk.inode_pct", m["disk.inode_pct"]) : ""}`;
     case "sensor": {
       if (m["temp.c"] != null) return `${fmt("temp.c", m["temp.c"])}°C`;

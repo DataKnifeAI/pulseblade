@@ -271,6 +271,7 @@ fn clip(s: &str, max: usize) -> String {
 }
 
 /// Build a view from the JSON-RPC results. Missing objects are skipped.
+#[allow(clippy::too_many_arguments)]
 pub fn parse_truenas(
     name: &str,
     info: &Value,
@@ -698,7 +699,7 @@ mod tests {
         let obs = observe_truenas(&view, Utc::now());
         assert_eq!(obs.resources[0].health, Health::Ok);
         assert_eq!(obs.resources[1].health, Health::Ok);
-        assert!(obs.resources[0].attrs.get("fault").is_none());
+        assert!(!obs.resources[0].attrs.contains_key("fault"));
     }
 
     #[test]
