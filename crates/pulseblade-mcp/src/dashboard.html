@@ -996,7 +996,7 @@ function wantedSeries(m) {
   if (m.host) { push(m.host, "cpu.used_pct"); push(m.host, "mem.used_pct"); }
   const disks = m.rs.filter((r) => r.kind === "disk" && r.metrics["disk.used_pct"] != null).sort((a, b) => b.metrics["disk.used_pct"] - a.metrics["disk.used_pct"]);
   if (disks[0]) push(disks[0], "disk.used_pct");
-  for (const s of m.rs.filter((r) => r.kind === "sensor" && (s.metrics["pressure.memory_pct"] != null || s.metrics["pressure.io_pct"] != null))) {
+  for (const s of m.rs.filter((r) => r.kind === "sensor" && r.metrics && (r.metrics["pressure.memory_pct"] != null || r.metrics["pressure.io_pct"] != null))) {
     push(s, "pressure.memory_pct");
     push(s, "pressure.io_pct");
   }
