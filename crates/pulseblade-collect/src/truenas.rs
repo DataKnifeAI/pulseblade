@@ -279,6 +279,7 @@ pub fn parse_truenas(
     disks: &Value,
     alerts: &Value,
     jobs: &Value,
+    temperatures: &Value,
     limits: HwLimits,
 ) -> NasView {
     let version = info
@@ -296,6 +297,7 @@ pub fn parse_truenas(
         limits,
     };
     let dataset_rows = rows(datasets);
+    let membership = pool_membership(pools);
     for row in rows(pools) {
         let Some(pool_name) = row.get("name").and_then(|v| v.as_str()) else {
             continue;
@@ -327,12 +329,15 @@ pub fn parse_truenas(
         let pool = row
             .get("pool")
             .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| membership.get(dev).cloned())
+            .unwrap_or_default();
+        let temp_c = num(row.get("temperature")).or_else(|| num(temperatures.get(dev)));
         view.disks.push(NasDisk {
             name: dev.to_string(),
             pool,
-            temp_c: num(row.get("temperature")),
+            temp_c,
         });
     }
     for row in rows(alerts) {
@@ -378,6 +383,42 @@ pub fn parse_truenas(
         }
     }
     view
+}
+
+fn pool_membership(pools: &Value) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    for pool in rows(pools) {
+        let Some(name) = pool.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(topo) = pool.get("topology").and_then(|v| v.as_object()) else {
+            continue;
+        };
+        for group in topo.values() {
+            walk_vdev(group, name, &mut out);
+        }
+    }
+    out
+}
+
+fn walk_vdev(node: &Value, pool: &str, out: &mut std::collections::BTreeMap<String, String>) {
+    if let Some(rows) = node.as_array() {
+        for child in rows {
+            walk_vdev(child, pool, out);
+        }
+        return;
+    }
+    let Some(obj) = node.as_object() else {
+        return;
+    };
+    if let Some(disk) = obj.get("disk").and_then(|v| v.as_str()) {
+        if !disk.is_empty() {
+            out.insert(disk.to_string(), pool.to_string());
+        }
+    }
+    if let Some(children) = obj.get("children") {
+        walk_vdev(children, pool, out);
+    }
 }
 
 fn dataset_usage(rows: &[&Value], pool: &str) -> (f64, f64) {
@@ -446,9 +487,11 @@ impl TrueNasSource for LiveTrueNas {
         let pools = rpc(&mut socket, 3, "pool.query", serde_json::json!([]))?;
         let datasets = rpc(&mut socket, 4, "pool.dataset.query", serde_json::json!([]))?;
         let disks = rpc(&mut socket, 5, "disk.query", serde_json::json!([]))?;
-        let alerts = rpc(&mut socket, 6, "alert.list", serde_json::json!([]))?;
+        let temperatures =
+            rpc(&mut socket, 6, "disk.temperatures", serde_json::json!([])).unwrap_or(Value::Null);
+        let alerts = rpc(&mut socket, 7, "alert.list", serde_json::json!([]))?;
         let jobs =
-            rpc(&mut socket, 7, "replication.query", serde_json::json!([])).unwrap_or(Value::Null);
+            rpc(&mut socket, 8, "replication.query", serde_json::json!([])).unwrap_or(Value::Null);
         let _ = socket.close(None);
         Ok(parse_truenas(
             &self.target.name,
@@ -458,6 +501,7 @@ impl TrueNasSource for LiveTrueNas {
             &disks,
             &alerts,
             &jobs,
+            &temperatures,
             self.target.limits,
         ))
     }
@@ -609,6 +653,7 @@ mod tests {
             &serde_json::json!([
                 {"name": "offsite", "state": {"state": "ERROR"}}
             ]),
+            &serde_json::json!({}),
             limits(),
         );
         let now = Utc.with_ymd_and_hms(2026, 11, 15, 0, 0, 0).unwrap();
@@ -647,11 +692,43 @@ mod tests {
             &serde_json::json!([]),
             &serde_json::json!([]),
             &serde_json::json!([]),
+            &serde_json::json!({}),
             limits(),
         );
         let obs = observe_truenas(&view, Utc::now());
         assert_eq!(obs.resources[0].health, Health::Ok);
         assert_eq!(obs.resources[1].health, Health::Ok);
         assert!(obs.resources[0].attrs.get("fault").is_none());
+    }
+
+    #[test]
+    fn temperature_and_topology_fill_a_disk_the_query_left_blank() {
+        let view = parse_truenas(
+            "tn",
+            &serde_json::json!({}),
+            &serde_json::json!([{
+                "name": "tank",
+                "status": "ONLINE",
+                "healthy": true,
+                "topology": {"data": [{"type": "RAIDZ", "children": [{"disk": "sda", "type": "DISK"}]}]}
+            }]),
+            &serde_json::json!([{"id": "tank", "used": {"parsed": 10}, "available": {"parsed": 90}}]),
+            &serde_json::json!([{"devname": "sda"}]),
+            &serde_json::json!([]),
+            &serde_json::json!([]),
+            &serde_json::json!({"sda": 33}),
+            limits(),
+        );
+        let disk = view.disks.iter().find(|d| d.name == "sda").unwrap();
+        assert_eq!(disk.pool, "tank");
+        assert_eq!(disk.temp_c, Some(33.0));
+        let obs = observe_truenas(&view, Utc::now());
+        let stored = obs
+            .resources
+            .iter()
+            .find(|r| r.id == "disk:tn:sda")
+            .unwrap();
+        assert_eq!(stored.health, Health::Ok);
+        assert_eq!(stored.parent.as_deref(), Some("pool:tn:tank"));
     }
 }
