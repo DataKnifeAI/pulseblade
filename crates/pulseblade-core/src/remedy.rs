@@ -21,6 +21,10 @@ pub fn resource_kind_of_id(id: &str) -> Option<&'static str> {
         "session" => Some("session"),
         "storage" => Some("storage"),
         "workload" => Some("workload"),
+        "pool" => Some("pool"),
+        "chassis" => Some("chassis"),
+        "pdu" => Some("pdu"),
+        "outlet" => Some("outlet"),
         _ => None,
     }
 }
@@ -85,10 +89,22 @@ pub fn resource_fields(id: &str) -> BTreeMap<String, String> {
             put(&mut fields, "node", node);
             put(&mut fields, "vmid", &vmid);
         }
-        "host" => {
-            let host = parts.collect::<Vec<_>>().join(":");
-            put(&mut fields, "host", &host);
-            put(&mut fields, "name", &host);
+        "host" | "chassis" | "pdu" => {
+            let name = parts.collect::<Vec<_>>().join(":");
+            put(&mut fields, "host", &name);
+            put(&mut fields, "name", &name);
+        }
+        "pool" => {
+            let host = parts.next().unwrap_or("");
+            let name = parts.collect::<Vec<_>>().join(":");
+            put(&mut fields, "host", host);
+            put(&mut fields, "name", &name);
+        }
+        "outlet" => {
+            let name = parts.next().unwrap_or("");
+            let outlet = parts.collect::<Vec<_>>().join(":");
+            put(&mut fields, "name", name);
+            put(&mut fields, "outlet", &outlet);
         }
         _ => {
             if let Some(host) = crate::host_of_id(id) {

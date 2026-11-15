@@ -167,9 +167,41 @@ ca = ""
 [[prometheus]]
 name = "app"
 url = ""
+
+# TrueNAS. api_key_env is the variable name, never the key. An empty url is skipped.
+# The URL must be https. A key sent over http is revoked by TrueNAS.
+[[truenas]]
+name = "tn"
+url = ""
+api_key_env = "TRUENAS_API_KEY"
+verify_tls = true
+pool_used_degraded = 85
+pool_used_failed = 95
+disk_temp_degraded = 50
+disk_temp_failed = 60
+
+# iDRAC over Redfish. user_env and password_env are variable names.
+# Leave verify_tls true. Set it false only for a certificate you have not reissued.
+[[idrac]]
+name = "idrac01"
+url = ""
+user_env = "IDRAC01_USER"
+password_env = "IDRAC01_PASSWORD"
+verify_tls = true
+
+# Rack PDU over Redfish. rated_watts of 0 skips the load percent.
+[[pdu]]
+name = "rack"
+url = ""
+user_env = "PDU_USER"
+password_env = "PDU_PASSWORD"
+verify_tls = true
+rated_watts = 0
+load_degraded = 80
+load_failed = 90
 ```
 
-`systemd.restart` takes `unit` (a bare name gets `.service`) and optional `user: true` for `systemctl --user`. `docker.restart` takes `container` and shells out to `docker`. `disk.prune_path` deletes regular files in an allow-listed directory and refuses `/`, `/home`, `/etc`, `/usr`, `/var`, `/boot`, and the other system roots. `script.run` runs an allow-listed program with an `args` array and no shell. `proxmox.start` and `proxmox.stop` take `node`, `vmid`, and optional `guest` (`qemu` or `lxc`). `proxmox.migrate` takes `node`, `vmid`, and `target`. `k8s.rollout_restart` takes `namespace`, `name`, and optional `kind` (`deployment`, `statefulset`, or `daemonset`). `k8s.scale` takes `namespace`, `name`, `replicas`, and optional `kind` (`deployment` or `statefulset`). `k8s.set_readiness_port` takes `namespace`, `name`, `container`, `port`, and optional `kind`. The pilot plans it, and does not restart, when a workload's HTTP readiness probe targets a port that container does not declare. `script.run` is denied unless its tier is changed. The other actions wait for approval unless their tier is changed. `action_plan` with `dry_run: true` records the run without invoking the command. Approve a waiting run with `pulseblade ctl approve <run_id>` or `POST /api/v1/actions/{id}/approve`. The node re-reads the finding and resource and refuses the click when they no longer match. Deny requires a reason (`pulseblade ctl deny <run_id> <reason>` or `POST /api/v1/actions/{id}/deny`); the command does not start, and that action is not filed again for that resource. Dismiss closes the request only. Recheck re-reads the resource: an unchanged failure stays waiting, and a change drops the plan.
+`systemd.restart` takes `unit` (a bare name gets `.service`) and optional `user: true` for `systemctl --user`. `docker.restart` takes `container` and shells out to `docker`. `disk.prune_path` deletes regular files in an allow-listed directory and refuses `/`, `/home`, `/etc`, `/usr`, `/var`, `/boot`, and the other system roots. `script.run` runs an allow-listed program with an `args` array and no shell. `proxmox.start` and `proxmox.stop` take `node`, `vmid`, and optional `guest` (`qemu` or `lxc`). `proxmox.migrate` takes `node`, `vmid`, and `target`. `k8s.rollout_restart` takes `namespace`, `name`, and optional `kind` (`deployment`, `statefulset`, or `daemonset`). `k8s.scale` takes `namespace`, `name`, `replicas`, and optional `kind` (`deployment` or `statefulset`). `k8s.set_readiness_port` takes `namespace`, `name`, `container`, `port`, and optional `kind`. The pilot plans it, and does not restart, when a workload's HTTP readiness probe targets a port that container does not declare. `idrac.power_cycle` takes `name` of a configured iDRAC and force-restarts that host; it is limited to one run an hour. `pdu.outlet_on` takes `name` and `outlet` and turns that outlet on. `pdu.outlet_off` takes the same parameters and is denied unless its tier is changed. The pilot does not plan `pdu.outlet_off`. `script.run` is denied unless its tier is changed. The other actions wait for approval unless their tier is changed. `action_plan` with `dry_run: true` records the run without invoking the command. Approve a waiting run with `pulseblade ctl approve <run_id>` or `POST /api/v1/actions/{id}/approve`. The node re-reads the finding and resource and refuses the click when they no longer match. Deny requires a reason (`pulseblade ctl deny <run_id> <reason>` or `POST /api/v1/actions/{id}/deny`); the command does not start, and that action is not filed again for that resource. Dismiss closes the request only. Recheck re-reads the resource: an unchanged failure stays waiting, and a change drops the plan.
 
 `pulseblade pilot` polls the MCP server and calls the model when a finding is new or its text changed, or when a resource's health became failed or degraded. The same finding and the same failure are not sent again, and numbers in a finding summary (such as `no push for 54s`) do not count as a change. A routine journal line and the poll timer do not call the model. The `[pilot.budget]` caps are checked before every model call and are counted from the pilot's recorded runs, so a restart does not reset them. A wake held by a cap is recorded once with status `capped` and zero tokens, and runs when the cap clears. A resource past `max_runs_per_resource_per_day` is not sent again that day, even when its finding text changes. Also set a spend limit on each provider API key; that limit holds even if the pilot is misconfigured. A quiet `--once` prints `{"investigated": false}` and does not call the model. Before any model call it reads `remedies_list`. A finding that already has a plan in `planned` or `awaiting_approval` does not start a run. A resolved remedy with the same finding rule and resource kind is filed again with `action_plan` (finding id bound, parameters filled from the current resource) and the model is not called. An approve-tier plan still waits for a human; the pilot does not call `action_execute`. A deny is not a remedy, and `still_open` is not a success. A denied action is not filed again for that resource; when a model run is still required, the reason is included in the digest. When nothing matches, the closest remedies are included in the digest. Conclusions stay `memory_note`s. The node still applies its own tier. `pulseblade ctl runs` lists recorded investigations. Provider routing and a two-tier example: [ARCHITECTURE.md](ARCHITECTURE.md#example-configuration).
 

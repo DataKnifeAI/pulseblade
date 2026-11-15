@@ -31,10 +31,18 @@ pub enum ResourceKind {
     Storage,
     /// A Kubernetes workload (Deployment, StatefulSet, or DaemonSet).
     Workload,
+    /// A storage pool (TrueNAS). Not a host disk and not Proxmox storage.
+    Pool,
+    /// A baseboard management controller (iDRAC).
+    Chassis,
+    /// A rack power distribution unit.
+    Pdu,
+    /// One switched outlet on a PDU.
+    Outlet,
 }
 
 impl ResourceKind {
-    pub const ALL: [ResourceKind; 13] = [
+    pub const ALL: [ResourceKind; 17] = [
         Self::Host,
         Self::Disk,
         Self::NetIface,
@@ -48,6 +56,10 @@ impl ResourceKind {
         Self::Session,
         Self::Storage,
         Self::Workload,
+        Self::Pool,
+        Self::Chassis,
+        Self::Pdu,
+        Self::Outlet,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -65,6 +77,10 @@ impl ResourceKind {
             Self::Session => "session",
             Self::Storage => "storage",
             Self::Workload => "workload",
+            Self::Pool => "pool",
+            Self::Chassis => "chassis",
+            Self::Pdu => "pdu",
+            Self::Outlet => "outlet",
         }
     }
 }

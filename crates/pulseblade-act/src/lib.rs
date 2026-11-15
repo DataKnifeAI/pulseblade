@@ -4,6 +4,7 @@
 //! execute; `approve` waits until `approve` (CLI or HTTP); `deny` never runs.
 
 mod config;
+mod hw;
 mod k8s;
 mod proxmox;
 
@@ -23,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 pub use config::{parse_ttl, ActionsConfig, PathAction, TierLimit};
+pub use hw::HwEndpoint;
 pub use k8s::{IdleK8s, K8sApi, K8sEndpoint};
 pub use proxmox::ProxmoxEndpoint;
 
@@ -154,6 +156,8 @@ pub struct Registry {
     proxmox: ProxmoxEndpoint,
     k8s: K8sEndpoint,
     k8s_api: Arc<dyn K8sApi>,
+    hw: Vec<HwEndpoint>,
+    hw_api: Arc<dyn hw::HwApi>,
 }
 
 impl Registry {
@@ -170,7 +174,19 @@ impl Registry {
             k8s_api: Arc::new(IdleK8s {
                 message: "kubernetes API client is not connected".into(),
             }),
+            hw: Vec::new(),
+            hw_api: Arc::new(hw::LiveHw),
         })
+    }
+
+    /// BMCs and PDUs `idrac.power_cycle` and the outlet actions may target.
+    pub fn set_hardware(&mut self, targets: Vec<HwEndpoint>) {
+        self.hw = targets;
+    }
+
+    pub fn with_hw_api(mut self, api: Arc<dyn hw::HwApi>) -> Self {
+        self.hw_api = api;
+        self
     }
 
     /// API used by `k8s.rollout_restart` and `k8s.scale`.
@@ -265,7 +281,14 @@ impl Registry {
             return Err(ActError::Invalid("params must be an object".into()));
         }
         validate_schema(&req.action, &params)?;
-        let derived = check_params(&req.action, &params, &self.config, &self.proxmox, &self.k8s)?;
+        let derived = check_params(
+            &req.action,
+            &params,
+            &self.config,
+            &self.proxmox,
+            &self.k8s,
+            &self.hw,
+        )?;
         let resource_id = match req.resource_id {
             Some(id) => clean_resource_id(&id)?,
             None => derived,
@@ -571,6 +594,8 @@ impl Registry {
                 secrets: self.secrets.as_ref(),
                 proxmox: &self.proxmox,
                 k8s: self.k8s_api.as_ref(),
+                hw: &self.hw,
+                hw_api: self.hw_api.as_ref(),
             },
         ) {
             Ok(output) => self.finish(
@@ -631,10 +656,13 @@ impl Registry {
             "k8s.rollout_restart" => self.config.k8s_rollout_restart.tier,
             "k8s.scale" => self.config.k8s_scale.tier,
             "k8s.set_readiness_port" => self.config.k8s_set_readiness_port.tier,
+            "idrac.power_cycle" => self.config.idrac_power_cycle.tier,
+            "pdu.outlet_on" => self.config.pdu_outlet_on.tier,
+            "pdu.outlet_off" => self.config.pdu_outlet_off.tier,
             _ => None,
         };
         over.unwrap_or(match name {
-            "script.run" => RiskTier::Deny,
+            "script.run" | "pdu.outlet_off" => RiskTier::Deny,
             _ => RiskTier::Approve,
         })
     }
@@ -651,6 +679,9 @@ impl Registry {
             "k8s.rollout_restart" => self.config.k8s_rollout_restart.rate_per_hour,
             "k8s.scale" => self.config.k8s_scale.rate_per_hour,
             "k8s.set_readiness_port" => self.config.k8s_set_readiness_port.rate_per_hour,
+            "idrac.power_cycle" => self.config.idrac_power_cycle.rate_per_hour,
+            "pdu.outlet_on" => self.config.pdu_outlet_on.rate_per_hour,
+            "pdu.outlet_off" => self.config.pdu_outlet_off.rate_per_hour,
             _ => 0,
         }
     }
@@ -727,6 +758,9 @@ const NAMES: &[&str] = &[
     "k8s.rollout_restart",
     "k8s.scale",
     "k8s.set_readiness_port",
+    "idrac.power_cycle",
+    "pdu.outlet_on",
+    "pdu.outlet_off",
 ];
 
 fn plan_of(run: &ActionRun) -> PlanResult {
@@ -749,6 +783,7 @@ fn description(name: &str) -> &'static str {
         "script.run" => "Run an allow-listed program with no shell.",
         other if proxmox::is_proxmox(other) => proxmox::description(other),
         other if k8s::is_k8s(other) => k8s::description(other),
+        other if hw::is_hw(other) => hw::description(other),
         _ => "",
     }
 }
@@ -764,6 +799,8 @@ fn applies_to(name: &str) -> Vec<ResourceKind> {
         "k8s.rollout_restart" | "k8s.scale" | "k8s.set_readiness_port" => {
             vec![ResourceKind::Workload]
         }
+        "idrac.power_cycle" => vec![ResourceKind::Chassis],
+        "pdu.outlet_on" | "pdu.outlet_off" => vec![ResourceKind::Outlet],
         _ => vec![ResourceKind::Host],
     }
 }
@@ -786,6 +823,7 @@ fn preconditions(name: &str) -> &'static [&'static str] {
         ],
         other if proxmox::is_proxmox(other) => proxmox::preconditions(other),
         other if k8s::is_k8s(other) => k8s::preconditions(other),
+        other if hw::is_hw(other) => hw::preconditions(other),
         _ => &[],
     }
 }
@@ -832,6 +870,7 @@ fn schema(name: &str) -> Value {
         }),
         other if proxmox::is_proxmox(other) => proxmox::schema(other),
         other if k8s::is_k8s(other) => k8s::schema(other),
+        other if hw::is_hw(other) => hw::schema(other),
         _ => json!({"type": "object"}),
     }
 }
@@ -861,6 +900,7 @@ fn check_params(
     config: &ActionsConfig,
     proxmox_ep: &ProxmoxEndpoint,
     k8s_ep: &K8sEndpoint,
+    hw_targets: &[HwEndpoint],
 ) -> Result<String, ActError> {
     match name {
         "systemd.restart" => {
@@ -891,6 +931,10 @@ fn check_params(
         other if k8s::is_k8s(other) => {
             k8s::ensure_configured(k8s_ep)?;
             k8s::resource_id(other, params, &k8s_ep.cluster)
+        }
+        other if hw::is_hw(other) => {
+            hw::ensure_known(other, params, hw_targets)?;
+            hw::resource_id(other, params)
         }
         "disk.prune_path" => {
             let path = params.get("path").and_then(|v| v.as_str()).unwrap_or("");
@@ -924,6 +968,8 @@ struct ExecEnv<'a> {
     secrets: &'a dyn SecretLookup,
     proxmox: &'a ProxmoxEndpoint,
     k8s: &'a dyn K8sApi,
+    hw: &'a [HwEndpoint],
+    hw_api: &'a dyn hw::HwApi,
 }
 
 fn perform(
@@ -984,6 +1030,7 @@ fn perform(
             proxmox::perform(other, params, env.proxmox, env.http, env.secrets)
         }
         other if k8s::is_k8s(other) => k8s::perform(other, params, env.k8s),
+        other if hw::is_hw(other) => hw::perform(other, params, env.hw, env.hw_api, env.secrets),
         other => Err(format!("unknown action `{other}`")),
     }
 }
@@ -1501,6 +1548,139 @@ mod tests {
             urls.as_slice(),
             ["https://pve.example:8006/api2/json/nodes/pve1/qemu/100/status/start"]
         );
+    }
+
+    struct RecHw {
+        calls: Mutex<Vec<(String, String)>>,
+    }
+
+    impl hw::HwApi for RecHw {
+        fn post_json(
+            &self,
+            url: &str,
+            _authorization: &str,
+            body: &str,
+            _verify_tls: bool,
+        ) -> Result<String, String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((url.to_string(), body.to_string()));
+            Ok("ok".into())
+        }
+    }
+
+    struct HwSecrets;
+
+    impl SecretLookup for HwSecrets {
+        fn get(&self, name: &str) -> Option<String> {
+            match name {
+                "IDRAC_USER" | "PDU_USER" => Some("monitor".into()),
+                "IDRAC_PASSWORD" | "PDU_PASSWORD" => Some("secret".into()),
+                _ => None,
+            }
+        }
+    }
+
+    fn hw_reg(api: Arc<RecHw>) -> Registry {
+        let mut reg = Registry::new(ActionsConfig::default(), Arc::new(FakeRunner::ok())).unwrap();
+        reg.set_hardware(vec![
+            HwEndpoint {
+                name: "idrac01".into(),
+                url: "https://idrac01.example".into(),
+                user_env: "IDRAC_USER".into(),
+                secret_env: "IDRAC_PASSWORD".into(),
+                verify_tls: false,
+                kind: "idrac",
+            },
+            HwEndpoint {
+                name: "rack".into(),
+                url: "https://pdu.example".into(),
+                user_env: "PDU_USER".into(),
+                secret_env: "PDU_PASSWORD".into(),
+                verify_tls: false,
+                kind: "pdu",
+            },
+        ]);
+        reg.with_secrets(Arc::new(HwSecrets)).with_hw_api(api)
+    }
+
+    #[test]
+    fn power_cycle_waits_and_posts_only_after_approval() {
+        let api = Arc::new(RecHw {
+            calls: Mutex::new(Vec::new()),
+        });
+        let reg = hw_reg(api.clone());
+        let store = Store::open_in_memory().unwrap();
+        let planned = reg
+            .plan(
+                &store,
+                PlanParams {
+                    action: "idrac.power_cycle".into(),
+                    params: json!({"name": "idrac01"}),
+                    resource_id: None,
+                    idempotency_key: None,
+                    dry_run: false,
+                    finding_id: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(planned.tier, RiskTier::Approve);
+        let held = reg.execute(&store, &planned.plan_id).unwrap();
+        assert_eq!(held.status, ActionRunStatus::AwaitingApproval);
+        assert!(api.calls.lock().unwrap().is_empty());
+        let done = reg.approve(&store, &held.id).unwrap();
+        assert_eq!(done.status, ActionRunStatus::Succeeded);
+        let calls = api.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].0.ends_with("/Actions/ComputerSystem.Reset"));
+        assert_eq!(calls[0].1, r#"{"ResetType":"ForceRestart"}"#);
+    }
+
+    #[test]
+    fn outlet_off_is_denied_and_outlet_on_waits() {
+        let api = Arc::new(RecHw {
+            calls: Mutex::new(Vec::new()),
+        });
+        let reg = hw_reg(api.clone());
+        let store = Store::open_in_memory().unwrap();
+        let off = reg
+            .plan(
+                &store,
+                PlanParams {
+                    action: "pdu.outlet_off".into(),
+                    params: json!({"name": "rack", "outlet": "3"}),
+                    resource_id: None,
+                    idempotency_key: None,
+                    dry_run: false,
+                    finding_id: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(off.tier, RiskTier::Deny);
+        let rejected = reg.execute(&store, &off.plan_id).unwrap();
+        assert_eq!(rejected.status, ActionRunStatus::Rejected);
+        assert!(api.calls.lock().unwrap().is_empty());
+        let on = reg
+            .plan(
+                &store,
+                PlanParams {
+                    action: "pdu.outlet_on".into(),
+                    params: json!({"name": "rack", "outlet": "3"}),
+                    resource_id: None,
+                    idempotency_key: None,
+                    dry_run: false,
+                    finding_id: None,
+                },
+            )
+            .unwrap();
+        let held = reg.execute(&store, &on.plan_id).unwrap();
+        assert_eq!(held.status, ActionRunStatus::AwaitingApproval);
+        reg.approve(&store, &held.id).unwrap();
+        let calls = api.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].0.contains("/Outlets/3/"));
+        assert_eq!(calls[0].1, r#"{"ResetType":"On"}"#);
     }
 
     #[test]

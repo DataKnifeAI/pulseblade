@@ -209,6 +209,7 @@ fn health_incident(resource: &Resource, severity: Severity) -> Incident {
     let summary = match resource
         .attrs
         .get("unready")
+        .or_else(|| resource.attrs.get("fault"))
         .and_then(|value| value.as_str())
         .filter(|why| !why.is_empty())
     {
@@ -312,6 +313,15 @@ mod tests {
                 },
             )
             .attr("requires", json!(["unit:h:dep.service"]))
+    }
+
+    #[test]
+    fn a_fault_attribute_is_part_of_the_health_summary() {
+        let resource = Resource::new("pool:tn:tank", ResourceKind::Pool, "tank")
+            .health(Health::Failed)
+            .attr("fault", "pool DEGRADED");
+        let incident = health_incident(&resource, Severity::Critical);
+        assert_eq!(incident.summary, "tank is failed: pool DEGRADED");
     }
 
     #[test]

@@ -83,6 +83,9 @@ pub struct ActionsConfig {
     pub k8s_rollout_restart: TierLimit,
     pub k8s_scale: TierLimit,
     pub k8s_set_readiness_port: TierLimit,
+    pub idrac_power_cycle: TierLimit,
+    pub pdu_outlet_on: TierLimit,
+    pub pdu_outlet_off: TierLimit,
 }
 
 impl Default for ActionsConfig {
@@ -104,6 +107,18 @@ impl Default for ActionsConfig {
             k8s_rollout_restart: TierLimit::default(),
             k8s_scale: TierLimit::default(),
             k8s_set_readiness_port: TierLimit::default(),
+            idrac_power_cycle: TierLimit {
+                tier: None,
+                rate_per_hour: 1,
+            },
+            pdu_outlet_on: TierLimit {
+                tier: None,
+                rate_per_hour: 4,
+            },
+            pdu_outlet_off: TierLimit {
+                tier: Some(RiskTier::Deny),
+                rate_per_hour: 4,
+            },
         }
     }
 }

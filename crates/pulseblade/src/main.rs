@@ -386,6 +386,7 @@ fn action_registry(config: &Config) -> anyhow::Result<Arc<pulseblade_act::Regist
     )
     .map_err(|e| anyhow::anyhow!(e))?;
     reg.set_proxmox(config.proxmox.endpoint());
+    reg.set_hardware(config::hardware_endpoints(config));
     if let Err(e) = reg.set_k8s(config.k8s.endpoint()) {
         tracing::warn!(error = %e, "kubernetes actions unavailable");
     }

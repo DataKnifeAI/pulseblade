@@ -75,15 +75,20 @@ A model call is never the default. Every path that can reach a provider has a ca
 - Next: estimated dollars per run from configured per-model prices, a dollar cap per day, cap state on `/api/v1/status` and the dashboard, and an alert when a cap holds a wake.
 - Next: a cheap triage tier before the investigation model, so a known or noisy finding never reaches the expensive model.
 
+### M9 — Hardware (in progress)
+
+Collectors poll the gear. Nothing is installed on the NAS, the BMCs, or the PDU. Health is set on the resource, so a failed or degraded pool, chassis, or PDU is a finding on the node that polls and a health change on the hub.
+
+- TrueNAS at <https://tn.dataknife.net/>: JSON-RPC over `wss://<host>/api/current`. Pools, disks, replication jobs, and alerts. A pool at 85% is degraded and at 95% failed. A disk at 50°C is degraded and at 60°C failed.
+- PDU at <https://192.168.8.100/>: Redfish. Load, input voltage, and outlet state. Lost input is failed. Load at 80% is degraded and at 90% failed. An outlet that is off is not a failure.
+- iDRAC `idrac01`, `idrac02`, and `idrac05`: Redfish system health, inlet temperature against the BMC's own thresholds, and power-supply health.
+- Actions: `idrac.power_cycle` and `pdu.outlet_on` wait for approval. `pdu.outlet_off` is denied. The URL is the configured target, not a parameter.
+
+The API key and the Redfish passwords stay in environment variables. `verify_tls` stays on unless the config turns it off. The iDRAC certificates are expired, so those targets need `verify_tls = false` until they are reissued.
+
 ### Later
 
 Shipped on the hub: a node that stops pushing keeps its last resources. After three missed push intervals it is stale on `/api/v1/status`, the snapshot, and the fleet tile, and one open `host offline` finding records last health, recent changes, and stored error lines. SIGTERM sends a final `shutting_down` push; a crash is silence. History keeps raw samples for about two days and 5-minute min/max/avg buckets plus an FTS index of failures, restarts, and error lines for 90 days (`history`, `search`). Info logs stay on the node.
-
-Not built, until access is sorted:
-
-- TrueNAS at <https://tn.dataknife.net/>
-- PDU at <https://192.168.8.100/>
-- iDRAC hosts `idrac01`, `idrac02`, and `idrac05`
 
 Also still later: cloud collectors (AWS, Azure, GCP) and hub-of-hubs.
 

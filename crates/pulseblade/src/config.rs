@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use pulseblade_act::ActionsConfig;
-use pulseblade_collect::{CollectorOpts, K8sTarget, PromTarget, ProxmoxTarget};
+use pulseblade_collect::{CollectorOpts, HwLimits, HwTarget, K8sTarget, PromTarget, ProxmoxTarget};
 use pulseblade_core::{
     default_time_format, default_timezone, valid_time_format, valid_timezone, HealthThresholds,
     LabelRule,
@@ -71,6 +71,15 @@ pub struct Config {
     /// Prometheus text endpoints to scrape into samples. An empty URL is skipped.
     #[serde(default)]
     pub prometheus: Vec<PromFile>,
+    /// TrueNAS hosts polled over the WebSocket API. An empty URL is skipped.
+    #[serde(default)]
+    pub truenas: Vec<TrueNasFile>,
+    /// iDRAC hosts polled over Redfish. An empty URL is skipped.
+    #[serde(default)]
+    pub idrac: Vec<IdracFile>,
+    /// Rack PDUs polled over Redfish. An empty URL is skipped.
+    #[serde(default)]
+    pub pdu: Vec<PduFile>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -126,6 +135,267 @@ impl ProxmoxFile {
                 verify_tls: self.verify_tls,
             })
         }
+    }
+}
+
+fn pct_degraded() -> f64 {
+    85.0
+}
+fn pct_failed() -> f64 {
+    95.0
+}
+fn disk_warm() -> f64 {
+    50.0
+}
+fn disk_hot() -> f64 {
+    60.0
+}
+fn load_degraded() -> f64 {
+    80.0
+}
+fn load_failed() -> f64 {
+    90.0
+}
+
+/// One TrueNAS. `api_key_env` is the variable name, never the key.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TrueNasFile {
+    pub name: String,
+    pub url: String,
+    pub api_key_env: String,
+    pub verify_tls: bool,
+    pub pool_used_degraded: f64,
+    pub pool_used_failed: f64,
+    pub disk_temp_degraded: f64,
+    pub disk_temp_failed: f64,
+}
+
+impl Default for TrueNasFile {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            url: String::new(),
+            api_key_env: "TRUENAS_API_KEY".into(),
+            verify_tls: true,
+            pool_used_degraded: pct_degraded(),
+            pool_used_failed: pct_failed(),
+            disk_temp_degraded: disk_warm(),
+            disk_temp_failed: disk_hot(),
+        }
+    }
+}
+
+impl TrueNasFile {
+    fn target(&self) -> Option<HwTarget> {
+        appliance(
+            &self.name,
+            &self.url,
+            "",
+            &self.api_key_env,
+            self.verify_tls,
+            0.0,
+            HwLimits {
+                pool_used_degraded: self.pool_used_degraded,
+                pool_used_failed: self.pool_used_failed,
+                disk_temp_degraded: self.disk_temp_degraded,
+                disk_temp_failed: self.disk_temp_failed,
+                ..HwLimits::default()
+            },
+        )
+    }
+}
+
+/// One iDRAC. User and password are environment variable names.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct IdracFile {
+    pub name: String,
+    pub url: String,
+    pub user_env: String,
+    pub password_env: String,
+    pub verify_tls: bool,
+}
+
+impl Default for IdracFile {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            url: String::new(),
+            user_env: String::new(),
+            password_env: String::new(),
+            verify_tls: true,
+        }
+    }
+}
+
+impl IdracFile {
+    fn target(&self) -> Option<HwTarget> {
+        appliance(
+            &self.name,
+            &self.url,
+            &self.user_env,
+            &self.password_env,
+            self.verify_tls,
+            0.0,
+            HwLimits::default(),
+        )
+    }
+
+    fn endpoint(&self) -> Option<pulseblade_act::HwEndpoint> {
+        endpoint(
+            &self.name,
+            &self.url,
+            &self.user_env,
+            &self.password_env,
+            self.verify_tls,
+            "idrac",
+        )
+    }
+}
+
+/// One rack PDU. `rated_watts` turns the watt sample into a load percent.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PduFile {
+    pub name: String,
+    pub url: String,
+    pub user_env: String,
+    pub password_env: String,
+    pub verify_tls: bool,
+    pub rated_watts: f64,
+    pub load_degraded: f64,
+    pub load_failed: f64,
+}
+
+impl Default for PduFile {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            url: String::new(),
+            user_env: String::new(),
+            password_env: String::new(),
+            verify_tls: true,
+            rated_watts: 0.0,
+            load_degraded: load_degraded(),
+            load_failed: load_failed(),
+        }
+    }
+}
+
+impl PduFile {
+    fn target(&self) -> Option<HwTarget> {
+        appliance(
+            &self.name,
+            &self.url,
+            &self.user_env,
+            &self.password_env,
+            self.verify_tls,
+            self.rated_watts,
+            HwLimits {
+                pdu_load_degraded: self.load_degraded,
+                pdu_load_failed: self.load_failed,
+                ..HwLimits::default()
+            },
+        )
+    }
+
+    fn endpoint(&self) -> Option<pulseblade_act::HwEndpoint> {
+        endpoint(
+            &self.name,
+            &self.url,
+            &self.user_env,
+            &self.password_env,
+            self.verify_tls,
+            "pdu",
+        )
+    }
+}
+
+fn appliance(
+    name: &str,
+    url: &str,
+    user_env: &str,
+    secret_env: &str,
+    verify_tls: bool,
+    rated_watts: f64,
+    limits: HwLimits,
+) -> Option<HwTarget> {
+    if url.trim().is_empty() || name.trim().is_empty() {
+        return None;
+    }
+    Some(HwTarget {
+        name: name.trim().to_string(),
+        url: url.trim().to_string(),
+        user_env: user_env.trim().to_string(),
+        secret_env: secret_env.trim().to_string(),
+        verify_tls,
+        rated_watts,
+        limits,
+    })
+}
+
+fn endpoint(
+    name: &str,
+    url: &str,
+    user_env: &str,
+    secret_env: &str,
+    verify_tls: bool,
+    kind: &'static str,
+) -> Option<pulseblade_act::HwEndpoint> {
+    if url.trim().is_empty() || name.trim().is_empty() {
+        return None;
+    }
+    Some(pulseblade_act::HwEndpoint {
+        name: name.trim().to_string(),
+        url: url.trim().to_string(),
+        user_env: user_env.trim().to_string(),
+        secret_env: secret_env.trim().to_string(),
+        verify_tls,
+        kind,
+    })
+}
+
+pub fn hardware_endpoints(config: &Config) -> Vec<pulseblade_act::HwEndpoint> {
+    config
+        .idrac
+        .iter()
+        .filter_map(|row| row.endpoint())
+        .chain(config.pdu.iter().filter_map(|row| row.endpoint()))
+        .collect()
+}
+
+fn validate_hw(cfg: &Config) -> Result<(), String> {
+    for row in &cfg.truenas {
+        ordered_pct(row.pool_used_degraded, row.pool_used_failed, "truenas pool")?;
+        ordered_temp(row.disk_temp_degraded, row.disk_temp_failed, "truenas disk")?;
+    }
+    for row in &cfg.pdu {
+        ordered_pct(row.load_degraded, row.load_failed, "pdu load")?;
+        if row.rated_watts < 0.0 {
+            return Err("pdu rated_watts must be zero or positive".into());
+        }
+    }
+    Ok(())
+}
+
+fn ordered_pct(lo: f64, hi: f64, what: &str) -> Result<(), String> {
+    if lo > 0.0 && hi > lo && hi <= 100.0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "{what} cutoffs must be 0 < degraded < failed <= 100"
+        ))
+    }
+}
+
+fn ordered_temp(lo: f64, hi: f64, what: &str) -> Result<(), String> {
+    if lo > 0.0 && hi > lo && hi <= 120.0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "{what} cutoffs must be 0 < degraded < failed <= 120"
+        ))
     }
 }
 
@@ -374,6 +644,9 @@ impl Default for Config {
             upstream: UpstreamConfig::default(),
             k8s: K8sFile::default(),
             prometheus: Vec::new(),
+            truenas: Vec::new(),
+            idrac: Vec::new(),
+            pdu: Vec::new(),
         }
     }
 }
@@ -385,6 +658,9 @@ impl Config {
             proxmox: self.proxmox.target(),
             k8s: self.k8s.target(),
             prometheus: self.prometheus.iter().filter_map(|p| p.target()).collect(),
+            truenas: self.truenas.iter().filter_map(|row| row.target()).collect(),
+            idrac: self.idrac.iter().filter_map(|row| row.target()).collect(),
+            pdu: self.pdu.iter().filter_map(|row| row.target()).collect(),
         }
     }
 
@@ -405,6 +681,9 @@ impl Config {
         cfg.health
             .validate()
             .map_err(|err| anyhow::anyhow!("invalid [health] in {}: {err}", path.display()))?;
+        validate_hw(&cfg).map_err(|err| {
+            anyhow::anyhow!("invalid hardware config in {}: {err}", path.display())
+        })?;
         if !valid_timezone(&cfg.timezone) {
             anyhow::bail!(
                 "timezone {:?} in {} is not an IANA name such as America/Los_Angeles",
@@ -598,6 +877,25 @@ mod tests {
             [[prometheus]]
             name = "app"
             url = ""
+
+            [[truenas]]
+            name = "tn"
+            url = ""
+            api_key_env = "TRUENAS_API_KEY"
+
+            [[idrac]]
+            name = "idrac01"
+            url = ""
+            user_env = "IDRAC01_USER"
+            password_env = "IDRAC01_PASSWORD"
+            verify_tls = true
+
+            [[pdu]]
+            name = "rack"
+            url = ""
+            user_env = "PDU_USER"
+            password_env = "PDU_PASSWORD"
+            rated_watts = 0
             "#,
         )
         .unwrap();
@@ -621,6 +919,11 @@ mod tests {
         assert_eq!(cfg.k8s.cluster, "demo");
         assert_eq!(cfg.prometheus.len(), 1);
         assert!(cfg.prometheus[0].url.is_empty());
+        assert!(cfg.truenas[0].url.is_empty());
+        assert_eq!(cfg.truenas[0].pool_used_degraded, 85.0);
+        assert!(cfg.idrac[0].url.is_empty());
+        assert!(cfg.pdu[0].url.is_empty());
+        assert!(cfg.collector_opts().truenas.is_empty());
         assert_eq!(cfg.timezone, "America/Los_Angeles");
         assert_eq!(cfg.time_format, "12h");
         assert_eq!(cfg.health.pod_restart_window_mins, 15);

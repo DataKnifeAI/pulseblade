@@ -317,13 +317,14 @@
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const RANK = { failed: 0, degraded: 1, unknown: 2, ok: 3 };
-const HOST_KINDS = new Set(["host", "disk", "net_iface", "service", "process", "session", "container", "image", "vm", "storage"]);
+const HOST_KINDS = new Set(["host", "disk", "net_iface", "service", "process", "session", "container", "image", "vm", "storage", "pool", "chassis", "pdu", "outlet"]);
 const KIND_LABEL = { disk: "disks", net_iface: "network", service: "services", process: "processes", session: "sessions", node: "nodes",
-  pod: "pods", workload: "workloads", container: "LXC", vm: "VMs", storage: "storage pools", host: "host" };
-const KIND_ORDER = ["workload", "pod", "vm", "container", "storage", "service", "disk", "process", "session", "net_iface", "image"];
+  pod: "pods", workload: "workloads", container: "LXC", vm: "VMs", storage: "storage pools", host: "host",
+  pool: "pools", chassis: "BMCs", pdu: "PDUs", outlet: "outlets" };
+const KIND_ORDER = ["workload", "pod", "vm", "container", "storage", "pool", "chassis", "pdu", "outlet", "service", "disk", "process", "session", "net_iface", "image"];
 const SCOPE_LABEL = { k8s: "Kubernetes", pve: "Proxmox", host: "Hosts" };
 const SCOPE_ICON = { k8s: "k8s", pve: "pve", host: "linux" };
-const KIND_ICON = { disk: "disk", net_iface: "net", service: "unit", process: "proc", vm: "vm", container: "lxc", storage: "storage", pod: "pod", workload: "workload", host: "host", node: "host", image: "storage" };
+const KIND_ICON = { disk: "disk", net_iface: "net", service: "unit", process: "proc", vm: "vm", container: "lxc", storage: "storage", pod: "pod", workload: "workload", host: "host", node: "host", image: "storage", pool: "storage", chassis: "host", pdu: "host", outlet: "net" };
 const ic = (n, cls = "", label = "") => n ? `<svg class="ic ${cls}" ${label ? `role="img" aria-label="${esc(label)}"><title>${esc(label)}</title>` : 'aria-hidden="true">'}<use href="#i-${n}"/></svg>` : "";
 const osIcon = (os) => /proxmox/i.test(os || "") ? "pve" : /debian/i.test(os || "") ? "debian" : /ubuntu/i.test(os || "") ? "ubuntu" : /arch|cachy|manjaro|endeavour/i.test(os || "") ? "arch" : /linux/i.test(os || "") ? "linux" : "";
 const machineIcon = (m) => m.pnode ? "pve" : osIcon(((m.host || {}).attrs || {}).os || "");
@@ -332,7 +333,8 @@ const TABS = [["overview", "Overview"], ["fleet", "Fleet"], ["changes", "Changes
 const QUIET_METRICS = /^(load\.(5|15)m|mem\.available_bytes|proc\.rss_bytes|net\.(rx|tx)_errors|k8s\.replicas)$/;
 const KIND_ALIAS = { disk: "disk", disks: "disk", vm: "vm", vms: "vm", lxc: "container", container: "container", containers: "container", pod: "pod", pods: "pod",
   workload: "workload", workloads: "workload", service: "service", services: "service", unit: "service", units: "service", process: "process", processes: "process",
-  storage: "storage", net: "net_iface", node: "node", nodes: "node", host: "host", hosts: "host" };
+  storage: "storage", net: "net_iface", node: "node", nodes: "node", host: "host", hosts: "host",
+  pool: "pool", pools: "pool", chassis: "chassis", pdu: "pdu", outlet: "outlet", outlets: "outlet" };
 const PRESETS = ["disks over 90%", "storage over 85%", "pods is:unhealthy", "vms is:paused", "is:stopped", "services is:failed", "cpu over 50%", "mem over 75%"];
 const params = new URLSearchParams(location.search);
 const FALLBACK_TZ = "America/Los_Angeles";
@@ -586,7 +588,13 @@ function reason(r) {
   switch (r.kind) {
     case "pod": return [m["k8s.restarts"] ? `${m["k8s.restarts"]} restarts` : "", a.restarted_at ? stamp(a.restarted_at) : "", a.reason || a.phase].filter(Boolean).join(" · ");
     case "workload": return `${a.ready || (m["k8s.ready"] != null ? m["k8s.ready"] + "/" + (m["k8s.replicas"] ?? "?") : "?")} ready`;
-    case "disk": return `${fmt("disk.used_pct", m["disk.used_pct"])} full · ${bytes(m["disk.available_bytes"])} free`;
+    case "disk":
+      if (m["disk.temp_c"] != null && m["disk.used_pct"] == null) return `${fmt("disk.temp_c", m["disk.temp_c"])}°C${a.pool ? " · " + a.pool : ""}`;
+      return `${fmt("disk.used_pct", m["disk.used_pct"])} full · ${bytes(m["disk.available_bytes"])} free`;
+    case "pool": return `${fmt("pool.used_pct", m["pool.used_pct"])} full${a.status ? " · " + a.status : ""}`;
+    case "chassis": return [a.power, m["chassis.temp_c"] != null ? `${fmt("chassis.temp_c", m["chassis.temp_c"])}°C` : "", a.fault].filter(Boolean).join(" · ");
+    case "pdu": return [m["pdu.watts"] != null ? `${fmt("pdu.watts", m["pdu.watts"])} W` : "", m["pdu.load_pct"] != null ? fmt("pdu.load_pct", m["pdu.load_pct"]) : "", a.fault].filter(Boolean).join(" · ");
+    case "outlet": return a.power || "";
     case "storage": return `${fmt("storage.used_pct", m["storage.used_pct"])} full${a.kind ? " · " + a.kind : ""}${a.active === false ? " · inactive" : ""}`;
     case "vm": case "container": { const p = r.id.split(":")[0]; return a.status && a.status !== "running" ? a.status : `cpu ${fmt("x_pct", m[p + ".cpu_pct"])} · ${bytes(m[p + ".mem_bytes"])}`; }
     case "process": {

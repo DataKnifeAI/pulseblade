@@ -5,18 +5,24 @@
 
 mod docker;
 mod host;
+mod hw;
 mod journal;
 mod k8s;
 mod processes;
 mod prometheus;
 mod proxmox;
+mod redfish;
 mod systemd;
+mod truenas;
 mod user;
 
 pub use docker::{observe_docker, DockerCollector, DockerSource, DockerView};
+pub use hw::{HwLimits, HwTarget};
 pub use k8s::{observe_k8s, K8sCollector, K8sSource, K8sTarget, K8sView};
 pub use prometheus::{observe_prom, PromCollector, PromSource, PromTarget};
 pub use proxmox::{observe_proxmox, ProxmoxCollector, ProxmoxSource, ProxmoxTarget, PveView};
+pub use redfish::{observe_chassis, observe_pdu, parse_chassis, parse_pdu};
+pub use truenas::{observe_truenas, parse_truenas};
 
 pub use host::HostCollector;
 pub use journal::JournaldCollector;
@@ -98,6 +104,9 @@ pub struct CollectorOpts {
     pub proxmox: Option<ProxmoxTarget>,
     pub k8s: Option<K8sTarget>,
     pub prometheus: Vec<PromTarget>,
+    pub truenas: Vec<HwTarget>,
+    pub idrac: Vec<HwTarget>,
+    pub pdu: Vec<HwTarget>,
 }
 
 impl Default for CollectorOpts {
@@ -107,6 +116,9 @@ impl Default for CollectorOpts {
             proxmox: None,
             k8s: None,
             prometheus: Vec::new(),
+            truenas: Vec::new(),
+            idrac: Vec::new(),
+            pdu: Vec::new(),
         }
     }
 }
@@ -141,6 +153,9 @@ pub fn default_collectors(
     push_proxmox(&mut out, opts.proxmox.as_ref());
     push_k8s(&mut out, opts.k8s.as_ref(), health);
     push_prometheus(&mut out, &host, &opts.prometheus);
+    push_truenas(&mut out, &opts.truenas);
+    push_idrac(&mut out, &opts.idrac);
+    push_pdu(&mut out, &opts.pdu);
     out
 }
 
@@ -238,7 +253,83 @@ fn push_prometheus(out: &mut Vec<Box<dyn Collector>>, host: &str, targets: &[Pro
     }
 }
 
-#[cfg(feature = "proxmox")]
+fn push_truenas(out: &mut Vec<Box<dyn Collector>>, targets: &[HwTarget]) {
+    push_hw(out, targets, "truenas", |target| {
+        #[cfg(feature = "hw")]
+        {
+            Box::new(truenas::TrueNasCollector::new(truenas::LiveTrueNas::new(
+                target.clone(),
+            )))
+        }
+        #[cfg(not(feature = "hw"))]
+        {
+            let _ = target;
+            unreachable!("feature gate");
+        }
+    });
+}
+
+fn push_idrac(out: &mut Vec<Box<dyn Collector>>, targets: &[HwTarget]) {
+    push_hw(out, targets, "idrac", |target| {
+        #[cfg(feature = "hw")]
+        {
+            Box::new(redfish::ChassisCollector::new(redfish::LiveChassis::new(
+                target.clone(),
+            )))
+        }
+        #[cfg(not(feature = "hw"))]
+        {
+            let _ = target;
+            unreachable!("feature gate");
+        }
+    });
+}
+
+fn push_pdu(out: &mut Vec<Box<dyn Collector>>, targets: &[HwTarget]) {
+    push_hw(out, targets, "pdu", |target| {
+        #[cfg(feature = "hw")]
+        {
+            Box::new(redfish::PduCollector::new(redfish::LivePdu::new(
+                target.clone(),
+            )))
+        }
+        #[cfg(not(feature = "hw"))]
+        {
+            let _ = target;
+            unreachable!("feature gate");
+        }
+    });
+}
+
+fn push_hw(
+    out: &mut Vec<Box<dyn Collector>>,
+    targets: &[HwTarget],
+    kind: &str,
+    build: impl Fn(&HwTarget) -> Box<dyn Collector>,
+) {
+    let configured: Vec<&HwTarget> = targets
+        .iter()
+        .filter(|t| !t.url.trim().is_empty() && !t.name.trim().is_empty())
+        .collect();
+    if configured.is_empty() {
+        return;
+    }
+    #[cfg(not(feature = "hw"))]
+    {
+        let _ = (out, build);
+        tracing::info!(kind, "hardware collectors are not compiled");
+        return;
+    }
+    #[cfg(feature = "hw")]
+    {
+        let _ = kind;
+        for target in configured {
+            out.push(build(target));
+        }
+    }
+}
+
+#[cfg(any(feature = "proxmox", feature = "hw"))]
 pub(crate) fn http_agent(verify_tls: bool) -> Result<ureq::Agent, String> {
     if verify_tls {
         return Ok(ureq::Agent::new());

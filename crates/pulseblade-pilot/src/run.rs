@@ -19,6 +19,9 @@ When the workload attribute fault is readiness_port, plan k8s.set_readiness_port
 with that container and container_port. Do not plan k8s.rollout_restart or k8s.scale \
 for a readiness port mismatch. Plan k8s.rollout_restart only when the container is \
 crash-looping or not running. \
+A TrueNAS pool, iDRAC chassis, or PDU fault is explained from the resource health and fault attribute. \
+Plan idrac.power_cycle only when the BMC is up and the host is not responding, and only as an approval. \
+Plan pdu.outlet_on to restore an outlet that should be on. Never plan pdu.outlet_off. \
 Use state_snapshot with no arguments or detail=brief, short metrics_query ranges, \
 and one resource_explain. Write a short conclusion with memory_note on the resource. \
 Propose remediation with action_plan and pass that finding's id as finding_id. \
