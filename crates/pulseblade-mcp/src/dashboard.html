@@ -1046,6 +1046,13 @@ function gapSpans(series, win) {
   if (now - end >= step * 2) spans.push({ from: end, to: now, kind: "after" });
   return spans;
 }
+function axisWhen(fromMs, toMs) {
+  const zone = zoneName();
+  const day = (ms) => new Date(ms).toLocaleDateString("en-US", { timeZone: zone, month: "short", day: "numeric" });
+  const a = new Date(fromMs).toISOString(), b = new Date(toMs).toISOString();
+  if (toMs - fromMs < 20 * 3600000 && day(fromMs) === day(toMs)) return `${clock(a)} – ${clock(b)}`;
+  return `${day(fromMs)} ${clock(a)} – ${day(toMs)} ${clock(b)}`;
+}
 function gapPhrase(span) {
   const a = new Date(span.from).toISOString(), b = new Date(span.to).toISOString();
   if (span.kind === "before") return `no samples before ${clock(b)}`;
@@ -1124,7 +1131,7 @@ function trendSvg(series, metric, win) {
   const lines = segs.filter((s) => s.length > 1).map((s) => `<polyline points="${s.map((p) => p[0].toFixed(1) + "," + p[1].toFixed(1)).join(" ")}" fill="none" stroke="var(--amber)" stroke-width="1.8" vector-effect="non-scaling-stroke"/>`).join("");
   const s = series.stats || {};
   const holes = gapSpans(series, win);
-  const when = `${clock(new Date(from).toISOString())} – ${clock(new Date(now).toISOString())}`;
+  const when = axisWhen(from, now);
   return `<div class="when">${esc(when)}</div><svg class="trend" viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(metric)}${holes.length ? ", " + holes.map(gapPhrase).join("; ") : ""}">
     <text x="4" y="${T + 8}" fill="var(--faint)" font-size="11">${esc(fmt(metric, max))}</text>
     <text x="4" y="${H - 4}" fill="var(--faint)" font-size="11">${esc(fmt(metric, min))}</text>
