@@ -218,7 +218,12 @@
   .approve label { display: flex; gap: 6px; align-items: center; font-size: 12px; color: var(--muted); }
   .approve input { min-width: 12em; }
   svg.spark { width: 100%; height: 64px; display: block; }
-  .sparkmeta { display: flex; justify-content: space-between; color: var(--muted); font-size: 12px; }
+  .sparkmeta { display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap; color: var(--muted); font-size: 12px; }
+  svg.trend { width: 100%; height: 148px; display: block; }
+  .trendgrid { display: grid; grid-template-columns: 1fr; gap: 16px; }
+  @media (min-width: 960px) { .trendgrid { grid-template-columns: 1fr 1fr; } }
+  .trendcard h3 { margin: 0 0 2px; font-size: 14px; font-weight: 600; }
+  .trendcard .when { font-size: 12px; color: var(--faint); margin-bottom: 4px; }
   .kind > button { width: 100%; display: flex; align-items: center; gap: 8px; background: none; border: 0; border-radius: 6px; padding: 6px 2px; text-align: left; font-size: 14px; color: var(--text); }
   .kind > button:hover { background: var(--hover); border-color: transparent; }
   .kind > button .caret { width: 10px; color: var(--faint); font-size: 10px; }
@@ -329,7 +334,8 @@ const ic = (n, cls = "", label = "") => n ? `<svg class="ic ${cls}" ${label ? `r
 const osIcon = (os) => /proxmox/i.test(os || "") ? "pve" : /debian/i.test(os || "") ? "debian" : /ubuntu/i.test(os || "") ? "ubuntu" : /arch|cachy|manjaro|endeavour/i.test(os || "") ? "arch" : /linux/i.test(os || "") ? "linux" : "";
 const machineIcon = (m) => m.pnode ? "pve" : osIcon(((m.host || {}).attrs || {}).os || "");
 const DOCKERISH = /^(docker|containerd)(\.service)?$|^docker0$|^ctr:/;
-const TABS = [["overview", "Overview"], ["fleet", "Fleet"], ["changes", "Changes"], ["actions", "Actions"]];
+const TABS = [["overview", "Overview"], ["fleet", "Fleet"], ["trends", "Trends"], ["changes", "Changes"], ["actions", "Actions"]];
+const TREND_WINS = ["1h", "6h", "24h", "7d"];
 const QUIET_METRICS = /^(load\.(5|15)m|mem\.available_bytes|proc\.rss_bytes|net\.(rx|tx)_errors|k8s\.replicas)$/;
 const KIND_ALIAS = { disk: "disk", disks: "disk", vm: "vm", vms: "vm", lxc: "container", container: "container", containers: "container", pod: "pod", pods: "pod",
   workload: "workload", workloads: "workload", service: "service", services: "service", unit: "service", units: "service", process: "process", processes: "process",
@@ -397,7 +403,8 @@ function loadFormat() {
 const state = {
   tab: "overview", fleet: "all", win: "1h", sel: null, filter: null, churn: false, metric: params.get("metric"),
   paused: false, timer: null, interval: 15, open: {}, showOk: {}, attnAll: false,
-  changesKey: "", spark: null, sparkLoading: null, searchHits: [], detailRecent: {}, detailFindings: {}, detailActions: {}, missing: {},
+  changesKey: "", sensorsKey: "", spark: null, sparkWin: "1h", sparkLoading: null, searchHits: [], detailRecent: {}, detailFindings: {}, detailActions: {}, missing: {},
+  trendHost: params.get("host") || null, trendWin: "6h", trendCache: {},
   deciding: null, decideErr: null,
   tz: loadZone(), serverTz: serverZone(), tf: loadFormat(), serverTf: serverFormat(), health: Object.assign({}, HEALTH_DEFAULTS), portalMsg: "",
 };
@@ -750,6 +757,7 @@ function badges() {
   return {
     overview: [items.length, items.some((i) => i.health === "failed" || i.critical) ? "bad" : "warn"],
     fleet: [fleet, "warn"],
+    trends: [0, ""],
     changes: [state.tab === "changes" ? D.changes.filter((c) => !isChurn(c) && c.ts && Date.now() - Date.parse(c.ts) <= winSecs() * 1000).length : hour, ""],
     actions: [pending().length, "warn"],
   };
@@ -803,7 +811,7 @@ function overviewView() {
     const m = [...M.machines.values()][0];
     return statsRow() + list + `<section class="card">${machineView(m.name, true)}</section>`;
   }
-  return statsRow() + list + `<section class="card"><h2>Scopes</h2>${scopeLines(all) || `<div class="empty">No scopes yet.</div>`}</section>`;
+  return statsRow() + list + hardwareCard() + `<section class="card"><h2>Scopes</h2>${scopeLines(all) || `<div class="empty">No scopes yet.</div>`}</section>`;
 }
 
 function meter(label, v) {
@@ -822,9 +830,10 @@ function machineTile(m) {
     : `<span class="num">${a.cpu_count || "?"} cpu</span>`;
   const glyph = m.type === "k8s" ? "" : ic(machineIcon(m), "", a.os ? String(a.os).replace(/^Linux \((.*)\)$/, "$1") : (m.pnode ? "Proxmox VE" : ""));
   const guests = m.type === "pve" ? `${plural(m.rs.filter((r) => r.kind === "vm").length, "VM")} · ${m.rs.filter((r) => r.id.startsWith("lxc:")).length} LXC` : "";
+  const sense = sensorBlurb(m);
   const foot = m.stale ? `<div class="tfoot">${m.shuttingDown ? "shut down" : "stale"} · last push ${ago(m.age)} ago</div>`
-    : m.failed || m.degraded ? `<div class="tfoot">${[guests, issues(m)].filter(Boolean).join(" · ")}</div>`
-    : `<div class="tfoot">${guests || plural(m.own.length, "resource") + " ok"}</div>`;
+    : m.failed || m.degraded ? `<div class="tfoot">${[guests, issues(m), sense].filter(Boolean).join(" · ")}</div>`
+    : `<div class="tfoot">${[guests || plural(m.own.length, "resource") + " ok", sense].filter(Boolean).join(" · ")}</div>`;
   return `<button type="button" class="tile ${m.stale ? "stale" : ""} ${sel ? "sel" : ""}" data-machine="${esc(m.name)}" title="${esc(a.os || "")}">
     <div class="tname">${dot(m.stale ? "unknown" : health)}<b>${esc(m.name)}</b>${badge}${glyph}</div>
     ${meter("cpu", m.cpu)}${meter("mem", m.mem)}${m.type === "pve" ? meter("store", m.stor) : meter("disk", m.disk)}${foot}</button>`;
@@ -941,11 +950,113 @@ function actionsView() {
     }).join("") : `<div class="empty">No runs yet.</div>`}</section>`;
 }
 
-function sparkKey(id, metric) { return id + "|" + metric + "|1h"; }
+function sensorBlurb(m) {
+  const sensors = (m.rs || []).filter((r) => r.kind === "sensor");
+  const temps = sensors.map((r) => r.metrics["temp.c"]).filter((v) => v != null);
+  const fans = sensors.map((r) => r.metrics["fan.rpm"]).filter((v) => v != null);
+  const pressure = sensors.find((r) => r.metrics["pressure.memory_pct"] != null || r.metrics["pressure.io_pct"] != null);
+  const parts = [];
+  if (temps.length) parts.push(`${Math.round(Math.max(...temps))}°C`);
+  if (fans.length) parts.push(`${Math.round(Math.max(...fans))} rpm`);
+  if (pressure) parts.push(`stall ${fmt("pressure.memory_pct", pressure.metrics["pressure.memory_pct"])}/${fmt("pressure.io_pct", pressure.metrics["pressure.io_pct"])}`);
+  return parts.join(" · ");
+}
+function sensorHot(m) {
+  return (m.rs || []).some((r) => r.kind === "sensor" && (bad(r) || (r.metrics["temp.c"] || 0) >= 70 || (r.metrics["pressure.memory_pct"] || 0) >= 20 || (r.metrics["pressure.io_pct"] || 0) >= 20));
+}
+function hardwareCard() {
+  if (!M) return "";
+  const rows = [...M.machines.values()].filter((m) => (m.rs || []).some((r) => r.kind === "sensor")).sort(machineOrder);
+  if (!rows.length) return "";
+  const shown = state.showOk.hw ? rows : rows.slice(0, 8);
+  return `<section class="card"><h2>Hardware<span class="right"><button type="button" class="linkish" data-tab="trends">trends ›</button></span></h2>
+    ${shown.map((m) => `<button type="button" class="sline" data-machine="${esc(m.name)}">${dot(sensorHot(m) ? "degraded" : "ok")}<span>${esc(m.name)}</span><span class="right">${esc(sensorBlurb(m) || "no reading")}</span></button>`).join("")}
+    ${rows.length > shown.length ? `<button type="button" class="linkish" data-showok="hw">show ${rows.length - shown.length} more</button>` : ""}</section>`;
+}
+function seriesTitle(resource, metric) {
+  if (metric === "cpu.used_pct") return "CPU";
+  if (metric === "mem.used_pct") return "Memory";
+  if (metric === "disk.used_pct") return "Disk " + resource.name;
+  if (metric === "temp.c") return resource.name + " temperature";
+  if (metric === "fan.rpm") return resource.name + " fan";
+  if (metric === "power.watts") return resource.name + " power";
+  if (metric === "pressure.memory_pct") return "Memory stall";
+  if (metric === "pressure.io_pct") return "I/O stall";
+  if (metric === "edac.ue") return "Uncorrectable memory errors";
+  if (metric === "edac.ce") return "Corrected memory errors";
+  if (metric === "cpu.throttle") return "CPU throttle";
+  return resource.name + " · " + metric;
+}
+function wantedSeries(m) {
+  const out = [];
+  const push = (resource, metric) => {
+    if (!resource || resource.metrics[metric] == null || out.some((w) => w.id === resource.id && w.metric === metric)) return;
+    out.push({ id: resource.id, metric, title: seriesTitle(resource, metric) });
+  };
+  if (m.host) { push(m.host, "cpu.used_pct"); push(m.host, "mem.used_pct"); }
+  const disks = m.rs.filter((r) => r.kind === "disk" && r.metrics["disk.used_pct"] != null).sort((a, b) => b.metrics["disk.used_pct"] - a.metrics["disk.used_pct"]);
+  if (disks[0]) push(disks[0], "disk.used_pct");
+  for (const s of m.rs.filter((r) => r.kind === "sensor" && (s.metrics["pressure.memory_pct"] != null || s.metrics["pressure.io_pct"] != null))) {
+    push(s, "pressure.memory_pct");
+    push(s, "pressure.io_pct");
+  }
+  m.rs.filter((r) => r.kind === "sensor" && r.metrics["temp.c"] != null).sort((a, b) => b.metrics["temp.c"] - a.metrics["temp.c"]).slice(0, 6).forEach((s) => push(s, "temp.c"));
+  m.rs.filter((r) => r.kind === "sensor" && r.metrics["fan.rpm"] != null).slice(0, 4).forEach((s) => push(s, "fan.rpm"));
+  m.rs.filter((r) => r.kind === "sensor" && bad(r)).forEach((s) => Object.keys(s.metrics || {}).forEach((metric) => { if (!QUIET_METRICS.test(metric)) push(s, metric); }));
+  return out.slice(0, 12);
+}
+function trendSvg(series, metric) {
+  const values = series && series.values || [];
+  const nums = values.filter((v) => v != null);
+  if (nums.length < 2) return `<div class="empty small">${series && series.error ? esc(series.error) : "Not enough history in this window yet."}</div>`;
+  const W = 640, H = 148, L = 44, R = 8, T = 10, B = 8;
+  const min = Math.min(...nums), max = Math.max(...nums), pad = (max - min) * 0.08 || Math.abs(max) * 0.08 || 1;
+  const lo = min - pad, hi = max + pad, span = hi - lo || 1;
+  const x = (i) => L + (values.length < 2 ? 0 : i * (W - L - R) / (values.length - 1));
+  const y = (v) => T + (1 - (v - lo) / span) * (H - T - B);
+  const segs = [];
+  let cur = [];
+  values.forEach((v, i) => {
+    if (v == null) { if (cur.length) segs.push(cur); cur = []; }
+    else cur.push([x(i), y(v)]);
+  });
+  if (cur.length) segs.push(cur);
+  const lines = segs.filter((s) => s.length > 1).map((s) => `<polyline points="${s.map((p) => p[0].toFixed(1) + "," + p[1].toFixed(1)).join(" ")}" fill="none" stroke="var(--amber)" stroke-width="1.8" vector-effect="non-scaling-stroke"/>`).join("");
+  const s = series.stats || {};
+  const endMs = series.start ? Date.parse(series.start) + (values.length - 1) * (series.step_secs || 0) * 1000 : NaN;
+  const when = series.start && !Number.isNaN(endMs) ? `${clock(series.start)} – ${clock(new Date(endMs).toISOString())}` : "";
+  return `<div class="when">${esc(when)}</div><svg class="trend" viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(metric)}">
+    <text x="4" y="${T + 8}" fill="var(--faint)" font-size="11">${esc(fmt(metric, max))}</text>
+    <text x="4" y="${H - 4}" fill="var(--faint)" font-size="11">${esc(fmt(metric, min))}</text>
+    <line x1="${L}" y1="${T}" x2="${L}" y2="${H - B}" stroke="var(--line)" />
+    ${lines}</svg>
+    <div class="sparkmeta num"><span>min ${esc(fmt(metric, s.min != null ? s.min : min))}</span><span>avg ${esc(fmt(metric, s.avg != null ? s.avg : nums.reduce((a, b) => a + b, 0) / nums.length))}</span><span>max ${esc(fmt(metric, s.max != null ? s.max : max))}</span><span>now ${esc(fmt(metric, s.last != null ? s.last : nums[nums.length - 1]))}</span></div>`;
+}
+function trendsView() {
+  const machines = M ? [...M.machines.values()].sort(machineOrder) : [];
+  if ((!state.trendHost || !M.machines.has(state.trendHost)) && machines.length) {
+    const picked = state.sel && state.sel.t === "machine" && M.machines.has(state.sel.id) ? state.sel.id : machines[0].name;
+    state.trendHost = picked;
+  }
+  const win = TREND_WINS.includes(state.trendWin) ? state.trendWin : "6h";
+  state.trendWin = win;
+  const m = state.trendHost && M.machines.get(state.trendHost);
+  const picker = `<label class="small">host <select id="trend-host" aria-label="Host">${machines.map((x) => `<option value="${esc(x.name)}" ${x.name === state.trendHost ? "selected" : ""}>${esc(x.name)}</option>`).join("")}</select></label>`;
+  const ranges = TREND_WINS.map((w) => `<button type="button" data-trendwin="${w}" aria-pressed="${win === w}">${w}</button>`).join("");
+  const want = m ? wantedSeries(m) : [];
+  const cards = want.map((w) => {
+    const series = state.trendCache[w.id + "|" + w.metric + "|" + win];
+    return `<div class="trendcard"><h3>${esc(w.title)}</h3>${series ? trendSvg(series, w.metric) : `<div class="empty small">Loading…</div>`}</div>`;
+  }).join("");
+  return `<div class="subnav"><div class="seg" role="group" aria-label="Time range">${ranges}</div>${picker}</div>
+    <section class="card">${m ? `<div class="facts">${esc(sensorBlurb(m) || "cpu " + fmt("x_pct", m.cpu) + " · mem " + fmt("x_pct", m.mem))}</div><div class="trendgrid">${cards || `<div class="empty">No series for this host yet.</div>`}</div>` : `<div class="empty">No hosts yet.</div>`}</section>`;
+}
+
+function sparkKey(id, metric) { return id + "|" + metric + "|" + (state.sparkWin || "1h"); }
 function chartMetric(r) {
   const keys = Object.keys(r.metrics || {}).filter((k) => r.metrics[k] != null && !QUIET_METRICS.test(k));
   if (state.metric && keys.includes(state.metric)) return state.metric;
-  return keys.find((k) => k.endsWith("_pct")) || null;
+  return keys.find((k) => k.endsWith("_pct")) || keys.find((k) => k === "temp.c" || k === "fan.rpm" || k === "power.watts" || k === "cpu.throttle") || keys[0] || null;
 }
 function spark(series, metric) {
   const vals = (series.values || []).filter((v) => v != null);
@@ -956,14 +1067,15 @@ function spark(series, metric) {
   const avg = s.avg != null ? s.avg : vals.reduce((a, b) => a + b, 0) / vals.length;
   return `<svg class="spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" aria-hidden="true">
     <polyline points="${pts.join(" ")}" fill="none" stroke="var(--amber)" stroke-width="1.6" vector-effect="non-scaling-stroke"/></svg>
-    <div class="sparkmeta num"><span>1h · min ${esc(fmt(metric, s.min != null ? s.min : min))}</span><span>avg ${esc(fmt(metric, avg))}</span><span>max ${esc(fmt(metric, s.max != null ? s.max : max))}</span><span>now ${esc(fmt(metric, s.last != null ? s.last : vals[vals.length - 1]))}</span></div>`;
+    <div class="sparkmeta num"><span>${esc(state.sparkWin || "1h")} · min ${esc(fmt(metric, s.min != null ? s.min : min))}</span><span>avg ${esc(fmt(metric, avg))}</span><span>max ${esc(fmt(metric, s.max != null ? s.max : max))}</span><span>now ${esc(fmt(metric, s.last != null ? s.last : vals[vals.length - 1]))}</span></div>`;
 }
 function metricBlock(r, noChart) {
   const keys = Object.keys(r.metrics || {}).filter((k) => r.metrics[k] != null && !QUIET_METRICS.test(k));
   if (!keys.length) return "";
   const cur = keys.includes(state.metric) ? state.metric : keys[0];
   const drawn = !noChart && state.spark && state.spark.key === sparkKey(r.id, cur) && state.spark.series ? spark(state.spark.series, cur) : "";
-  return `<div class="chips">${keys.map((k) => `<button type="button" class="chip ${!noChart && k === cur ? "on" : ""}" ${noChart ? "" : `data-metric="${esc(k)}"`}>${esc(k)} <b>${esc(fmt(k, r.metrics[k]))}</b></button>`).join("")}</div>${drawn}`;
+  const wins = noChart ? "" : `<div class="seg" role="group" aria-label="Chart range">${TREND_WINS.map((w) => `<button type="button" data-sparkwin="${w}" aria-pressed="${(state.sparkWin || "1h") === w}">${w}</button>`).join("")}</div>`;
+  return `<div class="chips">${keys.map((k) => `<button type="button" class="chip ${!noChart && k === cur ? "on" : ""}" ${noChart ? "" : `data-metric="${esc(k)}"`}>${esc(k)} <b>${esc(fmt(k, r.metrics[k]))}</b></button>`).join("")}</div>${wins}${drawn}`;
 }
 function recentFor(pred, n, id) {
   const fromExplain = id && state.detailRecent[id];
@@ -999,7 +1111,7 @@ function procBusy(r) {
 function fold(key, title, count, list, inner) {
   const f = list.filter((r) => r.health === "failed").length, dg = list.filter((r) => r.health === "degraded").length;
   const unk = list.filter((r) => r.health === "unknown").length, busyN = list.filter(procBusy).length;
-  const open = state.open[key] ?? (f + dg + busyN > 0);
+  const open = state.open[key] ?? (key.endsWith("|sensor") || f + dg + busyN > 0);
   const st = f || dg ? `<span class="st">${issues({ failed: f, degraded: dg })}</span>` : busyN ? `<span class="st"><span class="t-degraded">${busyN} busy</span></span>` : `<span class="st faint">${unk ? `${unk} unknown` : "ok"}</span>`;
   return `<div class="kind"><button type="button" data-kind="${esc(key)}" aria-expanded="${open}"><span class="caret">${open ? "▾" : "▸"}</span>
     ${title} <span class="cnt">${count}</span>${st}</button>${open ? `<div class="body">${inner()}</div>` : ""}</div>`;
@@ -1235,7 +1347,7 @@ function renderPanel() {
 }
 function renderView() {
   if (state.tab === "fleet" && single()) state.tab = "overview";
-  $("view").innerHTML = state.tab === "fleet" ? fleetView() : state.tab === "changes" ? changesView() : state.tab === "actions" ? actionsView() : overviewView();
+  $("view").innerHTML = state.tab === "fleet" ? fleetView() : state.tab === "trends" ? trendsView() : state.tab === "changes" ? changesView() : state.tab === "actions" ? actionsView() : overviewView();
 }
 function renderFoot() {
   const s = D.status, gs = [...M.groups.values()], n = (t) => gs.filter((g) => g.type === t).length;
@@ -1272,11 +1384,51 @@ function syncUrl() {
   p.delete("kind");
   if (state.sel && state.sel.t === "res") p.set("select", state.sel.id); else if (state.sel && state.sel.t === "search" && state.sel.id) p.set("q", state.sel.id); else p.delete("select");
   if (state.metric) p.set("metric", state.metric); else p.delete("metric");
-  if (state.tab === "fleet" && state.fleet !== "all") p.set("fleet", state.fleet); else p.delete("fleet");
+  if (state.tab === "trends" && state.trendHost) p.set("host", state.trendHost); else p.delete("host");
+  if (state.tab === "trends") p.set("range", state.trendWin || "6h"); else p.delete("range");
   const next = "?" + p.toString();
   if (next !== location.search) history.replaceState(null, "", next);
 }
 
+async function loadSensors() {
+  if (!D.status || state.sensorsKey === D.status.as_of_seq) return;
+  const page = await api("/api/v1/snapshot?detail=brief&kind=sensor&limit=500");
+  mergeResources(page.resources || [], true);
+  state.sensorsKey = D.status.as_of_seq;
+}
+async function loadTrends() {
+  const m = M && state.trendHost && M.machines.get(state.trendHost);
+  if (!m) return;
+  const win = TREND_WINS.includes(state.trendWin) ? state.trendWin : "6h";
+  await Promise.all(wantedSeries(m).map(async (w) => {
+    const key = w.id + "|" + w.metric + "|" + win;
+    if (state.trendCache[key]) return;
+    try {
+      state.trendCache[key] = await api(`/api/v1/history?resource=${encodeURIComponent(w.id)}&metric=${encodeURIComponent(w.metric)}&since=${encodeURIComponent(win)}`);
+    } catch (e) {
+      state.trendCache[key] = { error: e.message || "history failed", values: [] };
+    }
+  }));
+}
+async function ensureTrends() {
+  if (state.tab !== "trends" || !M) return;
+  const machines = [...M.machines.values()];
+  if (!state.trendHost || !M.machines.has(state.trendHost)) {
+    state.trendHost = (state.sel && state.sel.t === "machine" && M.machines.has(state.sel.id) && state.sel.id) || (machines[0] && machines[0].name) || null;
+  }
+  if (state.trendHost) {
+    await loadMachine(state.trendHost);
+    const disks = await api(`/api/v1/snapshot?detail=brief&kind=disk&labels=${encodeURIComponent("host=" + state.trendHost)}&limit=50`);
+    mergeResources(disks.resources || [], true);
+  }
+  if (state.trendSeq !== (D.status && D.status.as_of_seq)) {
+    state.trendCache = {};
+    state.trendSeq = D.status && D.status.as_of_seq;
+  }
+  M = buildModel();
+  await loadTrends();
+  render();
+}
 async function loadChanges() {
   const key = D.status.as_of_seq + ":" + state.win;
   if (state.changesKey === key) return;
@@ -1383,6 +1535,7 @@ async function loadSel(sel) {
 async function enrich() {
   if (!D.status) return;
   await loadChanges();
+  await loadSensors();
   if (state.tab === "fleet") await loadFleetExtras();
   else if (k8sPresent() || pvePresent()) await loadNodesIfNeeded();
   const q = $("q") && $("q").value.trim();
@@ -1404,7 +1557,7 @@ async function ensureSpark() {
   if ((state.spark && state.spark.key === key) || state.sparkLoading === key) return;
   state.sparkLoading = key;
   try {
-    const series = await api(`/api/v1/history?resource=${encodeURIComponent(r.id)}&metric=${encodeURIComponent(metric)}&since=1h`);
+    const series = await api(`/api/v1/history?resource=${encodeURIComponent(r.id)}&metric=${encodeURIComponent(metric)}&since=${encodeURIComponent(state.sparkWin || "1h")}`);
     if (state.sparkLoading !== key) return;
     state.spark = { key, series };
     if (M) renderPanel();
@@ -1451,6 +1604,7 @@ async function refresh() {
     mergeResources([].concat(snap.hosts || [], snap.resources || []));
     await enrich();
     render();
+    if (state.tab === "trends") await ensureTrends();
     sweep();
     ensureSpark();
     showError(null);
@@ -1474,6 +1628,13 @@ function select(sel, keepMetric) {
   syncUrl();
 }
 const sameSel = (t, id) => state.sel && state.sel.t === t && state.sel.id === id;
+document.addEventListener("change", (ev) => {
+  if (ev.target.id !== "trend-host") return;
+  state.trendHost = ev.target.value;
+  state.trendCache = {};
+  ensureTrends().catch(showError);
+  syncUrl();
+});
 document.addEventListener("click", (ev) => {
   const decision = ev.target.closest("[data-approve],[data-deny],[data-dismiss],[data-recheck]");
   if (decision) {
@@ -1483,16 +1644,18 @@ document.addEventListener("click", (ev) => {
     else if (decision.dataset.recheck) decideRun(decision.dataset.recheck, "recheck");
     return;
   }
-  const t = ev.target.closest("[data-tab],[data-strip],[data-gofleet],[data-fleet],[data-win],[data-machine],[data-scope],[data-g],[data-res],[data-kind],[data-showok],[data-metric],[data-close],[data-churn],[data-attnall],[data-attnless],[data-preset],[data-theme-choice],[data-settings],[data-clients]");
+  const t = ev.target.closest("[data-tab],[data-strip],[data-gofleet],[data-fleet],[data-win],[data-trendwin],[data-sparkwin],[data-machine],[data-scope],[data-g],[data-res],[data-kind],[data-showok],[data-metric],[data-close],[data-churn],[data-attnall],[data-attnless],[data-preset],[data-theme-choice],[data-settings],[data-clients]");
   if (!t) return;
   const d = t.dataset;
   if (d.themeChoice) return setTheme(d.themeChoice);
   if (d.clients !== undefined) return select(sameSel("clients", "clients") ? null : { t: "clients", id: "clients" });
   if (d.settings !== undefined) return select(sameSel("settings", "settings") ? null : { t: "settings", id: "settings" });
-  if (d.tab) { state.tab = d.tab; render(); enrich().then(render).catch(showError); return syncUrl(); }
+  if (d.tab) { state.tab = d.tab; render(); enrich().then(() => state.tab === "trends" ? ensureTrends() : render()).catch(showError); return syncUrl(); }
   if (d.gofleet) { state.tab = "fleet"; state.fleet = d.gofleet; render(); enrich().then(render).catch(showError); return syncUrl(); }
   if (d.fleet) { state.fleet = d.fleet; render(); return syncUrl(); }
   if (d.win) { state.win = d.win; state.changesKey = ""; loadChanges().then(render).catch(showError); return; }
+  if (d.trendwin) { state.trendWin = d.trendwin; render(); ensureTrends().catch(showError); return syncUrl(); }
+  if (d.sparkwin) { state.sparkWin = d.sparkwin; state.spark = null; render(); ensureSpark(); return; }
   if (d.strip) { state.filter = state.filter === d.strip ? null : d.strip; return render(); }
   if (d.close !== undefined) { $("q").value = ""; return select(null); }
   if (d.preset) { $("q").value = d.preset; return select({ t: "search", id: d.preset }); }
@@ -1565,6 +1728,7 @@ $("live").onclick = () => {
 if (TABS.some(([k]) => k === params.get("tab"))) state.tab = params.get("tab");
 if (["k8s", "pve", "host", "all"].includes(params.get("fleet"))) state.fleet = params.get("fleet");
 if (["15m", "1h", "6h", "24h"].includes(params.get("win"))) state.win = params.get("win");
+if (TREND_WINS.includes(params.get("range"))) state.trendWin = params.get("range");
 if (params.get("filter")) state.filter = params.get("filter");
 const initialQ = [params.get("kind") ? "kind:" + params.get("kind") : "", params.get("q") || ""].filter(Boolean).join(" ");
 if (initialQ) $("q").value = initialQ;
