@@ -413,7 +413,7 @@ const state = {
   paused: false, timer: null, interval: 15, open: {}, showOk: {}, attnAll: false,
   changesKey: "", sensorsKey: "", spark: null, sparkWin: "1h", sparkLoading: null, searchHits: [], detailRecent: {}, detailFindings: {}, detailActions: {}, missing: {},
   trendHost: params.get("host") || null, trendWin: "6h", trendCache: {},
-  gapWin: "24h", gapCache: {}, gapKey: "", gapAt: 0, gapTicket: "",
+  gapWin: "24h", gapCache: {}, gapKey: "", gapAt: 0, gapFlight: "",
   deciding: null, decideErr: null,
   tz: loadZone(), serverTz: serverZone(), tf: loadFormat(), serverTf: serverFormat(), health: Object.assign({}, HEALTH_DEFAULTS), portalMsg: "",
 };
@@ -1187,12 +1187,14 @@ function gapsView() {
   const ranges = TREND_WINS.map((w) => `<button type="button" data-gapwin="${w}" aria-pressed="${win === w}">${w}</button>`).join("");
   const live = staleSources().map((s) => ({ name: s.name, id: s.id, text: `${s.what} · ${ago(s.age)} ago` })).concat(offlineFindings().map((f) => ({ name: (byId.get(f.resource_id) || {}).name || f.summary, id: f.resource_id, text: f.summary })));
   const hosts = M ? [...M.machines.values()].filter((m) => m.host) : [];
-  const ready = hosts.length > 0 && hosts.every((m) => state.gapCache[m.host.id + "|" + win]);
-  const clusters = ready ? groupGaps(hostCpuGaps(win)) : [];
+  const loadedN = hosts.filter((m) => state.gapCache[m.host.id + "|" + win]).length;
+  const ready = hosts.length > 0 && loadedN === hosts.length;
+  const clusters = loadedN ? groupGaps(hostCpuGaps(win)) : [];
   const liveCard = `<section class="card"><h2>Outages<span class="right faint">${live.length || "none"}</span></h2>
     ${live.length ? live.map((r) => `<button type="button" class="gaprow" ${r.id ? `data-res="${esc(r.id)}"` : ""}>${dot("failed")}<span class="who">${esc(r.name)}</span><span class="when">${esc(r.text)}</span><span></span></button>`).join("") : `<div class="empty">Every agent is pushing.</div>`}</section>`;
-  const holeCard = `<section class="card"><h2>Missing samples<span class="right faint">${ready ? (clusters.length ? plural(clusters.length, "hole") : "none") : "reading"}</span></h2>
-    ${ready ? (clusters.length ? clusters.map((c, i) => gapCluster(c, i)).join("") : `<div class="empty">CPU history is continuous in this window.</div>`) : `<div class="empty small">Reading CPU history for ${plural(hosts.length, "host")}…</div>`}</section>`;
+  const holeBody = clusters.length ? clusters.map((c, i) => gapCluster(c, i)).join("") : (ready ? `<div class="empty">CPU history is continuous in this window.</div>` : `<div class="empty small">Reading CPU history…</div>`);
+  const progress = ready ? "" : `<div class="empty small">${loadedN} of ${hosts.length} hosts read</div>`;
+  const holeCard = `<section class="card"><h2>Missing samples<span class="right faint">${ready ? (clusters.length ? plural(clusters.length, "hole") : "none") : "reading"}</span></h2>${holeBody}${progress}</section>`;
   return `<div class="subnav"><div class="seg" role="group" aria-label="Time range">${ranges}</div><span class="small faint">CPU samples, one row per host</span></div>${liveCard}${holeCard}`;
 }
 function gapCluster(c, i) {
@@ -1592,26 +1594,30 @@ async function ensureGaps() {
   const win = TREND_WINS.includes(state.gapWin) ? state.gapWin : "24h";
   state.gapWin = win;
   const hosts = [...M.machines.values()].filter((m) => m.host);
-  const stale = state.gapKey !== win || Date.now() - (state.gapAt || 0) > 60000;
+  const stale = state.gapKey !== win || Date.now() - (state.gapAt || 0) > 180000;
   const missing = hosts.filter((m) => stale || !state.gapCache[m.host.id + "|" + win]);
-  if (!missing.length) return;
-  const ticket = win + ":" + Date.now();
-  state.gapTicket = ticket;
-  for (let i = 0; i < missing.length; i += 8) {
-    if (state.gapTicket !== ticket) return;
-    await Promise.all(missing.slice(i, i + 8).map(async (m) => {
-      const key = m.host.id + "|" + win;
-      try {
-        state.gapCache[key] = await api(`/api/v1/history?resource=${encodeURIComponent(m.host.id)}&metric=cpu.used_pct&since=${encodeURIComponent(win)}`);
-      } catch (e) {
-        state.gapCache[key] = { error: e.message || "history failed", values: [] };
-      }
-    }));
+  if (!missing.length || state.gapFlight === win) return;
+  state.gapFlight = win;
+  try {
+    for (let i = 0; i < missing.length; i += 4) {
+      await Promise.all(missing.slice(i, i + 4).map(async (m) => {
+        const key = m.host.id + "|" + win;
+        try {
+          state.gapCache[key] = await api(`/api/v1/history?resource=${encodeURIComponent(m.host.id)}&metric=cpu.used_pct&since=${encodeURIComponent(win)}`);
+        } catch (e) {
+          state.gapCache[key] = { error: e.message || "history failed", values: [] };
+        }
+      }));
+      if (state.tab === "gaps" && state.gapWin === win) render();
+    }
+    if (state.gapWin === win) {
+      state.gapKey = win;
+      state.gapAt = Date.now();
+    }
+    if (state.tab === "gaps" && state.gapWin === win) render();
+  } finally {
+    if (state.gapFlight === win) state.gapFlight = "";
   }
-  if (state.gapTicket !== ticket) return;
-  state.gapKey = win;
-  state.gapAt = Date.now();
-  render();
 }
 async function loadChanges() {
   const key = D.status.as_of_seq + ":" + state.win;
