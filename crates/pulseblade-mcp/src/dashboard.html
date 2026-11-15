@@ -222,8 +222,16 @@
   svg.trend { width: 100%; height: 148px; display: block; }
   .trendgrid { display: grid; grid-template-columns: 1fr; gap: 16px; }
   @media (min-width: 960px) { .trendgrid { grid-template-columns: 1fr 1fr; } }
-  .trendcard h3 { margin: 0 0 2px; font-size: 14px; font-weight: 600; }
+  .trendcard h3 { margin: 0 0 2px; font-size: 14px; font-weight: 600; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
   .trendcard .when { font-size: 12px; color: var(--faint); margin-bottom: 4px; }
+  .gaptag { font-size: 11px; font-weight: 600; letter-spacing: 0; text-transform: none; color: var(--bad-ink); background: var(--bad-bg); border-radius: 999px; padding: 1px 8px; }
+  .gaptag.quiet { color: var(--muted); background: var(--tint); }
+  .gapband { fill: var(--bad); opacity: .22; }
+  .gaprow { width: 100%; display: grid; grid-template-columns: 8px minmax(0, 1.2fr) minmax(0, 1fr) auto; gap: 8px; align-items: baseline; text-align: left; padding: 8px; margin: 0 -8px; border: 0; border-radius: 8px; background: var(--bad-bg); color: var(--text); font-size: 14px; }
+  .gaprow.quiet { background: var(--tint); }
+  .gaprow .who { font-weight: 600; }
+  .gaprow .when { color: var(--muted); font-size: 12px; }
+  .gaphosts { display: flex; flex-wrap: wrap; gap: 4px 10px; padding: 0 0 8px 16px; }
   .kind > button { width: 100%; display: flex; align-items: center; gap: 8px; background: none; border: 0; border-radius: 6px; padding: 6px 2px; text-align: left; font-size: 14px; color: var(--text); }
   .kind > button:hover { background: var(--hover); border-color: transparent; }
   .kind > button .caret { width: 10px; color: var(--faint); font-size: 10px; }
@@ -334,7 +342,7 @@ const ic = (n, cls = "", label = "") => n ? `<svg class="ic ${cls}" ${label ? `r
 const osIcon = (os) => /proxmox/i.test(os || "") ? "pve" : /debian/i.test(os || "") ? "debian" : /ubuntu/i.test(os || "") ? "ubuntu" : /arch|cachy|manjaro|endeavour/i.test(os || "") ? "arch" : /linux/i.test(os || "") ? "linux" : "";
 const machineIcon = (m) => m.pnode ? "pve" : osIcon(((m.host || {}).attrs || {}).os || "");
 const DOCKERISH = /^(docker|containerd)(\.service)?$|^docker0$|^ctr:/;
-const TABS = [["overview", "Overview"], ["fleet", "Fleet"], ["trends", "Trends"], ["changes", "Changes"], ["actions", "Actions"]];
+const TABS = [["overview", "Overview"], ["fleet", "Fleet"], ["trends", "Trends"], ["gaps", "Gaps"], ["changes", "Changes"], ["actions", "Actions"]];
 const TREND_WINS = ["1h", "6h", "24h", "7d"];
 const QUIET_METRICS = /^(load\.(5|15)m|mem\.available_bytes|proc\.rss_bytes|net\.(rx|tx)_errors|k8s\.replicas)$/;
 const KIND_ALIAS = { disk: "disk", disks: "disk", vm: "vm", vms: "vm", lxc: "container", container: "container", containers: "container", pod: "pod", pods: "pod",
@@ -405,6 +413,7 @@ const state = {
   paused: false, timer: null, interval: 15, open: {}, showOk: {}, attnAll: false,
   changesKey: "", sensorsKey: "", spark: null, sparkWin: "1h", sparkLoading: null, searchHits: [], detailRecent: {}, detailFindings: {}, detailActions: {}, missing: {},
   trendHost: params.get("host") || null, trendWin: "6h", trendCache: {},
+  gapWin: "24h", gapCache: {}, gapKey: "", gapAt: 0, gapTicket: "",
   deciding: null, decideErr: null,
   tz: loadZone(), serverTz: serverZone(), tf: loadFormat(), serverTf: serverFormat(), health: Object.assign({}, HEALTH_DEFAULTS), portalMsg: "",
 };
@@ -758,6 +767,7 @@ function badges() {
     overview: [items.length, items.some((i) => i.health === "failed" || i.critical) ? "bad" : "warn"],
     fleet: [fleet, "warn"],
     trends: [0, ""],
+    gaps: [gapBadge(), "warn"],
     changes: [state.tab === "changes" ? D.changes.filter((c) => !isChurn(c) && c.ts && Date.now() - Date.parse(c.ts) <= winSecs() * 1000).length : hour, ""],
     actions: [pending().length, "warn"],
   };
@@ -1005,31 +1015,121 @@ function wantedSeries(m) {
   m.rs.filter((r) => r.kind === "sensor" && bad(r)).forEach((s) => Object.keys(s.metrics || {}).forEach((metric) => { if (!QUIET_METRICS.test(metric)) push(s, metric); }));
   return out.slice(0, 12);
 }
-function trendSvg(series, metric) {
+function winMs(w) {
+  const n = Number.parseInt(w, 10);
+  if (!Number.isFinite(n) || n <= 0) return 6 * 3600000;
+  if (String(w).endsWith("d")) return n * 86400000;
+  if (String(w).endsWith("m")) return n * 60000;
+  return n * 3600000;
+}
+function gapSpans(series, win) {
+  const now = Date.now();
+  const from = now - winMs(win);
+  if (!series || series.error) return [];
+  const values = series.values || [];
+  const step = (Number(series.step_secs) || 0) * 1000;
+  const start = series.start ? Date.parse(series.start) : NaN;
+  if (!values.length || !step || Number.isNaN(start)) return [{ from, to: now, kind: "empty" }];
+  const spans = [];
+  if (start - from >= step * 2) spans.push({ from, to: start, kind: "before" });
+  let i = 0;
+  while (i < values.length) {
+    if (values[i] == null) {
+      let j = i;
+      while (j < values.length && values[j] == null) j++;
+      const a = start + i * step, b = start + j * step;
+      if (b > a) spans.push({ from: a, to: b, kind: "hole" });
+      i = j;
+    } else i++;
+  }
+  const end = start + values.length * step;
+  if (now - end >= step * 2) spans.push({ from: end, to: now, kind: "after" });
+  return spans;
+}
+function gapPhrase(span) {
+  const a = new Date(span.from).toISOString(), b = new Date(span.to).toISOString();
+  if (span.kind === "before") return `no samples before ${clock(b)}`;
+  if (span.kind === "after") return `silent since ${clock(a)}`;
+  if (span.kind === "empty") return "no samples in this window";
+  return `${clock(a)} – ${clock(b)} · ${ago((span.to - span.from) / 1000)}`;
+}
+function gapMissing(spans) {
+  return spans.filter((s) => s.kind === "hole" || s.kind === "after" || s.kind === "empty").reduce((n, s) => n + (s.to - s.from), 0);
+}
+function sameGap(last, g) {
+  if (last.kind !== g.kind) return false;
+  if (g.kind === "empty") return true;
+  if (g.kind === "before") return Math.abs(g.to - last.to) < 600000;
+  if (g.kind === "after") return Math.abs(g.from - last.from) < 600000;
+  return g.from <= last.to + 120000;
+}
+function groupGaps(items) {
+  const rows = items.slice().sort((a, b) => a.from - b.from || String(a.name).localeCompare(String(b.name)));
+  const out = [];
+  for (const g of rows) {
+    const last = out[out.length - 1];
+    if (last && sameGap(last, g)) {
+      last.to = Math.max(last.to, g.to);
+      last.from = Math.min(last.from, g.from);
+      if (!last.hosts.includes(g.name)) last.hosts.push(g.name);
+    } else out.push({ from: g.from, to: g.to, kind: g.kind, hosts: [g.name] });
+  }
+  return out.sort((a, b) => b.hosts.length - a.hosts.length || b.to - a.to);
+}
+function hostCpuGaps(win) {
+  const hosts = M ? [...M.machines.values()].filter((m) => m.host) : [];
+  const items = [];
+  for (const m of hosts) {
+    const series = state.gapCache[m.host.id + "|" + win];
+    if (!series || series.error) continue;
+    for (const span of gapSpans(series, win)) items.push({ name: m.name, from: span.from, to: span.to, kind: span.kind });
+  }
+  return items;
+}
+function gapBadge() {
+  const live = staleSources().length + offlineFindings().length;
+  const win = TREND_WINS.includes(state.gapWin) ? state.gapWin : "24h";
+  if (state.gapKey !== win) return live;
+  return live + groupGaps(hostCpuGaps(win)).length;
+}
+function offlineFindings() {
+  const seen = new Set(staleSources().map((s) => s.id).filter(Boolean));
+  return (D.findings.findings || []).filter((f) => /offline/i.test(f.rule || "") && !seen.has(f.resource_id));
+}
+function trendSvg(series, metric, win) {
   const values = series && series.values || [];
   const nums = values.filter((v) => v != null);
   if (nums.length < 2) return `<div class="empty small">${series && series.error ? esc(series.error) : "Not enough history in this window yet."}</div>`;
   const W = 640, H = 148, L = 44, R = 8, T = 10, B = 8;
   const min = Math.min(...nums), max = Math.max(...nums), pad = (max - min) * 0.08 || Math.abs(max) * 0.08 || 1;
   const lo = min - pad, hi = max + pad, span = hi - lo || 1;
-  const x = (i) => L + (values.length < 2 ? 0 : i * (W - L - R) / (values.length - 1));
+  const now = Date.now(), from = now - winMs(win);
+  const step = (Number(series.step_secs) || 0) * 1000;
+  const start = series.start ? Date.parse(series.start) : from;
+  const tOf = (i) => step ? start + i * step : from + i * (now - from) / Math.max(1, values.length - 1);
+  const x = (t) => L + Math.min(1, Math.max(0, (t - from) / (now - from || 1))) * (W - L - R);
   const y = (v) => T + (1 - (v - lo) / span) * (H - T - B);
+  const bands = gapSpans(series, win).map((s) => {
+    const x1 = x(s.from), x2 = x(s.to);
+    if (x2 - x1 < 1) return "";
+    return `<rect class="gapband" x="${x1.toFixed(1)}" y="${T}" width="${(x2 - x1).toFixed(1)}" height="${(H - T - B).toFixed(1)}"><title>${esc(gapPhrase(s))}</title></rect>`;
+  }).join("");
   const segs = [];
   let cur = [];
   values.forEach((v, i) => {
     if (v == null) { if (cur.length) segs.push(cur); cur = []; }
-    else cur.push([x(i), y(v)]);
+    else cur.push([x(tOf(i)), y(v)]);
   });
   if (cur.length) segs.push(cur);
   const lines = segs.filter((s) => s.length > 1).map((s) => `<polyline points="${s.map((p) => p[0].toFixed(1) + "," + p[1].toFixed(1)).join(" ")}" fill="none" stroke="var(--amber)" stroke-width="1.8" vector-effect="non-scaling-stroke"/>`).join("");
   const s = series.stats || {};
-  const endMs = series.start ? Date.parse(series.start) + (values.length - 1) * (series.step_secs || 0) * 1000 : NaN;
-  const when = series.start && !Number.isNaN(endMs) ? `${clock(series.start)} – ${clock(new Date(endMs).toISOString())}` : "";
-  return `<div class="when">${esc(when)}</div><svg class="trend" viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(metric)}">
+  const holes = gapSpans(series, win);
+  const when = `${clock(new Date(from).toISOString())} – ${clock(new Date(now).toISOString())}`;
+  return `<div class="when">${esc(when)}</div><svg class="trend" viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(metric)}${holes.length ? ", " + holes.map(gapPhrase).join("; ") : ""}">
     <text x="4" y="${T + 8}" fill="var(--faint)" font-size="11">${esc(fmt(metric, max))}</text>
     <text x="4" y="${H - 4}" fill="var(--faint)" font-size="11">${esc(fmt(metric, min))}</text>
     <line x1="${L}" y1="${T}" x2="${L}" y2="${H - B}" stroke="var(--line)" />
-    ${lines}</svg>
+    ${bands}${lines}</svg>
     <div class="sparkmeta num"><span>min ${esc(fmt(metric, s.min != null ? s.min : min))}</span><span>avg ${esc(fmt(metric, s.avg != null ? s.avg : nums.reduce((a, b) => a + b, 0) / nums.length))}</span><span>max ${esc(fmt(metric, s.max != null ? s.max : max))}</span><span>now ${esc(fmt(metric, s.last != null ? s.last : nums[nums.length - 1]))}</span></div>`;
 }
 function trendsView() {
@@ -1046,10 +1146,66 @@ function trendsView() {
   const want = m ? wantedSeries(m) : [];
   const cards = want.map((w) => {
     const series = state.trendCache[w.id + "|" + w.metric + "|" + win];
-    return `<div class="trendcard"><h3>${esc(w.title)}</h3>${series ? trendSvg(series, w.metric) : `<div class="empty small">Loading…</div>`}</div>`;
+    const spans = series ? gapSpans(series, win) : [];
+    const missing = gapMissing(spans);
+    const tag = spans.some((s) => s.kind === "hole" || s.kind === "after" || s.kind === "empty")
+      ? `<span class="gaptag">${esc(ago(missing / 1000))} missing</span>`
+      : spans.some((s) => s.kind === "before") ? `<span class="gaptag quiet">started late</span>` : "";
+    return `<div class="trendcard"><h3>${esc(w.title)}${tag}</h3>${series ? trendSvg(series, w.metric, win) : `<div class="empty small">Loading…</div>`}</div>`;
   }).join("");
+  const loaded = want.length && want.every((w) => state.trendCache[w.id + "|" + w.metric + "|" + win]);
+  const holes = hostSeriesGaps(want, win);
+  const gapCard = `<section class="card"><h2>Gaps in this window<span class="right faint">${holes.length ? plural(holes.length, "hole") : ""}</span></h2>
+    ${holes.length ? holes.map((g) => `<div class="gaprow ${g.kind === "before" ? "quiet" : ""}">${dot(g.kind === "before" ? "unknown" : "failed")}<span class="who">${esc(g.titles.join(", "))}</span><span class="when">${esc(gapPhrase(g))}</span><span></span></div>`).join("")
+      : loaded ? `<div class="empty">No gaps in this window.</div>` : `<div class="empty small">Checking history…</div>`}</section>`;
   return `<div class="subnav"><div class="seg" role="group" aria-label="Time range">${ranges}</div>${picker}</div>
+    ${m ? gapCard : ""}
     <section class="card">${m ? `<div class="facts">${esc(sensorBlurb(m) || "cpu " + fmt("x_pct", m.cpu) + " · mem " + fmt("x_pct", m.mem))}</div><div class="trendgrid">${cards || `<div class="empty">No series for this host yet.</div>`}</div>` : `<div class="empty">No hosts yet.</div>`}</section>`;
+}
+function hostSeriesGaps(want, win) {
+  const raw = [];
+  for (const w of want) {
+    const series = state.trendCache[w.id + "|" + w.metric + "|" + win];
+    if (!series || series.error) continue;
+    for (const span of gapSpans(series, win)) raw.push({ title: w.title, from: span.from, to: span.to, kind: span.kind });
+  }
+  raw.sort((a, b) => a.from - b.from);
+  const rows = [];
+  for (const g of raw) {
+    const last = rows[rows.length - 1];
+    if (last && last.kind === g.kind && g.from <= last.to + 120000) {
+      last.to = Math.max(last.to, g.to);
+      last.from = Math.min(last.from, g.from);
+      if (!last.titles.includes(g.title)) last.titles.push(g.title);
+    } else rows.push({ from: g.from, to: g.to, kind: g.kind, titles: [g.title] });
+  }
+  return rows;
+}
+function gapsView() {
+  const win = TREND_WINS.includes(state.gapWin) ? state.gapWin : "24h";
+  state.gapWin = win;
+  const ranges = TREND_WINS.map((w) => `<button type="button" data-gapwin="${w}" aria-pressed="${win === w}">${w}</button>`).join("");
+  const live = staleSources().map((s) => ({ name: s.name, id: s.id, text: `${s.what} · ${ago(s.age)} ago` })).concat(offlineFindings().map((f) => ({ name: (byId.get(f.resource_id) || {}).name || f.summary, id: f.resource_id, text: f.summary })));
+  const hosts = M ? [...M.machines.values()].filter((m) => m.host) : [];
+  const ready = hosts.length > 0 && hosts.every((m) => state.gapCache[m.host.id + "|" + win]);
+  const clusters = ready ? groupGaps(hostCpuGaps(win)) : [];
+  const liveCard = `<section class="card"><h2>Outages<span class="right faint">${live.length || "none"}</span></h2>
+    ${live.length ? live.map((r) => `<button type="button" class="gaprow" ${r.id ? `data-res="${esc(r.id)}"` : ""}>${dot("failed")}<span class="who">${esc(r.name)}</span><span class="when">${esc(r.text)}</span><span></span></button>`).join("") : `<div class="empty">Every agent is pushing.</div>`}</section>`;
+  const holeCard = `<section class="card"><h2>Missing samples<span class="right faint">${ready ? (clusters.length ? plural(clusters.length, "hole") : "none") : "reading"}</span></h2>
+    ${ready ? (clusters.length ? clusters.map((c, i) => gapCluster(c, i)).join("") : `<div class="empty">CPU history is continuous in this window.</div>`) : `<div class="empty small">Reading CPU history for ${plural(hosts.length, "host")}…</div>`}</section>`;
+  return `<div class="subnav"><div class="seg" role="group" aria-label="Time range">${ranges}</div><span class="small faint">CPU samples, one row per host</span></div>${liveCard}${holeCard}`;
+}
+function gapCluster(c, i) {
+  const names = c.hosts.slice().sort();
+  const open = !!state.showOk["gap:" + i];
+  const shown = open ? names : names.slice(0, 6);
+  const more = names.length - shown.length;
+  const who = names.length === 1 ? names[0] : `${names.length} hosts`;
+  const row = names.length === 1
+    ? `<button type="button" class="gaprow ${c.kind === "before" ? "quiet" : ""}" data-gaphost="${esc(names[0])}">${dot(c.kind === "before" ? "unknown" : "failed")}<span class="who">${esc(who)}</span><span class="when">${esc(gapPhrase(c))}</span><span class="go">›</span></button>`
+    : `<div class="gaprow ${c.kind === "before" ? "quiet" : ""}">${dot(c.kind === "before" ? "unknown" : "failed")}<span class="who">${esc(who)}</span><span class="when">${esc(gapPhrase(c))}</span><span></span></div>
+      <div class="gaphosts">${shown.map((n) => `<button type="button" class="linkish" data-gaphost="${esc(n)}">${esc(n)}</button>`).join("")}${more ? `<button type="button" class="linkish" data-showok="gap:${i}">show ${more} more</button>` : ""}</div>`;
+  return row;
 }
 
 function sparkKey(id, metric) { return id + "|" + metric + "|" + (state.sparkWin || "1h"); }
@@ -1347,7 +1503,7 @@ function renderPanel() {
 }
 function renderView() {
   if (state.tab === "fleet" && single()) state.tab = "overview";
-  $("view").innerHTML = state.tab === "fleet" ? fleetView() : state.tab === "trends" ? trendsView() : state.tab === "changes" ? changesView() : state.tab === "actions" ? actionsView() : overviewView();
+  $("view").innerHTML = state.tab === "fleet" ? fleetView() : state.tab === "trends" ? trendsView() : state.tab === "gaps" ? gapsView() : state.tab === "changes" ? changesView() : state.tab === "actions" ? actionsView() : overviewView();
 }
 function renderFoot() {
   const s = D.status, gs = [...M.groups.values()], n = (t) => gs.filter((g) => g.type === t).length;
@@ -1385,7 +1541,9 @@ function syncUrl() {
   if (state.sel && state.sel.t === "res") p.set("select", state.sel.id); else if (state.sel && state.sel.t === "search" && state.sel.id) p.set("q", state.sel.id); else p.delete("select");
   if (state.metric) p.set("metric", state.metric); else p.delete("metric");
   if (state.tab === "trends" && state.trendHost) p.set("host", state.trendHost); else p.delete("host");
-  if (state.tab === "trends") p.set("range", state.trendWin || "6h"); else p.delete("range");
+  if (state.tab === "trends") p.set("range", state.trendWin || "6h");
+  else if (state.tab === "gaps") p.set("range", state.gapWin || "24h");
+  else p.delete("range");
   const next = "?" + p.toString();
   if (next !== location.search) history.replaceState(null, "", next);
 }
@@ -1427,6 +1585,32 @@ async function ensureTrends() {
   }
   M = buildModel();
   await loadTrends();
+  render();
+}
+async function ensureGaps() {
+  if (state.tab !== "gaps" || !M) return;
+  const win = TREND_WINS.includes(state.gapWin) ? state.gapWin : "24h";
+  state.gapWin = win;
+  const hosts = [...M.machines.values()].filter((m) => m.host);
+  const stale = state.gapKey !== win || Date.now() - (state.gapAt || 0) > 60000;
+  const missing = hosts.filter((m) => stale || !state.gapCache[m.host.id + "|" + win]);
+  if (!missing.length) return;
+  const ticket = win + ":" + Date.now();
+  state.gapTicket = ticket;
+  for (let i = 0; i < missing.length; i += 8) {
+    if (state.gapTicket !== ticket) return;
+    await Promise.all(missing.slice(i, i + 8).map(async (m) => {
+      const key = m.host.id + "|" + win;
+      try {
+        state.gapCache[key] = await api(`/api/v1/history?resource=${encodeURIComponent(m.host.id)}&metric=cpu.used_pct&since=${encodeURIComponent(win)}`);
+      } catch (e) {
+        state.gapCache[key] = { error: e.message || "history failed", values: [] };
+      }
+    }));
+  }
+  if (state.gapTicket !== ticket) return;
+  state.gapKey = win;
+  state.gapAt = Date.now();
   render();
 }
 async function loadChanges() {
@@ -1605,6 +1789,7 @@ async function refresh() {
     await enrich();
     render();
     if (state.tab === "trends") await ensureTrends();
+    else if (state.tab === "gaps") await ensureGaps();
     sweep();
     ensureSpark();
     showError(null);
@@ -1644,17 +1829,32 @@ document.addEventListener("click", (ev) => {
     else if (decision.dataset.recheck) decideRun(decision.dataset.recheck, "recheck");
     return;
   }
-  const t = ev.target.closest("[data-tab],[data-strip],[data-gofleet],[data-fleet],[data-win],[data-trendwin],[data-sparkwin],[data-machine],[data-scope],[data-g],[data-res],[data-kind],[data-showok],[data-metric],[data-close],[data-churn],[data-attnall],[data-attnless],[data-preset],[data-theme-choice],[data-settings],[data-clients]");
+  const t = ev.target.closest("[data-tab],[data-strip],[data-gofleet],[data-fleet],[data-win],[data-trendwin],[data-gapwin],[data-gaphost],[data-sparkwin],[data-machine],[data-scope],[data-g],[data-res],[data-kind],[data-showok],[data-metric],[data-close],[data-churn],[data-attnall],[data-attnless],[data-preset],[data-theme-choice],[data-settings],[data-clients]");
   if (!t) return;
   const d = t.dataset;
   if (d.themeChoice) return setTheme(d.themeChoice);
   if (d.clients !== undefined) return select(sameSel("clients", "clients") ? null : { t: "clients", id: "clients" });
   if (d.settings !== undefined) return select(sameSel("settings", "settings") ? null : { t: "settings", id: "settings" });
-  if (d.tab) { state.tab = d.tab; render(); enrich().then(() => state.tab === "trends" ? ensureTrends() : render()).catch(showError); return syncUrl(); }
+  if (d.tab) {
+    state.tab = d.tab;
+    render();
+    enrich().then(() => state.tab === "trends" ? ensureTrends() : state.tab === "gaps" ? ensureGaps() : render()).catch(showError);
+    return syncUrl();
+  }
   if (d.gofleet) { state.tab = "fleet"; state.fleet = d.gofleet; render(); enrich().then(render).catch(showError); return syncUrl(); }
   if (d.fleet) { state.fleet = d.fleet; render(); return syncUrl(); }
   if (d.win) { state.win = d.win; state.changesKey = ""; loadChanges().then(render).catch(showError); return; }
   if (d.trendwin) { state.trendWin = d.trendwin; render(); ensureTrends().catch(showError); return syncUrl(); }
+  if (d.gapwin) { state.gapWin = d.gapwin; state.gapKey = ""; render(); ensureGaps().catch(showError); return syncUrl(); }
+  if (d.gaphost) {
+    state.tab = "trends";
+    state.trendHost = d.gaphost;
+    state.trendWin = state.gapWin || state.trendWin;
+    state.trendCache = {};
+    render();
+    ensureTrends().catch(showError);
+    return syncUrl();
+  }
   if (d.sparkwin) { state.sparkWin = d.sparkwin; state.spark = null; render(); ensureSpark(); return; }
   if (d.strip) { state.filter = state.filter === d.strip ? null : d.strip; return render(); }
   if (d.close !== undefined) { $("q").value = ""; return select(null); }
@@ -1728,7 +1928,10 @@ $("live").onclick = () => {
 if (TABS.some(([k]) => k === params.get("tab"))) state.tab = params.get("tab");
 if (["k8s", "pve", "host", "all"].includes(params.get("fleet"))) state.fleet = params.get("fleet");
 if (["15m", "1h", "6h", "24h"].includes(params.get("win"))) state.win = params.get("win");
-if (TREND_WINS.includes(params.get("range"))) state.trendWin = params.get("range");
+if (TREND_WINS.includes(params.get("range"))) {
+  if (state.tab === "gaps") state.gapWin = params.get("range");
+  else state.trendWin = params.get("range");
+}
 if (params.get("filter")) state.filter = params.get("filter");
 const initialQ = [params.get("kind") ? "kind:" + params.get("kind") : "", params.get("q") || ""].filter(Boolean).join(" ");
 if (initialQ) $("q").value = initialQ;
