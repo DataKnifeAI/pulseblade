@@ -12,6 +12,7 @@ mod processes;
 mod prometheus;
 mod proxmox;
 mod redfish;
+mod sensors;
 mod systemd;
 mod truenas;
 mod user;

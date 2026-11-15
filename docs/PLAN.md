@@ -81,7 +81,8 @@ Collectors poll the gear. Nothing is installed on the NAS, the BMCs, or the PDU.
 
 - TrueNAS at <https://tn.dataknife.net/>: JSON-RPC over `wss://<host>/api/current`. Pools, disks, replication jobs, and alerts. A pool at 85% is degraded and at 95% failed. A disk at 50°C is degraded and at 60°C failed.
 - PDU at <https://192.168.8.100/>: Redfish. Load, input voltage, and outlet state. Lost input is failed. Load at 80% is degraded and at 90% failed. An outlet that is off is not a failure.
-- iDRAC `idrac01`, `idrac02`, and `idrac05`: Redfish system health, inlet temperature against the BMC's own thresholds, and power-supply health.
+- iDRAC `idrac01`, `idrac02`, and `idrac05`: Redfish system health, inlet temperature against the BMC's own thresholds, power-supply health, and fan speed. A stopped or critical fan fails the chassis.
+- Each host reads its own sensors from sysfs and procfs. A temperature, fan, or power channel fails only on that chip's alarm or limit. Memory or I/O stall at 20% is degraded and at 50% failed. Uncorrectable ECC is failed, and corrected ECC is degraded. A thermal-throttle count that rises after the collector starts is degraded. An NVMe controller that is not `live` is failed. Inodes use the same 90/98 lines as disk space, and a read-only `/` is failed. Collector pods mount the node's `/sys` at `/host/sys` and `/proc` at `/host/proc`, read-only. A chip the unprivileged process cannot read is skipped.
 - Actions: `idrac.power_cycle` and `pdu.outlet_on` wait for approval. `pdu.outlet_off` is denied. The URL is the configured target, not a parameter.
 
 The API key and the Redfish passwords stay in environment variables. `verify_tls` stays on unless the config turns it off. The iDRAC certificates are expired, so those targets need `verify_tls = false` until they are reissued.

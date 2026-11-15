@@ -1,4 +1,6 @@
 use std::collections::BTreeSet;
+use std::ffi::CString;
+use std::os::unix::ffi::OsStrExt;
 use std::time::Instant;
 
 use pulseblade_core::{Health, Observation, Resource, ResourceKind, Sample};
@@ -20,6 +22,9 @@ pub struct HostCollector {
     disks: Disks,
     networks: Networks,
     last_net_refresh: Instant,
+    /// Last summed thermal-throttle count. The first pass records it and
+    /// does not page on history from before the collector started.
+    last_throttle: Option<u64>,
 }
 
 impl HostCollector {
@@ -32,6 +37,7 @@ impl HostCollector {
             disks: Disks::new_with_refreshed_list(),
             networks: Networks::new_with_refreshed_list(),
             last_net_refresh: Instant::now(),
+            last_throttle: None,
         }
     }
 
@@ -99,24 +105,32 @@ impl HostCollector {
                 continue;
             }
             let used_pct = pct(total - disk.available_space() as f64, total);
-            let health = disk_health(used_pct);
+            let inode_pct = inodes(disk.mount_point());
+            let root_ro = mount == "/" && disk.is_read_only();
+            let health = disk_health(used_pct, inode_pct, root_ro);
             let id = format!("disk:{}:{}", self.host, mount);
-            obs.resources.push(
-                Resource::new(&id, ResourceKind::Disk, &mount)
-                    .parent(&parent)
-                    .health(health)
-                    .label("host", &self.host)
-                    .attr("device", disk.name().to_string_lossy().to_string())
-                    .attr("fs", disk.file_system().to_string_lossy().to_string())
-                    .attr("kind", disk.kind().to_string())
-                    .attr("read_only", disk.is_read_only())
-                    .attr("removable", disk.is_removable())
-                    .attr("total_bytes", disk.total_space()),
-            );
+            let mut resource = Resource::new(&id, ResourceKind::Disk, &mount)
+                .parent(&parent)
+                .health(health)
+                .label("host", &self.host)
+                .attr("device", disk.name().to_string_lossy().to_string())
+                .attr("fs", disk.file_system().to_string_lossy().to_string())
+                .attr("kind", disk.kind().to_string())
+                .attr("read_only", disk.is_read_only())
+                .attr("removable", disk.is_removable())
+                .attr("total_bytes", disk.total_space());
+            if let Some(fault) = disk_fault(used_pct, inode_pct, root_ro) {
+                resource = resource.attr("fault", fault);
+            }
+            obs.resources.push(resource);
             obs.samples.extend([
                 Sample::new(&id, "disk.used_pct", used_pct),
                 Sample::new(&id, "disk.available_bytes", disk.available_space() as f64),
             ]);
+            if let Some(inode_pct) = inode_pct {
+                obs.samples
+                    .push(Sample::new(&id, "disk.inode_pct", inode_pct));
+            }
         }
     }
 
@@ -173,6 +187,9 @@ impl Collector for HostCollector {
         self.collect_host(&mut obs);
         self.collect_disks(&mut obs);
         self.collect_networks(&mut obs);
+        let sensors = crate::sensors::collect(&self.host, &mut self.last_throttle);
+        obs.resources.extend(sensors.resources);
+        obs.samples.extend(sensors.samples);
         Ok(obs)
     }
 }
@@ -185,13 +202,61 @@ fn pct(part: f64, total: f64) -> f64 {
     }
 }
 
-fn disk_health(used_pct: f64) -> Health {
-    if used_pct >= DISK_FAILED_PCT {
+/// Inode use on filesystems large enough to be a real disk. Config mounts
+/// and tmpfs report a handful of inodes and would look full.
+fn inodes(mount: &std::path::Path) -> Option<f64> {
+    let bytes = mount.as_os_str().as_bytes();
+    let path = CString::new(bytes).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } != 0 || stat.f_files < 100_000 {
+        return None;
+    }
+    let used = stat.f_files.saturating_sub(stat.f_ffree);
+    Some(pct(used as f64, stat.f_files as f64))
+}
+
+fn disk_health(used_pct: f64, inode_pct: Option<f64>, root_read_only: bool) -> Health {
+    let mut health = if used_pct >= DISK_FAILED_PCT {
         Health::Failed
     } else if used_pct >= DISK_DEGRADED_PCT {
         Health::Degraded
     } else {
         Health::Ok
+    };
+    if let Some(inode_pct) = inode_pct {
+        let inode = if inode_pct >= DISK_FAILED_PCT {
+            Health::Failed
+        } else if inode_pct >= DISK_DEGRADED_PCT {
+            Health::Degraded
+        } else {
+            Health::Ok
+        };
+        if inode < health {
+            health = inode;
+        }
+    }
+    if root_read_only {
+        Health::Failed
+    } else {
+        health
+    }
+}
+
+fn disk_fault(used_pct: f64, inode_pct: Option<f64>, root_read_only: bool) -> Option<String> {
+    let mut why = Vec::new();
+    if root_read_only {
+        why.push("read-only");
+    }
+    if used_pct >= DISK_DEGRADED_PCT {
+        why.push("filesystem full");
+    }
+    if inode_pct.is_some_and(|pct| pct >= DISK_DEGRADED_PCT) {
+        why.push("inodes full");
+    }
+    if why.is_empty() {
+        None
+    } else {
+        Some(why.join("; "))
     }
 }
 
@@ -206,9 +271,11 @@ mod tests {
 
     #[test]
     fn disk_thresholds() {
-        assert_eq!(disk_health(50.0), Health::Ok);
-        assert_eq!(disk_health(90.0), Health::Degraded);
-        assert_eq!(disk_health(99.0), Health::Failed);
+        assert_eq!(disk_health(50.0, None, false), Health::Ok);
+        assert_eq!(disk_health(90.0, None, false), Health::Degraded);
+        assert_eq!(disk_health(99.0, None, false), Health::Failed);
+        assert_eq!(disk_health(10.0, Some(99.0), false), Health::Failed);
+        assert_eq!(disk_health(10.0, None, true), Health::Failed);
     }
 
     #[test]

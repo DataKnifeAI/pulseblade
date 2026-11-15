@@ -2314,6 +2314,7 @@ dependencies = [
  "http",
  "k8s-openapi",
  "kube",
+ "libc",
  "native-tls",
  "pulseblade-core",
  "pulseblade-store",

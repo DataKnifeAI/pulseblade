@@ -127,6 +127,10 @@ spec:
                   key: poc-apps-worker-6
             - name: XDG_STATE_HOME
               value: /var/lib/pulseblade
+            - name: PULSEBLADE_SYSFS
+              value: /host/sys
+            - name: PULSEBLADE_PROC
+              value: /host/proc
           ports:
             - name: http
               containerPort: 7172
@@ -136,10 +140,24 @@ spec:
               readOnly: true
             - name: state
               mountPath: /var/lib/pulseblade
+            - name: host-sys
+              mountPath: /host/sys
+              readOnly: true
+            - name: host-proc
+              mountPath: /host/proc
+              readOnly: true
       volumes:
         - name: config
           configMap:
             name: pulseblade-prod
         - name: state
           emptyDir: {}
+        - name: host-sys
+          hostPath:
+            path: /sys
+            type: Directory
+        - name: host-proc
+          hostPath:
+            path: /proc
+            type: Directory
 

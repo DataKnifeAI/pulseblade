@@ -64,7 +64,7 @@ flowchart LR
 |-------|----------------|
 | `pulseblade-core` | Schema types (`Resource`, `Sample`, `Change`, `Checkpoint`, `Finding`, `ActionSpec`, `ActionRun`, `Note`), label matching, duration parsing. Every type derives `JsonSchema`. |
 | `pulseblade-store` | SQLite (`rusqlite`, bundled, WAL) on a node, Postgres on a hub that sets `database_url_env`. Resource state, append-only change journal, checkpoints, samples with retention, 5-minute buckets, and query-time downsampling, logs, notes, findings, action runs, and the hash-chained audit log. |
-| `pulseblade-collect` | `Collector` trait plus host (`sysinfo`), systemd, user systemd and session, journald, and top processes. Docker (`bollard`), Proxmox (REST), Kubernetes (`kube`), and hardware (TrueNAS WebSocket, iDRAC and PDU Redfish) are Cargo features and degrade when the daemon or API is absent. |
+| `pulseblade-collect` | `Collector` trait plus host (`sysinfo`, hwmon, pressure, ECC, NVMe state), systemd, user systemd and session, journald, and top processes. Docker (`bollard`), Proxmox (REST), Kubernetes (`kube`), and hardware (TrueNAS WebSocket, iDRAC and PDU Redfish) are Cargo features and degrade when the daemon or API is absent. |
 | `pulseblade-detect` | Threshold rules and EWMA anomaly detection. Findings carry recent changes and error lines for the resource, its parent, and its dependencies. |
 | `pulseblade-act` | Built-in action registry, node-local risk tiers, dry-run plans, approval gate, hash-chained audit. The node enforces its own policy. |
 | `pulseblade-mcp` | Shared query layer (`query.rs`), the `rmcp` tool surface over stdio and streamable HTTP, and the node's HTTP surface: JSON API, Prometheus exposition, embedded dashboard. |

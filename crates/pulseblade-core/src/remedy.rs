@@ -25,6 +25,7 @@ pub fn resource_kind_of_id(id: &str) -> Option<&'static str> {
         "chassis" => Some("chassis"),
         "pdu" => Some("pdu"),
         "outlet" => Some("outlet"),
+        "temp" | "fan" | "sensor" => Some("sensor"),
         _ => None,
     }
 }
@@ -105,6 +106,12 @@ pub fn resource_fields(id: &str) -> BTreeMap<String, String> {
             let outlet = parts.collect::<Vec<_>>().join(":");
             put(&mut fields, "name", name);
             put(&mut fields, "outlet", &outlet);
+        }
+        "temp" | "fan" | "sensor" => {
+            let host = parts.next().unwrap_or("");
+            let name = parts.collect::<Vec<_>>().join(":");
+            put(&mut fields, "host", host);
+            put(&mut fields, "name", &name);
         }
         _ => {
             if let Some(host) = crate::host_of_id(id) {

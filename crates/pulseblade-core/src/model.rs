@@ -39,10 +39,12 @@ pub enum ResourceKind {
     Pdu,
     /// One switched outlet on a PDU.
     Outlet,
+    /// A host sensor: temperature, fan, power, pressure, ECC, or a controller.
+    Sensor,
 }
 
 impl ResourceKind {
-    pub const ALL: [ResourceKind; 17] = [
+    pub const ALL: [ResourceKind; 18] = [
         Self::Host,
         Self::Disk,
         Self::NetIface,
@@ -60,6 +62,7 @@ impl ResourceKind {
         Self::Chassis,
         Self::Pdu,
         Self::Outlet,
+        Self::Sensor,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -81,6 +84,7 @@ impl ResourceKind {
             Self::Chassis => "chassis",
             Self::Pdu => "pdu",
             Self::Outlet => "outlet",
+            Self::Sensor => "sensor",
         }
     }
 }

@@ -20,12 +20,20 @@ pub struct BmcTemp {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct BmcFan {
+    pub name: String,
+    pub rpm: f64,
+    pub health: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct BmcView {
     pub name: String,
     pub model: String,
     pub power: String,
     pub health: String,
     pub temps: Vec<BmcTemp>,
+    pub fans: Vec<BmcFan>,
     pub supply_failed: bool,
 }
 
@@ -134,7 +142,53 @@ pub fn observe_chassis(view: &BmcView) -> Observation {
         obs.samples
             .push(Sample::new(&id, "chassis.temp_c", round2(temp)));
     }
+    for (index, fan) in view.fans.iter().enumerate() {
+        let label = fan_slug(&fan.name, index);
+        let fan_id = format!("fan:{name}:{label}");
+        let (fan_health, fan_fault) = fan_health(fan);
+        let mut resource = Resource::new(&fan_id, ResourceKind::Sensor, &fan.name)
+            .parent(host_id.clone())
+            .health(fan_health)
+            .label("host", name)
+            .attr("class", "fan");
+        if let Some(fan_fault) = fan_fault {
+            resource = resource.attr("fault", fan_fault);
+        }
+        obs.resources.push(resource);
+        obs.samples
+            .push(Sample::new(&fan_id, "fan.rpm", round2(fan.rpm)));
+    }
     obs
+}
+
+fn fan_health(fan: &BmcFan) -> (Health, Option<&'static str>) {
+    if fan.health.eq_ignore_ascii_case("critical") || fan.rpm <= 0.0 {
+        (Health::Failed, Some("fan stopped"))
+    } else if fan.health.eq_ignore_ascii_case("warning") {
+        (Health::Degraded, Some("fan warning"))
+    } else {
+        (Health::Ok, None)
+    }
+}
+
+fn fan_slug(name: &str, index: usize) -> String {
+    let mut out = String::new();
+    let mut spaced = false;
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+            spaced = false;
+        } else if !spaced && !out.is_empty() {
+            out.push('_');
+            spaced = true;
+        }
+    }
+    let out = out.trim_matches('_').to_string();
+    if out.is_empty() {
+        format!("fan{}", index + 1)
+    } else {
+        out
+    }
 }
 
 fn chassis_health(view: &BmcView) -> (Health, Option<String>) {
@@ -164,6 +218,17 @@ fn chassis_health(view: &BmcView) -> (Health, Option<String>) {
         } else if over_warn {
             health = worse(health, Health::Degraded);
             why.push("thermal warning");
+        }
+    }
+    for fan in &view.fans {
+        let (fan_state, fan_fault) = fan_health(fan);
+        if fan_state == Health::Failed {
+            health = Health::Failed;
+        } else if fan_state == Health::Degraded {
+            health = worse(health, Health::Degraded);
+        }
+        if let Some(fan_fault) = fan_fault {
+            why.push(fan_fault);
         }
     }
     if health == Health::Unknown {
@@ -349,6 +414,39 @@ pub fn parse_chassis(
             });
         }
     }
+    let mut fans = Vec::new();
+    if let Some(rows) = thermal
+        .and_then(|v| v.get("Fans"))
+        .and_then(|v| v.as_array())
+    {
+        for row in rows {
+            let state = row
+                .get("Status")
+                .and_then(|s| s.get("State"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("Enabled");
+            if state.eq_ignore_ascii_case("absent") || state.eq_ignore_ascii_case("disabled") {
+                continue;
+            }
+            let Some(rpm) = num(row.get("Reading")) else {
+                continue;
+            };
+            fans.push(BmcFan {
+                name: row
+                    .get("Name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                rpm,
+                health: row
+                    .get("Status")
+                    .and_then(|s| s.get("Health"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            });
+        }
+    }
     let supply_failed = power
         .and_then(|v| v.get("PowerSupplies"))
         .and_then(|v| v.as_array())
@@ -375,6 +473,7 @@ pub fn parse_chassis(
             .to_string(),
         health,
         temps,
+        fans,
         supply_failed,
     }
 }
@@ -698,6 +797,49 @@ mod tests {
         assert_eq!(chassis.attrs["power"], "On");
         assert_eq!(obs.samples[0].metric, "chassis.temp_c");
         assert_eq!(obs.samples[0].value, 48.0);
+    }
+
+    #[test]
+    fn a_stopped_fan_fails_the_chassis() {
+        let view = parse_chassis(
+            "idrac01",
+            &serde_json::json!({"PowerState": "On", "Status": {"Health": "OK"}}),
+            Some(&serde_json::json!({
+                "Fans": [
+                    {"Name": "Fan 1", "Reading": 0, "Status": {"Health": "Critical", "State": "Enabled"}},
+                    {"Name": "Fan 2", "Reading": 4200, "Status": {"Health": "OK", "State": "Enabled"}},
+                    {"Name": "Empty", "Reading": 0, "Status": {"State": "Absent"}}
+                ]
+            })),
+            None,
+        );
+        let obs = observe_chassis(&view);
+        let chassis = obs
+            .resources
+            .iter()
+            .find(|r| r.id == "chassis:idrac01")
+            .unwrap();
+        assert_eq!(chassis.health, Health::Failed);
+        assert!(chassis.attrs["fault"]
+            .as_str()
+            .unwrap()
+            .contains("fan stopped"));
+        let fan = obs
+            .resources
+            .iter()
+            .find(|r| r.id == "fan:idrac01:fan_1")
+            .unwrap();
+        assert_eq!(fan.kind, ResourceKind::Sensor);
+        assert_eq!(fan.health, Health::Failed);
+        assert!(obs.resources.iter().all(|r| r.id != "fan:idrac01:empty"));
+        assert_eq!(
+            obs.samples
+                .iter()
+                .find(|s| s.resource_id == "fan:idrac01:fan_2")
+                .unwrap()
+                .value,
+            4200.0
+        );
     }
 
     #[test]

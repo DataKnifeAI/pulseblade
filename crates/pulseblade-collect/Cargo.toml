@@ -19,6 +19,7 @@ pulseblade-core.workspace = true
 chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+libc = "0.2"
 sysinfo.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
