@@ -1,9 +1,14 @@
-# Publish deploy/Dockerfile to Harbor.
+# Publish deploy/Dockerfile to Harbor, then sign that image's digest.
 # Registry host, project, and credentials are group CI/CD variables
 # (HARBOR_REGISTRY, HARBOR_PROJECT, HARBOR_USERNAME, HARBOR_PASSWORD,
-# DOCKER_AUTH_CONFIG). Nothing secret belongs in this file.
+# DOCKER_AUTH_CONFIG). The release signing key is the file variable
+# PULSEBLADE_RELEASE_SIGNING_KEY. Nothing secret belongs in this file.
+include:
+  - local: deploy/ci/sign-release.gitlab-ci.yml
+
 stages:
   - build
+  - sign
 
 workflow:
   rules:
@@ -57,6 +62,7 @@ publish:
         --local context=. \
         --local dockerfile=. \
         --opt filename=deploy/Dockerfile \
+        --opt build-arg:PULSEBLADE_BUILD_ID=${CI_COMMIT_SHA} \
         --metadata-file image-metadata.json \
         --import-cache type=registry,ref="${DEST}:buildcache",ignore-error=true \
         --export-cache type=registry,ref="${DEST}:buildcache",mode=max \

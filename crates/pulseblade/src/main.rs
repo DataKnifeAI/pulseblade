@@ -1,6 +1,7 @@
 mod config;
 mod hub;
 mod node;
+mod release;
 mod status;
 mod webhook;
 
@@ -372,10 +373,15 @@ fn spawn_upstream(
             }
         }
     };
-    let poll = config.upstream.poll_secs;
-    let base = url.to_string();
+    let link = hub::UpstreamLink {
+        base: url.to_string(),
+        token,
+        tls,
+        poll_secs: config.upstream.poll_secs,
+        update: config.upstream.update.clone(),
+    };
     Some(std::thread::spawn(move || {
-        hub::run_upstream(store, actions, base, token, tls, poll, shutdown);
+        hub::run_upstream(store, actions, link, shutdown);
     }))
 }
 
@@ -614,6 +620,7 @@ async fn main() -> anyhow::Result<()> {
                 std::time::Duration::from_secs(config.hub.action_wait_secs.max(1)),
             );
             inner.set_health_defaults(config.health.clone());
+            inner.set_release_source(&config.hub.release.manifest, &config.hub.release.nodes);
             hub::serve(
                 listener,
                 inner,

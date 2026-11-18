@@ -1,0 +1,93 @@
+# Signs the image digest publish wrote to image-digest.txt.
+# Included from .gitlab-ci.yml. This job does not build or push an image.
+#
+# PULSEBLADE_RELEASE_SIGNING_KEY is a GitLab file variable: its value is a
+# path to a PKCS#8 ed25519 PEM. pulseblade-sign reads that path. The hub does
+# not. Do not commit the PEM, and do not put the key in this file.
+# Optional overrides, also names only: PULSEBLADE_RELEASE_URL,
+# PULSEBLADE_RELEASE_SEQUENCE, PULSEBLADE_RELEASE_VERSION,
+# PULSEBLADE_RELEASE_EXPIRES_SECS.
+
+sign-release:
+  stage: sign
+  image: lukemathwalker/cargo-chef:latest-rust-1.99.0-bookworm@sha256:2ee6e8edf0b91b5a7295071299596601710bccb243bd9735e0b9abf6e114582b
+  tags:
+    - kubernetes
+  timeout: 2h
+  # Same policy as publish: a newer main push must not cancel a release sign.
+  interruptible: false
+  needs:
+    - job: publish
+      artifacts: true
+  variables:
+    CARGO_HOME: $CI_PROJECT_DIR/.cargo
+    KUBERNETES_CPU_REQUEST: "2"
+    KUBERNETES_CPU_LIMIT: "2"
+    KUBERNETES_MEMORY_REQUEST: "3Gi"
+    KUBERNETES_MEMORY_LIMIT: "4Gi"
+  cache:
+    key:
+      files:
+        - Cargo.lock
+    paths:
+      - .cargo
+  artifacts:
+    paths:
+      - release.json
+      - release.json.pub
+    expire_in: 30 days
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  script:
+    - |
+      set -euo pipefail
+      if [ -z "${PULSEBLADE_RELEASE_SIGNING_KEY:-}" ] || [ ! -f "${PULSEBLADE_RELEASE_SIGNING_KEY}" ]; then
+        echo "PULSEBLADE_RELEASE_SIGNING_KEY must be a GitLab file variable (path to a PKCS#8 ed25519 PEM)"
+        exit 1
+      fi
+      digest=$(tr -d '[:space:]' < image-digest.txt)
+      case "${digest}" in
+        sha256:*) ;;
+        *) echo "image-digest.txt is not a sha256 digest"; exit 1 ;;
+      esac
+      if [ -n "${PULSEBLADE_RELEASE_URL:-}" ]; then
+        url="${PULSEBLADE_RELEASE_URL}"
+      else
+        if [ -z "${HARBOR_REGISTRY:-}" ] || [ -z "${HARBOR_PROJECT:-}" ]; then
+          echo "HARBOR_REGISTRY and HARBOR_PROJECT are required to name the artifact URL"
+          exit 1
+        fi
+        registry="${HARBOR_REGISTRY#https://}"
+        registry="${registry#http://}"
+        registry="${registry%/}"
+        url="https://${registry}/${HARBOR_PROJECT}/pulseblade/${digest}"
+      fi
+      case "${url}" in
+        https://*) ;;
+        *) echo "artifact URL must be https"; exit 1 ;;
+      esac
+      case "${url}" in
+        *\?*|*\@*|*'#'*) echo "artifact URL must not contain userinfo, a query, or a fragment"; exit 1 ;;
+      esac
+      if [ -n "${PULSEBLADE_RELEASE_SEQUENCE:-}" ]; then
+        sequence="${PULSEBLADE_RELEASE_SEQUENCE}"
+      else
+        sequence="${CI_PIPELINE_IID}"
+      fi
+      if [ -n "${PULSEBLADE_RELEASE_VERSION:-}" ]; then
+        version="${PULSEBLADE_RELEASE_VERSION}"
+      elif [ -n "${CI_COMMIT_TAG:-}" ]; then
+        version="${CI_COMMIT_TAG#v}"
+      else
+        version="0.1.0"
+      fi
+      cargo build --release --locked -p pulseblade --bin pulseblade-sign
+      ./target/release/pulseblade-sign \
+        --sequence "${sequence}" \
+        --version "${version}" \
+        --build-id "${CI_COMMIT_SHA}" \
+        --digest "${digest}" \
+        --url "${url}" \
+        --expires-secs "${PULSEBLADE_RELEASE_EXPIRES_SECS:-604800}" \
+        --out release.json

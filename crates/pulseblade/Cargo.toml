@@ -16,6 +16,7 @@ pulseblade-act.workspace = true
 pulseblade-mcp.workspace = true
 pulseblade-pilot.workspace = true
 ureq = { version = "2.12", default-features = false, features = ["json", "tls"] }
+ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tokio-rustls = "0.26"
 rustls-pemfile = "2"
@@ -40,6 +41,7 @@ hw = ["pulseblade-collect/hw"]
 
 [dev-dependencies]
 rcgen = "0.13"
+tempfile.workspace = true
 
 [[example]]
 name = "seed_demo"

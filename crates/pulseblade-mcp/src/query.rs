@@ -60,6 +60,10 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+fn is_zero_u64(n: &u64) -> bool {
+    *n == 0
+}
+
 fn is_zero(n: &usize) -> bool {
     *n == 0
 }
@@ -197,6 +201,19 @@ pub struct NodePushStatus {
     /// The last push was a shutdown. Absent when the node was still running.
     #[serde(default, skip_serializing_if = "is_false")]
     pub shutting_down: bool,
+    /// `systemd` or `kubernetes`. Empty when the node has not reported a build.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub runtime: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub version: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub build_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub digest: String,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub release_seq: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub update_state: String,
 }
 
 /// Self-health. `process_started` is the serving process's start time, if any.
@@ -247,6 +264,12 @@ fn node_push_status(now: DateTime<Utc>, row: &NodePush) -> NodePushStatus {
         last_push_age_secs: age_secs,
         stale,
         shutting_down: row.shutting_down,
+        runtime: row.runtime.clone(),
+        version: row.version.clone(),
+        build_id: row.build_id.clone(),
+        digest: row.digest.clone(),
+        release_seq: row.release_seq,
+        update_state: row.update_state.clone(),
     }
 }
 
@@ -1867,6 +1890,7 @@ mod tests {
                 last_push_ms: now.timestamp_millis(),
                 interval_secs: 15,
                 shutting_down: false,
+                ..NodePush::default()
             },
         );
         assert_eq!(fresh.node, "web1");
@@ -1882,6 +1906,7 @@ mod tests {
                 last_push_ms: (now - Duration::seconds(120)).timestamp_millis(),
                 interval_secs: 15,
                 shutting_down: false,
+                ..NodePush::default()
             },
         );
         assert!(silent.stale);
@@ -1895,6 +1920,7 @@ mod tests {
                 last_push_ms: 0,
                 interval_secs: 15,
                 shutting_down: false,
+                ..NodePush::default()
             },
         );
         assert!(unknown.stale);
@@ -1907,6 +1933,7 @@ mod tests {
                 last_push_ms: (now - Duration::seconds(40)).timestamp_millis(),
                 interval_secs: 15,
                 shutting_down: false,
+                ..NodePush::default()
             },
         );
         assert!(!recent.stale, "three 15s intervals have not elapsed");
@@ -1918,6 +1945,7 @@ mod tests {
                 last_push_ms: (now - Duration::seconds(46)).timestamp_millis(),
                 interval_secs: 15,
                 shutting_down: true,
+                ..NodePush::default()
             },
         );
         assert!(missed.stale);

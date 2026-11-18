@@ -20,6 +20,8 @@ use crate::{from_ms, Store, StoreError};
 pub const DEFAULT_PUSH_INTERVAL_SECS: i64 = 15;
 /// A node is stale after this many missed push intervals.
 pub const STALE_MISSED_PUSHES: i64 = 3;
+/// An announced update may suppress `host offline` only this long after the push.
+pub const MAX_UPDATE_WINDOW_MS: i64 = 5 * 60 * 1000;
 /// Finding rule for a node that stopped pushing. One open finding per host.
 pub const OFFLINE_RULE: &str = "host offline";
 
@@ -30,6 +32,31 @@ pub struct StampedSample {
     pub metric: String,
     pub ts: DateTime<Utc>,
     pub value: f64,
+}
+
+/// Build the node is running. Crate version alone does not show drift.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeBuild {
+    /// `systemd` or `kubernetes`.
+    #[serde(default)]
+    pub runtime: String,
+    #[serde(default)]
+    pub version: String,
+    /// Git commit or another id stamped at build time. `dev` when unset.
+    #[serde(default)]
+    pub build_id: String,
+    /// sha256 of the binary, or the image digest the pod is running.
+    #[serde(default)]
+    pub digest: String,
+    /// Release sequence this process is running. Zero when it has never applied one.
+    #[serde(default)]
+    pub sequence: u64,
+    /// `applying`, `verify_failed`, `reported`, `rolled_back`, or `accepted`.
+    #[serde(default)]
+    pub update_state: String,
+    /// When `update_state` is `applying`, silence until this instant is not offline.
+    #[serde(default)]
+    pub update_deadline_ms: i64,
 }
 
 /// What a node pushes after the hub's cursor.
@@ -58,6 +85,9 @@ pub struct NodeBatch {
     /// seq at or below the stored cursor as already ingested.
     #[serde(default)]
     pub journal_reset: bool,
+    /// Identity of the running build. Absent on a node that predates releases.
+    #[serde(default)]
+    pub build: NodeBuild,
 }
 
 /// Highest node journal seq and sample timestamp the hub has applied.
@@ -76,7 +106,7 @@ pub struct NodeCursor {
 /// One row of `node_cursors`: how far the hub has applied this node, and when
 /// it last accepted a push. `last_push_ms` is 0 for rows written before that
 /// column existed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct NodePush {
     pub node: String,
     pub seq: i64,
@@ -85,6 +115,13 @@ pub struct NodePush {
     pub interval_secs: i64,
     /// The last accepted push was marked `shutting_down`.
     pub shutting_down: bool,
+    pub runtime: String,
+    pub version: String,
+    pub build_id: String,
+    pub digest: String,
+    pub release_seq: u64,
+    pub update_state: String,
+    pub update_deadline_ms: i64,
 }
 
 impl NodePush {
@@ -392,10 +429,12 @@ fn ingest_batch(
             }
         }
     }
+    let (state, deadline, release_seq) = recorded_build(pushed_ms, &batch.build);
     sql.execute(
         "INSERT INTO node_cursors
-            (node_id, seq, sample_ms, last_push_ms, interval_secs, shutting_down, bucket_ms, event_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            (node_id, seq, sample_ms, last_push_ms, interval_secs, shutting_down, bucket_ms, event_id,
+             runtime, version, build_id, digest, release_seq, update_state, update_deadline_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
          ON CONFLICT(node_id) DO UPDATE SET
             seq = excluded.seq,
             sample_ms = excluded.sample_ms,
@@ -403,7 +442,14 @@ fn ingest_batch(
             interval_secs = excluded.interval_secs,
             shutting_down = excluded.shutting_down,
             bucket_ms = excluded.bucket_ms,
-            event_id = excluded.event_id",
+            event_id = excluded.event_id,
+            runtime = excluded.runtime,
+            version = excluded.version,
+            build_id = excluded.build_id,
+            digest = excluded.digest,
+            release_seq = excluded.release_seq,
+            update_state = excluded.update_state,
+            update_deadline_ms = excluded.update_deadline_ms",
         &[
             SqlVal::text(node_id),
             SqlVal::Int(cursor),
@@ -413,6 +459,13 @@ fn ingest_batch(
             SqlVal::Int(i64::from(batch.shutting_down)),
             SqlVal::Int(bucket_ms),
             SqlVal::Int(event_id),
+            SqlVal::text(&batch.build.runtime),
+            SqlVal::text(&batch.build.version),
+            SqlVal::text(&batch.build.build_id),
+            SqlVal::text(&batch.build.digest),
+            SqlVal::Int(release_seq),
+            SqlVal::text(state),
+            SqlVal::Int(deadline),
         ],
     )?;
     Ok(IngestResult {
@@ -577,6 +630,31 @@ fn runs_from_route_rows(
     Ok(out)
 }
 
+/// Keep a known update state. Only `applying` may carry a deadline, and only
+/// for [`MAX_UPDATE_WINDOW_MS`] after this push. A node cannot silence itself
+/// for longer than that.
+fn recorded_build(pushed_ms: i64, build: &NodeBuild) -> (String, i64, i64) {
+    let state = match build.update_state.as_str() {
+        "applying" | "verify_failed" | "reported" | "rolled_back" | "accepted" => {
+            build.update_state.clone()
+        }
+        _ => String::new(),
+    };
+    let release_seq = i64::try_from(build.sequence).unwrap_or(i64::MAX);
+    if state != "applying" {
+        return (state, 0, release_seq);
+    }
+    let cap = pushed_ms.saturating_add(MAX_UPDATE_WINDOW_MS);
+    if build.update_deadline_ms <= pushed_ms {
+        return (state, 0, release_seq);
+    }
+    (state, build.update_deadline_ms.min(cap), release_seq)
+}
+
+fn update_window_open(push: &NodePush, now_ms: i64) -> bool {
+    push.update_state == "applying" && push.update_deadline_ms > now_ms
+}
+
 fn is_deadlock(err: &StoreError) -> bool {
     let StoreError::Database(message) = err else {
         return false;
@@ -607,7 +685,9 @@ impl Store {
     pub fn node_pushes(&self) -> crate::Result<Vec<NodePush>> {
         self.with_sql(|sql| {
             sql.query(
-                "SELECT node_id, seq, last_push_ms, interval_secs, shutting_down
+                "SELECT node_id, seq, last_push_ms, interval_secs, shutting_down,
+                        runtime, version, build_id, digest, release_seq, update_state,
+                        update_deadline_ms
                  FROM node_cursors ORDER BY node_id",
                 &[],
                 |row| {
@@ -617,6 +697,13 @@ impl Store {
                         last_push_ms: row.int(2)?,
                         interval_secs: row.int(3)?,
                         shutting_down: row.int(4)? != 0,
+                        runtime: row.text(5)?,
+                        version: row.text(6)?,
+                        build_id: row.text(7)?,
+                        digest: row.text(8)?,
+                        release_seq: row.int(9)?.max(0) as u64,
+                        update_state: row.text(10)?,
+                        update_deadline_ms: row.int(11)?,
                     })
                 },
             )
@@ -639,22 +726,40 @@ impl Store {
             batch.interval_secs as i64
         };
         let pushed_ms = Utc::now().timestamp_millis();
+        let (state, deadline, release_seq) = recorded_build(pushed_ms, &batch.build);
         // The check-in commits before the sample write. A node waiting on that
         // write is still reporting, so the offline rule does not fire for it.
+        // The build and any update window commit here too, so a planned restart
+        // is visible even when the journal batch is still in flight.
         self.with_sql(|sql| {
             sql.execute(
                 "INSERT INTO node_cursors
-                    (node_id, seq, sample_ms, last_push_ms, interval_secs, shutting_down, bucket_ms, event_id)
-                 VALUES (?1, 0, 0, ?2, ?3, ?4, 0, 0)
+                    (node_id, seq, sample_ms, last_push_ms, interval_secs, shutting_down, bucket_ms, event_id,
+                     runtime, version, build_id, digest, release_seq, update_state, update_deadline_ms)
+                 VALUES (?1, 0, 0, ?2, ?3, ?4, 0, 0, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                  ON CONFLICT(node_id) DO UPDATE SET
                     last_push_ms = excluded.last_push_ms,
                     interval_secs = excluded.interval_secs,
-                    shutting_down = excluded.shutting_down",
+                    shutting_down = excluded.shutting_down,
+                    runtime = excluded.runtime,
+                    version = excluded.version,
+                    build_id = excluded.build_id,
+                    digest = excluded.digest,
+                    release_seq = excluded.release_seq,
+                    update_state = excluded.update_state,
+                    update_deadline_ms = excluded.update_deadline_ms",
                 &[
                     SqlVal::text(node_id),
                     SqlVal::Int(pushed_ms),
                     SqlVal::Int(interval),
                     SqlVal::Int(i64::from(batch.shutting_down)),
+                    SqlVal::text(&batch.build.runtime),
+                    SqlVal::text(&batch.build.version),
+                    SqlVal::text(&batch.build.build_id),
+                    SqlVal::text(&batch.build.digest),
+                    SqlVal::Int(release_seq),
+                    SqlVal::text(&state),
+                    SqlVal::Int(deadline),
                 ],
             )?;
             Ok(())
@@ -770,9 +875,14 @@ impl Store {
         now: DateTime<Utc>,
     ) -> crate::Result<Vec<pulseblade_core::Finding>> {
         let mut drafts = Vec::new();
+        let now_ms = now.timestamp_millis();
         for push in self.node_pushes()? {
             let (age, stale) = push.freshness(now);
             if !stale {
+                continue;
+            }
+            // A planned swap announced this. Past the deadline, silence is offline.
+            if update_window_open(&push, now_ms) {
                 continue;
             }
             let host_id = format!("host:{}", push.node);
@@ -1402,6 +1512,9 @@ mod tests {
         assert_eq!(pushes[0].last_push_ms, 0);
         assert_eq!(pushes[0].interval_secs, 15);
         assert!(!pushes[0].shutting_down);
+        assert!(pushes[0].build_id.is_empty());
+        assert!(pushes[0].digest.is_empty());
+        assert_eq!(pushes[0].update_deadline_ms, 0);
         drop(store);
         for suffix in ["", "-wal", "-shm"] {
             let mut sidecar = path.clone().into_os_string();
@@ -1543,6 +1656,116 @@ mod tests {
             .changes_after(0, &crate::ChangeFilter::default(), 20)
             .unwrap();
         assert!(!changes.iter().any(|c| c.kind == ChangeKind::Disappeared));
+    }
+
+    #[test]
+    fn push_carries_build_identity() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .ingest_node(
+                "lee-cachy",
+                &NodeBatch {
+                    interval_secs: 15,
+                    build: NodeBuild {
+                        runtime: "systemd".into(),
+                        version: "0.1.0".into(),
+                        build_id: "abc123".into(),
+                        digest: "sha256:deadbeef".into(),
+                        sequence: 4,
+                        update_state: "reported".into(),
+                        update_deadline_ms: 0,
+                    },
+                    ..NodeBatch::default()
+                },
+            )
+            .unwrap();
+        let push = &store.node_pushes().unwrap()[0];
+        assert_eq!(push.version, "0.1.0");
+        assert_eq!(push.build_id, "abc123");
+        assert_ne!(push.build_id, push.version);
+        assert_eq!(push.digest, "sha256:deadbeef");
+        assert_eq!(push.runtime, "systemd");
+        assert_eq!(push.release_seq, 4);
+        assert_eq!(push.update_state, "reported");
+    }
+
+    #[test]
+    fn announced_update_window_does_not_open_host_offline() {
+        let store = Store::open_in_memory().unwrap();
+        let now = Utc::now();
+        store
+            .ingest_node(
+                "web1",
+                &NodeBatch {
+                    changes: vec![change(1, "host:web1", ChangeKind::Appeared)],
+                    resources: vec![
+                        Resource::new("host:web1", ResourceKind::Host, "web1").health(Health::Ok)
+                    ],
+                    interval_secs: 15,
+                    build: NodeBuild {
+                        runtime: "systemd".into(),
+                        version: "0.1.0".into(),
+                        build_id: "new".into(),
+                        digest: "sha256:aa".into(),
+                        sequence: 2,
+                        update_state: "applying".into(),
+                        update_deadline_ms: now.timestamp_millis() + 180_000,
+                    },
+                    ..NodeBatch::default()
+                },
+            )
+            .unwrap();
+        store
+            .set_node_last_push("web1", now.timestamp_millis() - 120_000)
+            .unwrap();
+        let opened = store.sync_offline_hosts(now).unwrap();
+        assert!(opened.is_empty(), "{opened:?}");
+        let (open, _) = store
+            .findings(
+                &crate::FindingFilter {
+                    status: Some(pulseblade_core::FindingStatus::Open),
+                    ..Default::default()
+                },
+                10,
+            )
+            .unwrap();
+        assert!(open.iter().all(|f| f.rule != OFFLINE_RULE));
+
+        let later = now + chrono::Duration::minutes(6);
+        store
+            .set_node_last_push("web1", later.timestamp_millis() - 120_000)
+            .unwrap();
+        let opened = store.sync_offline_hosts(later).unwrap();
+        assert_eq!(opened.len(), 1);
+        assert_eq!(opened[0].rule, OFFLINE_RULE);
+    }
+
+    #[test]
+    fn silence_without_an_update_window_is_still_offline() {
+        let store = Store::open_in_memory().unwrap();
+        let now = Utc::now();
+        store
+            .ingest_node(
+                "web1",
+                &NodeBatch {
+                    changes: vec![change(1, "host:web1", ChangeKind::Appeared)],
+                    resources: vec![
+                        Resource::new("host:web1", ResourceKind::Host, "web1").health(Health::Ok)
+                    ],
+                    interval_secs: 15,
+                    shutting_down: true,
+                    ..NodeBatch::default()
+                },
+            )
+            .unwrap();
+        store
+            .set_node_last_push("web1", now.timestamp_millis() - 120_000)
+            .unwrap();
+        let opened = store.sync_offline_hosts(now).unwrap();
+        assert_eq!(opened.len(), 1);
+        assert_eq!(opened[0].rule, OFFLINE_RULE);
+        assert_eq!(opened[0].severity, pulseblade_core::Severity::Warning);
+        assert!(opened[0].summary.contains("shut down"));
     }
 
     /// The hub maintain loop calls this every 15s. Postgres parse rejects a bare

@@ -6,7 +6,7 @@ The node serves an LLM-free view of the same data on its HTTP port, next to `/mc
 |------|------|
 | `/` | Built-in dashboard (one self-contained HTML page, no external assets) |
 | `/metrics` | Prometheus text exposition |
-| `/api/v1/status` | Pulseblade self-health: version, `as_of_seq`, database path and size, per-collector last run (age, duration, ok/error, consecutive failures), resource and sample counts, uptime. On a hub, `nodes` lists each node's cursor, `last_push_age_secs`, `stale`, and `shutting_down` after a shutdown push |
+| `/api/v1/status` | Pulseblade self-health: version, `as_of_seq`, database path and size, per-collector last run (age, duration, ok/error, consecutive failures), resource and sample counts, uptime. On a hub, `nodes` lists each node's cursor, `last_push_age_secs`, `stale`, `shutting_down` after a shutdown push, and, when the node has reported them, `runtime`, `version`, `build_id`, `digest`, `release_seq`, and `update_state` |
 | `/api/v1/snapshot` | `state_snapshot`: `detail`, `if_changed_since`, `kind`, `query`, `labels=k=v,k2=v2`, `unhealthy_only`, `limit` |
 | `/api/v1/resources/{id}` | `resource_explain` (`changes_limit`); ids may be percent-encoded or raw, e.g. `/api/v1/resources/disk:web1:/home` |
 | `/api/v1/metrics` | `metrics_query`: `id`, `metric`, `range`, `step`, `agg` |

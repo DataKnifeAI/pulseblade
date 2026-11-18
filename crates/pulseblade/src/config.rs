@@ -423,6 +423,19 @@ pub struct HubConfig {
     /// Not the Postgres volume and not the old SQLite PVC.
     #[serde(default)]
     pub snapshot_cache: String,
+    /// Signed release the hub may offer. Empty offers nothing.
+    #[serde(default)]
+    pub release: HubRelease,
+}
+
+/// A signed manifest on disk, and the nodes that may see it.
+/// Listing one node is the rollout. An empty list offers the release to nobody.
+/// The file holds a signature, never the signing private key.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HubRelease {
+    pub manifest: String,
+    pub nodes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -454,6 +467,34 @@ pub struct UpstreamConfig {
     pub ca: String,
     pub cert: String,
     pub key: String,
+    /// Signed releases offered on poll. Default `off` does not download.
+    #[serde(default)]
+    pub update: NodeUpdate,
+}
+
+/// How this node treats a signed release. `kubernetes` never applies an image.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NodeUpdate {
+    /// `off`, `report`, or `apply`.
+    pub mode: String,
+    /// Hex ed25519 public key pinned on this node. Not a secret.
+    pub public_key: String,
+    /// Artifact URL hosts. Empty rejects every URL.
+    pub allowed_hosts: Vec<String>,
+    /// Binary to replace. Empty uses the running executable.
+    pub binary_path: String,
+}
+
+impl Default for NodeUpdate {
+    fn default() -> Self {
+        Self {
+            mode: "off".into(),
+            public_key: String::new(),
+            allowed_hosts: Vec::new(),
+            binary_path: String::new(),
+        }
+    }
 }
 
 impl Default for HubConfig {
@@ -468,6 +509,7 @@ impl Default for HubConfig {
             database_password_env: String::new(),
             database_ca_env: String::new(),
             snapshot_cache: String::new(),
+            release: HubRelease::default(),
         }
     }
 }
@@ -548,6 +590,7 @@ impl Default for UpstreamConfig {
             ca: String::new(),
             cert: String::new(),
             key: String::new(),
+            update: NodeUpdate::default(),
         }
     }
 }
@@ -698,8 +741,26 @@ impl Config {
                 path.display()
             );
         }
+        match cfg.upstream.update.mode.as_str() {
+            "off" | "report" | "apply" => {}
+            other => anyhow::bail!(
+                "upstream.update.mode {other:?} in {} must be off, report, or apply",
+                path.display()
+            ),
+        }
+        if cfg.upstream.update.mode != "off" && !valid_public_key(&cfg.upstream.update.public_key) {
+            anyhow::bail!(
+                "upstream.update.public_key in {} must be 32 bytes of hex",
+                path.display()
+            );
+        }
         Ok(cfg)
     }
+}
+
+fn valid_public_key(text: &str) -> bool {
+    let text = text.trim();
+    text.len() == 64 && text.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 fn home() -> PathBuf {
@@ -994,6 +1055,47 @@ mod tests {
         let err = Config::load(Some(&path)).unwrap_err().to_string();
         assert!(err.contains("12h"), "{err}");
         assert!(err.contains("24h"), "{err}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn release_update_config_parses_and_load_rejects_a_bad_mode() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [hub.release]
+            manifest = "/var/lib/pulseblade/release.json"
+            nodes = ["lee-cachy"]
+
+            [upstream.update]
+            mode = "report"
+            public_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            allowed_hosts = ["releases.example"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.hub.release.nodes, vec!["lee-cachy".to_string()]);
+        assert_eq!(cfg.upstream.update.mode, "report");
+        assert_eq!(cfg.upstream.update.allowed_hosts, vec!["releases.example"]);
+        assert!(cfg.hub.release.manifest.ends_with("release.json"));
+
+        let path = std::env::temp_dir().join(format!(
+            "pulseblade-update-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, "[upstream.update]\nmode = \"nope\"\n").unwrap();
+        let err = Config::load(Some(&path)).unwrap_err().to_string();
+        assert!(err.contains("off, report, or apply"), "{err}");
+        std::fs::write(
+            &path,
+            "[upstream.update]\nmode = \"apply\"\npublic_key = \"abcd\"\n",
+        )
+        .unwrap();
+        let err = Config::load(Some(&path)).unwrap_err().to_string();
+        assert!(err.contains("public_key"), "{err}");
         let _ = std::fs::remove_file(&path);
     }
 }

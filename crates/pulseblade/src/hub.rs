@@ -22,8 +22,11 @@ use pulseblade_mcp::journal::{self, Journal, WriteError};
 use pulseblade_mcp::query::{self, SnapshotParams};
 use pulseblade_mcp::{build_router, ActionRoute, PortalDefaults};
 use pulseblade_store::{
-    ChangeFilter, IngestResult, NodeBatch, NodeCursor, RouteJob, Store, StoreError,
+    ChangeFilter, IngestResult, NodeBatch, NodeBuild, NodeCursor, RouteJob, Store, StoreError,
 };
+
+use crate::config::NodeUpdate;
+use crate::release::{self, Decision, ReleaseOffer};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
@@ -41,6 +44,16 @@ pub struct HubInner {
     ids: AtomicU64,
     /// Toml cutoffs used when the hub has not stored a portal document.
     health: Mutex<HealthThresholds>,
+    /// Signed manifest path and the nodes allowed to see it. Empty offers nothing.
+    release: Mutex<ReleaseSource>,
+}
+
+/// Where the hub reads a signed release, and which nodes may be offered it.
+/// The hub does not hold a signing key. An empty node list offers nothing.
+#[derive(Debug, Clone, Default)]
+pub struct ReleaseSource {
+    pub manifest: String,
+    pub nodes: Vec<String>,
 }
 
 impl HubInner {
@@ -554,6 +567,7 @@ pub fn new_hub_journal(
         action_wait,
         ids: AtomicU64::new(1),
         health: Mutex::new(HealthThresholds::default()),
+        release: Mutex::new(ReleaseSource::default()),
     })
 }
 
@@ -562,6 +576,38 @@ impl HubInner {
     pub fn set_health_defaults(&self, health: HealthThresholds) {
         *self.health.lock().unwrap_or_else(|e| e.into_inner()) = health;
     }
+
+    pub fn set_release_source(&self, manifest: &str, nodes: &[String]) {
+        *self.release.lock().unwrap_or_else(|e| e.into_inner()) = ReleaseSource {
+            manifest: manifest.to_string(),
+            nodes: nodes.to_vec(),
+        };
+    }
+}
+
+/// Read the signed manifest for `node`. Missing file, empty allow-list, and a
+/// node that is not listed all yield nothing. A private key stuffed into the
+/// file is dropped and is never returned.
+pub fn load_release_offer(path: &str, nodes: &[String], node: &str) -> Option<Value> {
+    if path.is_empty() || !nodes.iter().any(|id| id == node) {
+        return None;
+    }
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut value: Value = serde_json::from_str(&text).ok()?;
+    if let Some(obj) = value.as_object_mut() {
+        obj.remove("private_key");
+        obj.remove("signing_key");
+        obj.remove("seed");
+        obj.remove("pkcs8");
+    }
+    let signature = value
+        .get("signature")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if signature.is_empty() {
+        return None;
+    }
+    Some(value)
 }
 
 pub async fn serve(
@@ -876,8 +922,11 @@ async fn push(
 
 /// Health document beside the routed jobs. Omitted when the store cannot be read,
 /// so a node keeps the last good copy instead of replacing it with defaults.
-fn poll_body(hub: &HubInner, jobs: Vec<Value>) -> Value {
+fn poll_body(hub: &HubInner, jobs: Vec<Value>, release: Option<Value>) -> Value {
     let mut payload = json!({ "jobs": jobs });
+    if let Some(release) = release {
+        payload["release"] = release;
+    }
     let fallback = hub.health.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let Some(store) = hub.journal.store() else {
         return payload;
@@ -933,7 +982,13 @@ async fn poll(
                 .into_iter()
                 .map(|j| json!({"id": j.id, "op": j.op, "body": j.body}))
                 .collect::<Vec<_>>();
-            return Ok(Json(poll_body(&hub, jobs)));
+            let source = hub
+                .release
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            let release = load_release_offer(&source.manifest, &source.nodes, &node);
+            return Ok(Json(poll_body(&hub, jobs, release)));
         }
         let notified = hub.notify.notified();
         tokio::pin!(notified);
@@ -1018,10 +1073,12 @@ async fn result(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Jobs from a hub long-poll, plus the health document when the hub sent one.
+/// Jobs from a hub long-poll, plus the health document and a release offer.
+/// The release is not a job and is not part of the health document.
 pub struct PollReply {
     pub jobs: Vec<RouteJob>,
     pub health: Option<HealthThresholds>,
+    pub release: Option<ReleaseOffer>,
 }
 
 /// Outbound client a node uses. Plain HTTP uses ureq. mTLS uses rustls.
@@ -1032,6 +1089,10 @@ pub struct HubClient {
     agent: ureq::Agent,
     tls: Option<Arc<rustls::ClientConfig>>,
     interval_secs: u64,
+    build: NodeBuild,
+    /// Send the build even when the journal has nothing new.
+    state_dirty: bool,
+    update: NodeUpdate,
 }
 
 impl HubClient {
@@ -1045,6 +1106,9 @@ impl HubClient {
                 .build(),
             tls: None,
             interval_secs: 15,
+            build: NodeBuild::default(),
+            state_dirty: false,
+            update: NodeUpdate::default(),
         }
     }
 
@@ -1058,23 +1122,26 @@ impl HubClient {
         Ok(serde_json::from_value(v)?)
     }
 
-    pub fn push_store(&self, store: &Store) -> anyhow::Result<IngestResult> {
+    pub fn push_store(&mut self, store: &Store) -> anyhow::Result<IngestResult> {
         let cursor = self.cursor()?;
         let mut batch = batch_since(store, cursor)?;
         batch.interval_secs = self.interval_secs;
-        if !batch.journal_reset
+        batch.build = self.build.clone();
+        let idle = !batch.journal_reset
             && batch.changes.is_empty()
             && batch.samples.is_empty()
             && batch.buckets.is_empty()
-            && batch.events.is_empty()
-        {
+            && batch.events.is_empty();
+        if idle && !self.state_dirty {
             return Ok(IngestResult {
                 cursor: cursor.seq,
                 sample_ms: cursor.sample_ms,
                 applied: 0,
             });
         }
-        self.push(&batch)
+        let result = self.push(&batch)?;
+        self.state_dirty = false;
+        Ok(result)
     }
 
     /// One last push before exit. A crash never calls this, so the hub sees silence.
@@ -1082,6 +1149,7 @@ impl HubClient {
         let cursor = self.cursor()?;
         let mut batch = batch_since(store, cursor)?;
         batch.interval_secs = self.interval_secs;
+        batch.build = self.build.clone();
         batch.shutting_down = true;
         self.push(&batch)
     }
@@ -1111,7 +1179,21 @@ impl HubClient {
             },
             None => None,
         };
-        Ok(PollReply { jobs: out, health })
+        let release = match v.get("release") {
+            Some(raw) if raw.is_object() => match serde_json::from_value(raw.clone()) {
+                Ok(offer) => Some(offer),
+                Err(err) => {
+                    tracing::warn!(error = %err, "ignoring invalid hub release offer");
+                    None
+                }
+            },
+            _ => None,
+        };
+        Ok(PollReply {
+            jobs: out,
+            health,
+            release,
+        })
     }
 
     pub fn finish(&self, id: &str, ok: bool, body: &Value) -> anyhow::Result<()> {
@@ -1185,17 +1267,152 @@ fn hub_client_timeout(poll_secs: u64) -> Duration {
     Duration::from_secs(30.max(wait_secs + 5))
 }
 
+fn note_verify_failed(client: &mut HubClient) {
+    client.build.update_state = "verify_failed".into();
+    client.build.update_deadline_ms = 0;
+    client.state_dirty = true;
+}
+
+/// A new binary that cannot reach the hub is replaced by the previous file.
+fn confirm_pending_update(client: &mut HubClient, store: &Store) {
+    let path = release::binary_path(&client.update.binary_path);
+    if !release::pending(&path) {
+        return;
+    }
+    let mut pushed = false;
+    for _ in 0..3 {
+        if client.push_store(store).is_ok() {
+            pushed = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    if pushed {
+        release::clear_pending(&path);
+        return;
+    }
+    tracing::warn!("updated binary failed its first pushes; restoring the previous one");
+    if release::restore_previous(&path).is_err() {
+        return;
+    }
+    client.build.update_state = "rolled_back".into();
+    client.build.update_deadline_ms = 0;
+    client.build.sequence = release::read_sequence(&path);
+    client.state_dirty = true;
+    let _ = client.push_store(store);
+    release::clear_pending(&path);
+    let err = release::exec_binary(&path);
+    tracing::error!(error = %err, "exec of the restored binary failed");
+}
+
+/// Verify a poll offer. systemd may swap its own binary. kubernetes only reports.
+fn consider_offer(client: &mut HubClient, store: &Store, offer: &ReleaseOffer) {
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let decision = release::evaluate(&release::OfferCheck {
+        mode: &client.update.mode,
+        runtime: &client.build.runtime,
+        running_seq: client.build.sequence,
+        now_ms,
+        public_key_hex: &client.update.public_key,
+        allowed_hosts: &client.update.allowed_hosts,
+        offer,
+        bytes: None,
+    });
+    match decision {
+        Decision::Ignore => {}
+        Decision::Reject(err) => {
+            tracing::warn!(error = %err, "release offer rejected");
+            note_verify_failed(client);
+        }
+        Decision::Report => {
+            client.build.update_state = "reported".into();
+            client.build.update_deadline_ms = 0;
+            client.state_dirty = true;
+        }
+        Decision::Apply => {
+            if client.build.runtime != "systemd" {
+                note_verify_failed(client);
+                return;
+            }
+            let bytes = match release::fetch_artifact(&offer.url) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    tracing::warn!(error = %err, "release download rejected");
+                    note_verify_failed(client);
+                    return;
+                }
+            };
+            let checked = release::evaluate(&release::OfferCheck {
+                mode: &client.update.mode,
+                runtime: &client.build.runtime,
+                running_seq: client.build.sequence,
+                now_ms,
+                public_key_hex: &client.update.public_key,
+                allowed_hosts: &client.update.allowed_hosts,
+                offer,
+                bytes: Some(&bytes),
+            });
+            if checked != Decision::Apply {
+                note_verify_failed(client);
+                return;
+            }
+            let path = release::binary_path(&client.update.binary_path);
+            client.build.update_state = "applying".into();
+            client.build.update_deadline_ms = now_ms + release::UPDATE_WINDOW_MS;
+            client.state_dirty = true;
+            if client.push_store(store).is_err() {
+                note_verify_failed(client);
+                return;
+            }
+            if let Err(err) =
+                release::install_for_runtime(&client.build.runtime, &path, &bytes, &offer.digest)
+            {
+                tracing::warn!(error = %err, "release was not installed");
+                note_verify_failed(client);
+                return;
+            }
+            if release::write_sequence(&path, offer.sequence).is_err()
+                || release::mark_pending(&path).is_err()
+            {
+                let _ = release::restore_previous(&path);
+                note_verify_failed(client);
+                return;
+            }
+            client.build.sequence = offer.sequence;
+            let err = release::exec_binary(&path);
+            tracing::error!(error = %err, "exec of the updated binary failed");
+            let _ = release::restore_previous(&path);
+            release::clear_pending(&path);
+            note_verify_failed(client);
+        }
+    }
+}
+
+/// Connection a node opens toward a hub. The release key is not in here.
+pub struct UpstreamLink {
+    pub base: String,
+    pub token: String,
+    pub tls: Option<Arc<rustls::ClientConfig>>,
+    pub poll_secs: u64,
+    pub update: NodeUpdate,
+}
+
 /// Push the local journal and apply any routed actions until `shutdown`.
 pub fn run_upstream(
     store: Arc<Store>,
     reg: Arc<Registry>,
-    base: String,
-    token: String,
-    tls: Option<Arc<rustls::ClientConfig>>,
-    poll_secs: u64,
+    link: UpstreamLink,
     shutdown: CancellationToken,
 ) {
-    let client = HubClient {
+    let UpstreamLink {
+        base,
+        token,
+        tls,
+        poll_secs,
+        update,
+    } = link;
+    let build = release::local_identity(&update.binary_path);
+    let mut client = HubClient {
         base: base.trim_end_matches('/').to_string(),
         token,
         agent: ureq::AgentBuilder::new()
@@ -1203,8 +1420,12 @@ pub fn run_upstream(
             .build(),
         tls,
         interval_secs: poll_secs.clamp(1, 60),
+        build,
+        state_dirty: true,
+        update,
     };
     tracing::info!(url = %client.base, mtls = client.tls.is_some(), "pushing to hub");
+    confirm_pending_update(&mut client, &store);
     let pause = Duration::from_secs(poll_secs.clamp(1, 60));
     while !shutdown.is_cancelled() {
         if let Err(e) = client.push_store(&store) {
@@ -1232,6 +1453,9 @@ pub fn run_upstream(
                             let _ = client.finish(&job.id, false, &json!({"error": e}));
                         }
                     }
+                }
+                if let Some(offer) = reply.release {
+                    consider_offer(&mut client, &store, &offer);
                 }
             }
             Err(e) => {
@@ -1335,6 +1559,54 @@ mod tests {
     use std::thread::JoinHandle;
 
     #[test]
+    fn poll_offer_is_separate_from_jobs_and_health() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let hub = new_hub(
+            store,
+            vec![("web1".into(), "t".into())],
+            Duration::from_secs(1),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("release.json");
+        std::fs::write(
+            &path,
+            r#"{"sequence":2,"version":"0.1.0","build_id":"abc","digest":"sha256:aa","expires_ms":9,"url":"https://releases.example/pulseblade","rollback":false,"signature":"abcd","private_key":"do-not-forward"}"#,
+        )
+        .unwrap();
+        hub.set_release_source(&path.display().to_string(), &["web1".into()]);
+        let jobs = vec![json!({"id": "r1", "op": "plan", "body": {"action": "systemd.restart"}})];
+        let body = poll_body(
+            &hub,
+            jobs,
+            load_release_offer(&path.display().to_string(), &["web1".into()], "web1"),
+        );
+        assert_eq!(body["jobs"][0]["op"], "plan");
+        assert!(body["jobs"][0].get("signature").is_none());
+        assert!(body["jobs"][0].get("url").is_none());
+        assert_eq!(body["release"]["signature"], "abcd");
+        assert!(body["release"].get("private_key").is_none());
+        assert!(body["health"].get("signature").is_none());
+        assert!(
+            load_release_offer(&path.display().to_string(), &["web1".into()], "other").is_none()
+        );
+        assert!(load_release_offer(&path.display().to_string(), &[], "web1").is_none());
+
+        let reg = Registry::builtin();
+        let stored = hub.journal.store().unwrap();
+        let err = apply_job(
+            &reg,
+            &stored,
+            &RouteJob {
+                id: "r2".into(),
+                op: "release".into(),
+                body: json!({"url": "https://releases.example/pulseblade"}),
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("unknown route op"), "{err}");
+    }
+
+    #[test]
     fn workload_routes_to_the_node_that_reported_it() {
         let store = Store::open_in_memory().unwrap();
         store
@@ -1433,7 +1705,7 @@ mod tests {
             .await
             .ok();
         });
-        let client = HubClient::plain(format!("http://{addr}"), "token");
+        let mut client = HubClient::plain(format!("http://{addr}"), "token");
 
         let previous = Store::open_in_memory().unwrap();
         apply_workload(&previous, "9/9", Health::Ok);
@@ -1564,8 +1836,8 @@ mod tests {
             .ok();
         });
         let base = format!("http://{addr}");
-        let web1 = HubClient::plain(&base, "token-web1");
-        let web2 = HubClient::plain(&base, "token-web2");
+        let mut web1 = HubClient::plain(&base, "token-web1");
+        let mut web2 = HubClient::plain(&base, "token-web2");
 
         let node1 = Arc::new(Store::open_in_memory().unwrap());
         observe(
@@ -2063,6 +2335,9 @@ mod tests {
                 )
                 .unwrap(),
             ),
+            build: NodeBuild::default(),
+            state_dirty: false,
+            update: NodeUpdate::default(),
         };
         assert_eq!(authed.cursor().unwrap().seq, 0);
         let bad = HubClient {
@@ -2153,6 +2428,9 @@ mod tests {
             agent,
             tls: None,
             interval_secs: 15,
+            build: NodeBuild::default(),
+            state_dirty: false,
+            update: NodeUpdate::default(),
         };
         assert_eq!(authed.cursor().unwrap().seq, 0);
         let err = HubClient {
@@ -2276,7 +2554,7 @@ mod tests {
             },
         )
         .unwrap();
-        let client = HubClient::plain(&base, "token");
+        let mut client = HubClient::plain(&base, "token");
         let err = client.push_store(&node).unwrap_err().to_string();
         assert!(err.contains("503"), "{err}");
         assert_eq!(store.current_seq().unwrap(), seq);

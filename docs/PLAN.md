@@ -93,10 +93,12 @@ Shipped on the hub: a node that stops pushing keeps its last resources. After th
 
 Also still later: cloud collectors (AWS, Azure, GCP) and hub-of-hubs.
 
-To revisit: push updates to downstream agents. Today each node is upgraded by hand (a DaemonSet image roll per cluster, or a rebuilt binary and a systemd restart), so nodes drift: some clusters and the local workstation still run older builds without later fixes. Look at:
+Agent updates are a pull on the existing outbound connection. Each push carries `runtime` (`systemd` or `kubernetes`), crate `version`, `build_id`, and the digest that is running. Crate version `0.1.0` alone does not show drift; `build_id` is `PULSEBLADE_BUILD_ID` at compile time (`dev` when unset) and the digest is the binary sha256 or `PULSEBLADE_IMAGE_DIGEST`. Poll returns a signed `release` beside `jobs`. It is not a remediation job and it is not inside the health document. The node checks the offer with the ed25519 public key in `[upstream.update]`. A bad signature, a digest mismatch, an expired offer, or a replayed sequence leaves the current build in place and the next push says `verify_failed`.
 
-- The hub showing each node's version and build, and flagging nodes behind the hub.
-- The hub offering a target version, with the node pulling and applying it over its existing outbound connection (no inbound ports), and the node's own policy deciding whether to accept.
-- A staged rollout: one node first, then the rest, with a pause and automatic stop if the updated node goes offline or unhealthy.
-- Suppressing the host-offline findings (and the pilot model calls they trigger) caused by a planned restart.
-- Signed artifacts and a rollback to the previous build.
+A systemd node with `mode = "apply"` may download the https URL (host allow-list, no query string, no bearer token), keep the previous binary, rename the new one into place, and exec. The unit file and the env file that holds the hub token are not rewritten. A kubernetes node only reports. It does not patch its DaemonSet and it does not pull a hub-chosen image. Image rolls stay with the cluster deployer.
+
+The hub reads a signed manifest from `[hub.release]`. `nodes` chooses who is offered that one release. An empty list offers it to nobody. The hub can withhold the file or leave an old signature in place. It does not have the signing private key and it cannot mint a signature. `.gitlab-ci.yml` includes `deploy/ci/sign-release.gitlab-ci.yml`. After `publish` writes `image-digest.txt`, `sign-release` signs that digest. `pulseblade-sign` reads `PULSEBLADE_RELEASE_SIGNING_KEY` (a GitLab file variable: a path to a PKCS#8 PEM). That job does not build an image, and the hub image does not contain the signer.
+
+Before exec, the node pushes `update_state = "applying"` with a three-minute deadline. While that window is open, a missed push does not open `host offline` and so does not wake the pilot. Past the deadline, silence is still a finding. A shutdown push that did not announce a window still opens `host offline` at warning. If the new binary cannot push, it copies the previous binary back and execs it.
+
+Still later: a canary promotion screen (the operator still types the node list; nothing promotes the next cluster on its own), automatic stop of a fleet rollout when the canary goes unhealthy, and dollar caps on the pilot. Do not auto-roll production clusters.

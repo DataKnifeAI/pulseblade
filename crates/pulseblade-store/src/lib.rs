@@ -19,7 +19,7 @@ mod sql;
 
 pub use actions::{ActionTransition, NewAction};
 pub use history::{MetricBucket, StoredEvent, BUCKET_MS, DEFAULT_HISTORY_DAYS, HUB_RAW_HOURS};
-pub use hub::{IngestResult, NodeBatch, NodeCursor, NodePush, RouteJob, StampedSample};
+pub use hub::{IngestResult, NodeBatch, NodeBuild, NodeCursor, NodePush, RouteJob, StampedSample};
 pub use memory::{FindingDraft, FindingFilter};
 pub use pilot::{NewPilotRun, PilotRunRow, PilotSpend};
 pub use remedies::{ActionRejection, RemedyPage, RemedyRow};
@@ -234,7 +234,14 @@ CREATE TABLE IF NOT EXISTS node_cursors (
     interval_secs INTEGER NOT NULL DEFAULT 15,
     shutting_down INTEGER NOT NULL DEFAULT 0,
     bucket_ms     INTEGER NOT NULL DEFAULT 0,
-    event_id      INTEGER NOT NULL DEFAULT 0
+    event_id      INTEGER NOT NULL DEFAULT 0,
+    runtime       TEXT NOT NULL DEFAULT '',
+    version       TEXT NOT NULL DEFAULT '',
+    build_id      TEXT NOT NULL DEFAULT '',
+    digest        TEXT NOT NULL DEFAULT '',
+    release_seq   INTEGER NOT NULL DEFAULT 0,
+    update_state  TEXT NOT NULL DEFAULT '',
+    update_deadline_ms INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS route_rpc (
@@ -405,6 +412,28 @@ pub(crate) fn ensure_later_columns(sql: &mut dyn sql::Sql) -> Result<()> {
     ensure_column(sql, "route_plans", "finding_id", "TEXT")?;
     ensure_column(sql, "route_plans", "resource_id", "TEXT")?;
     ensure_column(sql, "pilot_runs", "subjects", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(sql, "node_cursors", "runtime", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(sql, "node_cursors", "version", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(sql, "node_cursors", "build_id", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(sql, "node_cursors", "digest", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(
+        sql,
+        "node_cursors",
+        "release_seq",
+        "BIGINT NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        sql,
+        "node_cursors",
+        "update_state",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        sql,
+        "node_cursors",
+        "update_deadline_ms",
+        "BIGINT NOT NULL DEFAULT 0",
+    )?;
     sql.execute(
         "CREATE INDEX IF NOT EXISTS route_plans_resource ON route_plans(resource_id)",
         &[],

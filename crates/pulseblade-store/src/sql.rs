@@ -711,7 +711,14 @@ CREATE TABLE IF NOT EXISTS node_cursors (
     interval_secs BIGINT NOT NULL DEFAULT 15,
     shutting_down BIGINT NOT NULL DEFAULT 0,
     bucket_ms     BIGINT NOT NULL DEFAULT 0,
-    event_id      BIGINT NOT NULL DEFAULT 0
+    event_id      BIGINT NOT NULL DEFAULT 0,
+    runtime       TEXT NOT NULL DEFAULT '',
+    version       TEXT NOT NULL DEFAULT '',
+    build_id      TEXT NOT NULL DEFAULT '',
+    digest        TEXT NOT NULL DEFAULT '',
+    release_seq   BIGINT NOT NULL DEFAULT 0,
+    update_state  TEXT NOT NULL DEFAULT '',
+    update_deadline_ms BIGINT NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS route_rpc (

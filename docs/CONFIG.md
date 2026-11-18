@@ -137,6 +137,14 @@ database_ca_env = ""
 id = "web1"
 token_env = "PULSEBLADE_NODE_WEB1"
 
+# Signed release the hub may offer on poll. Empty offers nothing.
+# manifest is a file produced by pulseblade-sign. It has no private key.
+# nodes lists who may see this one release. Empty offers it to nobody.
+# One name is the rollout. Do not list every production cluster.
+[hub.release]
+manifest = ""
+nodes = []
+
 [hub.tls]
 cert = ""
 key = ""
@@ -153,6 +161,20 @@ poll_secs = 15
 ca = ""
 cert = ""
 key = ""
+
+# Signed releases from the hub poll. mode is off, report, or apply.
+# kubernetes never applies, even when mode is apply.
+# public_key is 32 bytes of hex, the pin from release.json.pub. Not a secret.
+# allowed_hosts are the only artifact URL hosts. The URL is https, with no token.
+# binary_path empty replaces the running executable. The hub token env file is not touched.
+# PULSEBLADE_RELEASE_SIGNING_KEY is a GitLab file variable (a path) read only by pulseblade-sign.
+# PULSEBLADE_BUILD_ID is the compile-time build id. PULSEBLADE_IMAGE_DIGEST is the
+# image id a collector reports. Neither value belongs in this file.
+[upstream.update]
+mode = "off"
+public_key = ""
+allowed_hosts = []
+binary_path = ""
 
 # Kubernetes collector and actions. An empty api_url leaves both off.
 # token_env is the name of an environment variable, never the secret.
