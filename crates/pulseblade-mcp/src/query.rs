@@ -1400,6 +1400,9 @@ fn write_note(store: &Store, resource: &str, author: Option<&str>, text: &str) -
     let author = author.unwrap_or("agent").trim();
     let author = if author.is_empty() { "agent" } else { author };
     let author = author.chars().take(64).collect::<String>();
+    if author == pulseblade_core::PILOT_REF_AUTHOR {
+        return Ok(store.upsert_ref_note(resource, text, Utc::now())?);
+    }
     Ok(store.insert_note(resource, &author, text, Utc::now())?)
 }
 

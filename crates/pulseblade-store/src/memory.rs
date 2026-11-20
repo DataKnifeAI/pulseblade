@@ -309,6 +309,63 @@ impl Store {
         Ok(finding)
     }
 
+    /// One `pilot-ref` note per resource and failure mode. A later recurrence
+    /// updates that row: same id, new last-seen and count. The conclusion is
+    /// the text the pilot already stored, not a log.
+    pub fn upsert_ref_note(
+        &self,
+        resource_id: &str,
+        text: &str,
+        now: DateTime<Utc>,
+    ) -> crate::Result<Note> {
+        let first = text.lines().next().unwrap_or(text);
+        let pattern = like_prefix(first);
+        let author = pulseblade_core::PILOT_REF_AUTHOR;
+        self.with_sql(|sql| {
+            let existing = sql.query_opt(
+                "SELECT id, created_at FROM notes
+                 WHERE resource_id = ?1 AND author = ?2 AND text LIKE ?3 ESCAPE '\\'
+                 ORDER BY id LIMIT 1",
+                &[
+                    SqlVal::text(resource_id),
+                    SqlVal::text(author),
+                    SqlVal::text(&pattern),
+                ],
+                |row| Ok((row.int(0)?, row.int(1)?)),
+            )?;
+            if let Some((id, created)) = existing {
+                sql.execute(
+                    "UPDATE notes SET text = ?2 WHERE id = ?1",
+                    &[SqlVal::Int(id), SqlVal::text(text)],
+                )?;
+                return Ok(Note {
+                    id: format!("n{id}"),
+                    resource_id: resource_id.to_string(),
+                    author: author.to_string(),
+                    text: text.to_string(),
+                    created_at: from_ms(created),
+                });
+            }
+            sql.execute(
+                "INSERT INTO notes (resource_id, author, text, created_at) VALUES (?1, ?2, ?3, ?4)",
+                &[
+                    SqlVal::text(resource_id),
+                    SqlVal::text(author),
+                    SqlVal::text(text),
+                    SqlVal::Int(now.timestamp_millis()),
+                ],
+            )?;
+            let id = sql.last_id()?;
+            Ok(Note {
+                id: format!("n{id}"),
+                resource_id: resource_id.to_string(),
+                author: author.to_string(),
+                text: text.to_string(),
+                created_at: from_ms(now.timestamp_millis()),
+            })
+        })
+    }
+
     pub fn insert_note(
         &self,
         resource_id: &str,
@@ -396,6 +453,21 @@ fn fnv(s: &str) -> u64 {
         h = h.wrapping_mul(0x100000001b3);
     }
     h
+}
+
+/// `line\n%`, with LIKE wildcards in `line` escaped. Matches that line and
+/// anything after it, not a longer first line.
+fn like_prefix(line: &str) -> String {
+    let mut out = String::new();
+    for c in line.chars() {
+        if c == '\\' || c == '%' || c == '_' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('\n');
+    out.push('%');
+    out
 }
 
 fn like_contains(query: &str) -> String {
@@ -548,5 +620,43 @@ mod tests {
         assert_eq!(n, 1);
         assert_eq!(logs[0].message, "disk quota exceeded");
         assert!(store.search_notes("100%", 10).unwrap().0.is_empty());
+    }
+
+    #[test]
+    fn a_repeated_failure_updates_one_ref_note() {
+        let store = Store::open_in_memory().unwrap();
+        let now = Utc::now();
+        let resource = "sensor:h:pressure";
+        let first = store
+            .upsert_ref_note(
+                resource,
+                "failure pressure on sensor:h:pressure\ndecided: io stall\nrecurred 1",
+                now,
+            )
+            .unwrap();
+        let second = store
+            .upsert_ref_note(
+                resource,
+                "failure pressure on sensor:h:pressure\ndecided: io stall\nrecurred 2",
+                now,
+            )
+            .unwrap();
+        assert_eq!(first.id, second.id);
+        assert_eq!(first.author, pulseblade_core::PILOT_REF_AUTHOR);
+        let notes = store.notes_for(resource, 10).unwrap();
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].text.contains("recurred 2"));
+        let other = store
+            .upsert_ref_note(
+                resource,
+                "failure host offline on sensor:h:pressure\nrecurred 1",
+                now,
+            )
+            .unwrap();
+        assert_ne!(other.id, first.id);
+        assert_eq!(store.notes_for(resource, 10).unwrap().len(), 2);
+        let (found, total) = store.search_notes("io stall", 10).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(found[0].id, first.id);
     }
 }

@@ -4,6 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{json, Value};
 
 use crate::chat::{parse_completion, Chat};
@@ -33,6 +34,18 @@ Call escalate when a stronger model should take over. \
 The node enforces risk tiers; you cannot override approve or deny.";
 
 const OUTPUT_CAP: usize = 6_000;
+/// A pressure flap recovers in about ten seconds. A finding that is still open
+/// after this gets one look.
+const SENSOR_PERSIST: Duration = Duration::from_secs(60);
+/// Same length as the announced-update hold (`MAX_UPDATE_WINDOW_MS`). A
+/// host-offline finding younger than this is a node bounce.
+const BOUNCE_WINDOW: Duration = Duration::from_secs(5 * 60);
+/// While the same failure keeps returning inside this window, it is one incident.
+/// The daily per-resource cap is the outer bound and is unchanged.
+const REPEAT_QUIET: Duration = Duration::from_secs(60 * 60);
+const REF_AUTHOR: &str = pulseblade_core::PILOT_REF_AUTHOR;
+/// Matches `pulseblade_store::OFFLINE_RULE`.
+const HOST_OFFLINE: &str = "host offline";
 
 #[derive(Clone)]
 struct OpenFinding {
@@ -41,6 +54,24 @@ struct OpenFinding {
     summary: String,
     severity: String,
     rule: String,
+    opened_at: Option<DateTime<Utc>>,
+}
+
+/// One failure mode already investigated. A later flap updates the count and
+/// the `pilot-ref` note instead of calling the model.
+struct Incident {
+    resource_id: String,
+    mode: String,
+    run_id: String,
+    note_id: String,
+    conclusion: String,
+    first_seen: String,
+    last_seen: String,
+    recurrences: u32,
+    /// Set when health returned to ok. Cleared when the failure comes back.
+    healthy_since: Option<Instant>,
+    /// The stored note is already older than the quiet gap.
+    quiet: bool,
 }
 
 /// Record of one wake. Steady-state polls do not produce a run.
@@ -70,6 +101,8 @@ pub struct Session {
     spend: Ledger,
     /// The cap reason already reported, so a held wake is recorded once.
     capped: Option<String>,
+    /// Resource + failure mode already investigated in this process.
+    incidents: BTreeMap<String, Incident>,
 }
 
 impl Session {
@@ -82,6 +115,22 @@ impl Session {
             change_seen: BTreeSet::new(),
             spend: Ledger::default(),
             capped: None,
+            incidents: BTreeMap::new(),
+        }
+    }
+
+    /// The hub assigns the run id after `tick` returns. The next repeat note
+    /// can name it.
+    pub fn remember_run(&mut self, id: &str, run: &PilotRun) {
+        if id.is_empty() {
+            return;
+        }
+        for incident in self.incidents.values_mut() {
+            if incident.run_id.is_empty()
+                && run.subjects.iter().any(|subject| subject == &incident.resource_id)
+            {
+                incident.run_id = id.to_string();
+            }
         }
     }
 
@@ -112,33 +161,68 @@ impl Session {
         // failed. Catch the cursor up and do not call the model for it.
         let startup_backlog =
             self.seq == 0 && changes.get("truncated").and_then(|v| v.as_bool()) == Some(true);
-        let change_list = if startup_backlog {
+        let all_changes = if startup_backlog {
             Vec::new()
         } else {
             changes
                 .get("changes")
                 .and_then(|c| c.as_array())
-                .map(|list| {
-                    list.iter()
-                        .filter(|c| wakes_pilot(c))
-                        .filter(|c| !self.change_seen.contains(&change_signature(c)))
-                        .cloned()
-                        .collect::<Vec<_>>()
-                })
+                .cloned()
                 .unwrap_or_default()
         };
         // The timer is not a reason to call the model. A call happens when a
         // finding is new or its signature changed, or when a resource's health
-        // became failed or degraded. An investigation that already failed to
-        // root-cause that same signature does not run again.
-        let fresh: Vec<_> = open
+        // became failed or degraded. Sensor flaps, a host-offline bounce, a
+        // pod that flipped with its node, and a failure mode already
+        // investigated are not a call. An investigation that already failed
+        // to root-cause that same signature does not run again.
+        self.note_recoveries(&all_changes, now);
+        let wall = Utc::now();
+        let bounce = bounce_nodes(&open, &all_changes, wall);
+        let mut parents = BTreeMap::new();
+        let mut delayed = BTreeSet::new();
+        let mut counted = BTreeSet::new();
+        let candidates: Vec<OpenFinding> = open
             .iter()
-            .filter(|finding| match self.signatures.get(&finding.id) {
-                Some(sig) => sig != &finding_signature(finding),
-                None => !self.seen.contains(&finding.id),
-            })
+            .filter(|finding| is_fresh(self, finding))
             .cloned()
             .collect();
+        let mut fresh = Vec::new();
+        for finding in candidates {
+            let mode = failure_mode(&finding.resource_id, &finding.rule);
+            if self.already_recurring(tools, &finding.resource_id, &mode, now) {
+                self.seen.insert(finding.id.clone());
+                self.signatures
+                    .insert(finding.id.clone(), finding_signature(&finding));
+                self.record_repeat(tools, &finding.resource_id, &mode, &mut counted);
+                continue;
+            }
+            if hold_finding(tools, &finding, &bounce, wall, &mut parents) {
+                delayed.insert(finding.id.clone());
+                continue;
+            }
+            fresh.push(finding);
+        }
+        let mut change_list: Vec<Value> = all_changes
+            .iter()
+            .filter(|c| wakes_pilot(c))
+            .filter(|c| !self.change_seen.contains(&change_signature(c)))
+            .cloned()
+            .collect();
+        change_list.retain(|change| {
+            let id = change_resource(change).to_string();
+            let mode = failure_mode(&id, "");
+            if self.already_recurring(tools, &id, &mode, now) {
+                self.change_seen.insert(change_signature(change));
+                self.record_repeat(tools, &id, &mode, &mut counted);
+                return false;
+            }
+            if hold_change(tools, change, &bounce, &mut parents) {
+                self.change_seen.insert(change_signature(change));
+                return false;
+            }
+            true
+        });
         let wake_findings = self.config.wakes_on("findings") && !fresh.is_empty();
         // A health failure is a root-cause wake on its own. `wake_on` does not
         // have to list changes, and listing changes does not add routine ones.
@@ -154,8 +238,11 @@ impl Session {
             self.seq = seq;
             return Ok(None);
         };
-        let focus = if fresh.is_empty() {
-            open.clone()
+        let focus: Vec<OpenFinding> = if fresh.is_empty() {
+            open.iter()
+                .filter(|finding| !delayed.contains(finding.id.as_str()))
+                .cloned()
+                .collect()
         } else {
             fresh
         };
@@ -237,7 +324,7 @@ impl Session {
             BTreeSet::new()
         };
         for finding in &open {
-            if deferred.contains(finding.id.as_str()) {
+            if deferred.contains(finding.id.as_str()) || delayed.contains(finding.id.as_str()) {
                 continue;
             }
             self.seen.insert(finding.id.clone());
@@ -293,12 +380,215 @@ impl Session {
             .collect();
         subjects.sort();
         subjects.dedup();
-        let digest = digest(&model_focus, &change_list, &notes, &closest, &denials, seq);
-        let mut run = investigate(&self.config, tools, chat, &trigger, &digest, &model_focus);
+        let priors = self.prior_lines(&model_focus, &change_list);
+        let digest = digest(
+            &model_focus,
+            &change_list,
+            &notes,
+            &closest,
+            &denials,
+            &priors,
+            seq,
+        );
+        let mut noted = BTreeMap::new();
+        let mut run = investigate(
+            &self.config,
+            tools,
+            chat,
+            &trigger,
+            &digest,
+            &model_focus,
+            &mut noted,
+        );
         run.subjects = subjects;
+        self.remember_investigation(&model_focus, &change_list, &run, &noted);
         self.spend
             .record(now, run.tokens, run.subjects.clone(), run.status == "error");
         Ok(Some(run))
+    }
+
+    fn note_recoveries(&mut self, changes: &[Value], now: Instant) {
+        for change in changes {
+            if change.get("field").and_then(|v| v.as_str()) != Some("health") {
+                continue;
+            }
+            if change.get("after").and_then(|v| v.as_str()) != Some("ok") {
+                continue;
+            }
+            let id = change_resource(change);
+            for incident in self.incidents.values_mut() {
+                if incident.resource_id == id && incident.healthy_since.is_none() {
+                    incident.healthy_since = Some(now);
+                }
+            }
+        }
+    }
+
+    fn already_recurring<T: Tools>(
+        &mut self,
+        tools: &mut T,
+        resource: &str,
+        mode: &str,
+        now: Instant,
+    ) -> bool {
+        let key = incident_key(resource, mode);
+        if !self.incidents.contains_key(&key) {
+            self.load_ref(tools, resource, mode, now);
+        }
+        match self.incidents.get(&key) {
+            Some(incident) => !quiet_ready(incident, now),
+            None => false,
+        }
+    }
+
+    fn load_ref<T: Tools>(&mut self, tools: &mut T, resource: &str, mode: &str, _now: Instant) {
+        let key_line = format!("failure {mode} on {resource}");
+        let Ok(page) = tools.call("memory_search", json!({"query": resource, "limit": 5})) else {
+            return;
+        };
+        let Some(notes) = page.get("notes").and_then(|n| n.as_array()) else {
+            return;
+        };
+        for note in notes {
+            let text = note.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            let author = note.get("author").and_then(|v| v.as_str()).unwrap_or("");
+            if author != REF_AUTHOR || !text.starts_with(&key_line) {
+                continue;
+            }
+            let parsed = parse_ref(text);
+            let quiet = parsed
+                .last_seen
+                .as_deref()
+                .is_some_and(|stamp| quiet_since(stamp, Utc::now()));
+            self.incidents.insert(
+                incident_key(resource, mode),
+                Incident {
+                    resource_id: resource.to_string(),
+                    mode: mode.to_string(),
+                    run_id: parsed.run_id,
+                    note_id: parsed.note_id,
+                    conclusion: parsed.conclusion,
+                    first_seen: parsed.first_seen,
+                    last_seen: parsed.last_seen.unwrap_or_default(),
+                    recurrences: parsed.recurrences,
+                    healthy_since: None,
+                    quiet,
+                },
+            );
+            return;
+        }
+    }
+
+    fn record_repeat<T: Tools>(
+        &mut self,
+        tools: &mut T,
+        resource: &str,
+        mode: &str,
+        counted: &mut BTreeSet<String>,
+    ) {
+        let key = incident_key(resource, mode);
+        if !counted.insert(key.clone()) {
+            return;
+        }
+        let Some(incident) = self.incidents.get_mut(&key) else {
+            return;
+        };
+        incident.recurrences = incident.recurrences.saturating_add(1);
+        incident.last_seen = stamp_now();
+        incident.healthy_since = None;
+        incident.quiet = false;
+        let text = ref_text(incident, resource);
+        let _ = tools.call(
+            "memory_note",
+            json!({"resource": resource, "author": REF_AUTHOR, "text": text}),
+        );
+    }
+
+    fn remember_investigation(
+        &mut self,
+        focus: &[OpenFinding],
+        changes: &[Value],
+        run: &PilotRun,
+        notes: &BTreeMap<String, String>,
+    ) {
+        let wall = stamp_now();
+        let mut modes = BTreeMap::new();
+        for finding in focus {
+            modes.insert(
+                finding.resource_id.clone(),
+                failure_mode(&finding.resource_id, &finding.rule),
+            );
+        }
+        for change in changes {
+            let id = change_resource(change).to_string();
+            modes
+                .entry(id.clone())
+                .or_insert_with(|| failure_mode(&id, ""));
+        }
+        let conclusion = clip_text(&run.conclusion);
+        for (resource, mode) in modes {
+            let note_id = notes.get(&resource).cloned().unwrap_or_default();
+            let key = incident_key(&resource, &mode);
+            let entry = self.incidents.entry(key).or_insert_with(|| Incident {
+                resource_id: resource.clone(),
+                mode,
+                run_id: String::new(),
+                note_id: String::new(),
+                conclusion: String::new(),
+                first_seen: wall.clone(),
+                last_seen: wall.clone(),
+                recurrences: 0,
+                healthy_since: None,
+                quiet: false,
+            });
+            entry.conclusion = conclusion.clone();
+            entry.last_seen = wall.clone();
+            entry.healthy_since = None;
+            entry.quiet = false;
+            entry.run_id.clear();
+            if !note_id.is_empty() {
+                entry.note_id = note_id;
+            }
+            if entry.first_seen.is_empty() {
+                entry.first_seen = wall.clone();
+            }
+        }
+    }
+
+    fn prior_lines(&self, focus: &[OpenFinding], changes: &[Value]) -> Vec<String> {
+        let mut ids = BTreeSet::new();
+        for finding in focus {
+            ids.insert(finding.resource_id.as_str());
+        }
+        for change in changes {
+            ids.insert(change_resource(change));
+        }
+        let mut lines = Vec::new();
+        for incident in self.incidents.values() {
+            if !ids.contains(incident.resource_id.as_str()) {
+                continue;
+            }
+            if incident.conclusion.is_empty() && incident.recurrences == 0 {
+                continue;
+            }
+            lines.push(format!(
+                "prior {} on {} run {} note {} first {} last {} recurred {} decided: {}",
+                incident.mode,
+                incident.resource_id,
+                incident.run_id,
+                incident.note_id,
+                incident.first_seen,
+                incident.last_seen,
+                incident.recurrences,
+                incident.conclusion
+            ));
+        }
+        if !lines.is_empty() {
+            lines.push(
+                "Do not call memory_note to repeat a stored conclusion.".to_string(),
+            );
+        }
+        lines
     }
 }
 
@@ -491,6 +781,7 @@ fn investigate<T: Tools, C: Chat>(
     trigger: &str,
     digest: &str,
     focus: &[OpenFinding],
+    noted: &mut BTreeMap<String, String>,
 ) -> PilotRun {
     let started = Instant::now();
     let wall = Duration::from_secs(config.budget.max_wall_secs);
@@ -600,6 +891,7 @@ fn investigate<T: Tools, C: Chat>(
                     plans: &mut plans,
                     proposed: &mut run.proposed,
                     note: &mut note,
+                    noted,
                 };
                 let result = apply_tool(tools, &call.name, &call.arguments, &mut state);
                 executed.push(json!({
@@ -674,6 +966,7 @@ struct ToolState<'a> {
     plans: &'a mut BTreeMap<String, String>,
     proposed: &'a mut Vec<String>,
     note: &'a mut String,
+    noted: &'a mut BTreeMap<String, String>,
 }
 
 fn apply_tool<T: Tools>(
@@ -700,6 +993,10 @@ fn apply_tool<T: Tools>(
             state.proposed.push(action.to_string());
         }
     }
+    let noted_resource = args
+        .get("resource")
+        .and_then(|s| s.as_str())
+        .map(str::to_string);
     match tools.call(name, args) {
         Ok(v) => {
             if name == "action_plan" {
@@ -708,6 +1005,14 @@ fn apply_tool<T: Tools>(
                     v.get("tier").and_then(|s| s.as_str()),
                 ) {
                     state.plans.insert(id.to_string(), tier.to_string());
+                }
+            }
+            if name == "memory_note" {
+                if let (Some(resource), Some(id)) = (
+                    noted_resource.as_deref(),
+                    v.get("id").and_then(|s| s.as_str()),
+                ) {
+                    state.noted.insert(resource.to_string(), id.to_string());
                 }
             }
             v
@@ -867,6 +1172,7 @@ fn digest(
     notes: &[String],
     remedies: &[String],
     denials: &[String],
+    priors: &[String],
     seq: i64,
 ) -> String {
     let mut lines = vec![format!("as_of_seq {seq}")];
@@ -897,6 +1203,9 @@ fn digest(
     for denial in denials.iter().take(5) {
         lines.push(denial.clone());
     }
+    for prior in priors.iter().take(4) {
+        lines.push(prior.clone());
+    }
     let mut text = lines.join("\n");
     if text.chars().count() > 4000 {
         text = text.chars().take(4000).collect();
@@ -904,10 +1213,241 @@ fn digest(
     text
 }
 
+fn is_fresh(session: &Session, finding: &OpenFinding) -> bool {
+    match session.signatures.get(&finding.id) {
+        Some(sig) => sig != &finding_signature(finding),
+        None => !session.seen.contains(&finding.id),
+    }
+}
+
+fn incident_key(resource: &str, mode: &str) -> String {
+    format!("{resource}\n{mode}")
+}
+
+fn failure_mode(resource_id: &str, rule: &str) -> String {
+    if !rule.is_empty() && rule != "health" {
+        return rule.to_string();
+    }
+    if let Some(rest) = resource_id.strip_prefix("sensor:") {
+        if let Some(channel) = rest.split(':').next_back() {
+            if !channel.is_empty() && channel != rest {
+                return channel.to_string();
+            }
+        }
+    }
+    if rule.is_empty() {
+        "health".to_string()
+    } else {
+        rule.to_string()
+    }
+}
+
+fn kind_of(id: &str) -> &'static str {
+    pulseblade_core::resource_kind_of_id(id).unwrap_or("")
+}
+
+fn stamp_now() -> String {
+    Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+fn clip_text(text: &str) -> String {
+    let flat: String = text
+        .chars()
+        .map(|ch| if ch == '\n' || ch == '\r' { ' ' } else { ch })
+        .take(240)
+        .collect();
+    flat.trim().to_string()
+}
+
+fn ref_text(incident: &Incident, resource: &str) -> String {
+    format!(
+        "failure {} on {resource}\nrun {}\nnote {}\ndecided: {}\nfirst {}\nlast {}\nrecurred {}",
+        incident.mode,
+        incident.run_id,
+        incident.note_id,
+        incident.conclusion,
+        incident.first_seen,
+        incident.last_seen,
+        incident.recurrences
+    )
+}
+
+struct ParsedRef {
+    run_id: String,
+    note_id: String,
+    conclusion: String,
+    first_seen: String,
+    last_seen: Option<String>,
+    recurrences: u32,
+}
+
+fn parse_ref(text: &str) -> ParsedRef {
+    let mut parsed = ParsedRef {
+        run_id: String::new(),
+        note_id: String::new(),
+        conclusion: String::new(),
+        first_seen: String::new(),
+        last_seen: None,
+        recurrences: 0,
+    };
+    for line in text.lines() {
+        if let Some(value) = line.strip_prefix("run ") {
+            parsed.run_id = value.trim().to_string();
+        } else if let Some(value) = line.strip_prefix("note ") {
+            parsed.note_id = value.trim().to_string();
+        } else if let Some(value) = line.strip_prefix("decided: ") {
+            parsed.conclusion = value.trim().to_string();
+        } else if let Some(value) = line.strip_prefix("first ") {
+            parsed.first_seen = value.trim().to_string();
+        } else if let Some(value) = line.strip_prefix("last ") {
+            parsed.last_seen = Some(value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix("recurred ") {
+            parsed.recurrences = value.trim().parse().unwrap_or(0);
+        }
+    }
+    parsed
+}
+
+fn quiet_ready(incident: &Incident, now: Instant) -> bool {
+    incident.quiet
+        || incident
+            .healthy_since
+            .is_some_and(|since| now.saturating_duration_since(since) >= REPEAT_QUIET)
+}
+
+fn quiet_since(stamp: &str, wall: DateTime<Utc>) -> bool {
+    let Ok(parsed) = DateTime::parse_from_rfc3339(stamp) else {
+        return false;
+    };
+    wall.signed_duration_since(parsed.with_timezone(&Utc))
+        >= chrono::Duration::seconds(REPEAT_QUIET.as_secs() as i64)
+}
+
+fn age_reached(opened: Option<DateTime<Utc>>, hold: Duration, wall: DateTime<Utc>) -> bool {
+    let Some(opened) = opened else {
+        return false;
+    };
+    wall.signed_duration_since(opened) >= chrono::Duration::seconds(hold.as_secs() as i64)
+}
+
+fn node_name(id: &str) -> Option<String> {
+    if let Some(name) = id.strip_prefix("host:") {
+        return Some(name.to_string());
+    }
+    id.strip_prefix("knode:")
+        .and_then(|rest| rest.split(':').next_back())
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+}
+
+fn bounce_nodes(open: &[OpenFinding], changes: &[Value], wall: DateTime<Utc>) -> BTreeSet<String> {
+    let mut nodes = BTreeSet::new();
+    for finding in open {
+        if finding.rule == HOST_OFFLINE && !age_reached(finding.opened_at, BOUNCE_WINDOW, wall) {
+            if let Some(name) = finding.resource_id.strip_prefix("host:") {
+                nodes.insert(name.to_string());
+            }
+        }
+    }
+    for change in changes {
+        if change.get("field").and_then(|v| v.as_str()) != Some("health") {
+            continue;
+        }
+        if !matches!(
+            change.get("after").and_then(|v| v.as_str()),
+            Some("failed" | "degraded")
+        ) {
+            continue;
+        }
+        let id = change_resource(change);
+        if id.starts_with("host:") || id.starts_with("knode:") {
+            if let Some(name) = node_name(id) {
+                nodes.insert(name);
+            }
+        }
+    }
+    nodes
+}
+
+fn parent_node<T: Tools>(
+    tools: &mut T,
+    cache: &mut BTreeMap<String, String>,
+    id: &str,
+) -> Option<String> {
+    if let Some(cached) = cache.get(id) {
+        return node_name(cached);
+    }
+    let parent = tools
+        .call("resource_explain", json!({"id": id}))
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/resource/parent")
+                .and_then(|item| item.as_str())
+                .map(str::to_string)
+                .or_else(|| {
+                    value
+                        .pointer("/parent/id")
+                        .and_then(|item| item.as_str())
+                        .map(str::to_string)
+                })
+        })
+        .unwrap_or_default();
+    cache.insert(id.to_string(), parent.clone());
+    node_name(&parent)
+}
+
+fn hold_finding<T: Tools>(
+    tools: &mut T,
+    finding: &OpenFinding,
+    bounce: &BTreeSet<String>,
+    wall: DateTime<Utc>,
+    parents: &mut BTreeMap<String, String>,
+) -> bool {
+    let kind = kind_of(&finding.resource_id);
+    if finding.rule == HOST_OFFLINE || kind == "node" {
+        return !age_reached(finding.opened_at, BOUNCE_WINDOW, wall);
+    }
+    if kind == "sensor" {
+        return !age_reached(finding.opened_at, SENSOR_PERSIST, wall);
+    }
+    if kind != "pod" && kind != "workload" {
+        return false;
+    }
+    if bounce.is_empty() || age_reached(finding.opened_at, BOUNCE_WINDOW, wall) {
+        return false;
+    }
+    match parent_node(tools, parents, &finding.resource_id) {
+        Some(node) => bounce.contains(&node),
+        None => true,
+    }
+}
+
+fn hold_change<T: Tools>(
+    tools: &mut T,
+    change: &Value,
+    bounce: &BTreeSet<String>,
+    parents: &mut BTreeMap<String, String>,
+) -> bool {
+    let id = change_resource(change);
+    let kind = kind_of(id);
+    if kind == "sensor" || kind == "node" {
+        return true;
+    }
+    if (kind != "pod" && kind != "workload") || bounce.is_empty() {
+        return false;
+    }
+    match parent_node(tools, parents, id) {
+        Some(node) => bounce.contains(&node),
+        None => true,
+    }
+}
+
 /// A journal line wakes the model only when stored health became failed or
 /// degraded. Process start/stop, the display-only busy band, and routine
 /// field updates (replicas, labels, a recovery to ok) do not. A finding is a
-/// separate wake.
+/// separate wake. Sensor health, a short host bounce, and a pod that flipped
+/// with its node are filtered after this.
 fn wakes_pilot(change: &Value) -> bool {
     let kind = change.get("kind").and_then(|v| v.as_str()).unwrap_or("");
     if kind == "appeared" || kind == "disappeared" {
@@ -950,6 +1490,11 @@ fn open_findings(v: &Value) -> Vec<OpenFinding> {
                     .and_then(|s| s.as_str())
                     .unwrap_or("")
                     .to_string(),
+                opened_at: f
+                    .get("opened_at")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                    .map(|t| t.with_timezone(&Utc)),
             })
         })
         .collect()
@@ -1053,6 +1598,7 @@ mod tests {
         plan_args: Vec<Value>,
         remedy: Value,
         explain: Value,
+        note_args: Vec<Value>,
     }
 
     impl Tools for FakeTools {
@@ -1061,10 +1607,50 @@ mod tests {
             match name {
                 "findings_list" => Ok(self.findings.clone()),
                 "changes_since" => Ok(self.changes.clone()),
-                "memory_search" => Ok(json!({"notes": []})),
-                "memory_note" => Ok(
-                    json!({"id": "n1", "text": args.get("text").cloned().unwrap_or(Value::Null)}),
-                ),
+                "memory_search" => {
+                    let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+                    let notes: Vec<Value> = self
+                        .note_args
+                        .iter()
+                        .filter(|note| {
+                            let text = note.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                            let resource =
+                                note.get("resource").and_then(|v| v.as_str()).unwrap_or("");
+                            text.contains(query) || resource.contains(query)
+                        })
+                        .map(|note| {
+                            json!({
+                                "id": "n-ref",
+                                "resource_id": note.get("resource").cloned().unwrap_or(Value::Null),
+                                "author": note.get("author").cloned().unwrap_or(json!(REF_AUTHOR)),
+                                "text": note.get("text").cloned().unwrap_or(Value::Null),
+                            })
+                        })
+                        .collect();
+                    Ok(json!({"notes": notes}))
+                }
+                "memory_note" => {
+                    let author = args.get("author").and_then(|v| v.as_str()).unwrap_or("");
+                    if author == REF_AUTHOR {
+                        let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                        let resource = args.get("resource").and_then(|v| v.as_str()).unwrap_or("");
+                        let key = text.lines().next().unwrap_or("");
+                        self.note_args.retain(|note| {
+                            let same_resource =
+                                note.get("resource").and_then(|v| v.as_str()) == Some(resource);
+                            let same_key = note
+                                .get("text")
+                                .and_then(|v| v.as_str())
+                                .is_some_and(|saved| saved.starts_with(key));
+                            !(same_resource && same_key)
+                        });
+                        self.note_args.push(args.clone());
+                    }
+                    Ok(json!({
+                        "id": "n1",
+                        "text": args.get("text").cloned().unwrap_or(Value::Null)
+                    }))
+                }
                 "remedies_list" => Ok(self.remedy.clone()),
                 "action_plan" => {
                     self.plan_args.push(args);
@@ -1083,6 +1669,13 @@ mod tests {
                     "finding_outcome": "still_open"
                 })),
                 "resource_explain" => {
+                    let id = args.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                    if let Some(row) = self.explain.get("by_id").and_then(|v| v.get(id)) {
+                        return Ok(row.clone());
+                    }
+                    if self.explain.get("by_id").is_some() {
+                        return Ok(json!({}));
+                    }
                     if self.explain.get("resource").is_some() {
                         Ok(self.explain.clone())
                     } else {
@@ -1099,10 +1692,12 @@ mod tests {
         rounds: Vec<Value>,
         n: usize,
         urls: Vec<String>,
+        bodies: Vec<Value>,
     }
 
     impl Chat for ScriptChat {
-        fn complete(&mut self, endpoint: &EndpointConfig, _body: &Value) -> Result<Value, String> {
+        fn complete(&mut self, endpoint: &EndpointConfig, body: &Value) -> Result<Value, String> {
+            self.bodies.push(body.clone());
             self.urls.push(endpoint.base_url.clone());
             if endpoint.base_url.contains("down.example") {
                 return Err("endpoint down".into());
@@ -1176,11 +1771,13 @@ mod tests {
             plan_args: Vec::new(),
             remedy: json!({}),
             explain: json!({}),
+            note_args: Vec::new(),
         };
         let mut chat = ScriptChat {
             rounds: vec![],
             n: 0,
             urls: vec![],
+            bodies: Vec::new(),
         };
         let run = session.tick(&mut tools, &mut chat, Instant::now()).unwrap();
         assert!(run.is_none());
@@ -1198,6 +1795,7 @@ mod tests {
             plan_args: Vec::new(),
             remedy: json!({}),
             explain: json!({}),
+            note_args: Vec::new(),
         };
         let mut chat = ScriptChat {
             rounds: vec![
@@ -1235,6 +1833,7 @@ mod tests {
             ],
             n: 0,
             urls: vec![],
+            bodies: Vec::new(),
         };
         let now = Instant::now();
         let run = session.tick(&mut tools, &mut chat, now).unwrap().unwrap();
@@ -1264,6 +1863,7 @@ mod tests {
             plan_args: Vec::new(),
             remedy: json!({}),
             explain: json!({}),
+            note_args: Vec::new(),
         };
         let mut chat = ScriptChat {
             rounds: vec![
@@ -1282,6 +1882,7 @@ mod tests {
             ],
             n: 0,
             urls: vec![],
+            bodies: Vec::new(),
         };
         let run = session
             .tick(&mut tools, &mut chat, Instant::now())
@@ -1305,6 +1906,7 @@ mod tests {
             plan_args: Vec::new(),
             remedy: json!({}),
             explain: json!({}),
+            note_args: Vec::new(),
         };
         let mut chat = ScriptChat {
             rounds: vec![
@@ -1323,6 +1925,7 @@ mod tests {
             ],
             n: 0,
             urls: vec![],
+            bodies: Vec::new(),
         };
         let run = session
             .tick(&mut tools, &mut chat, Instant::now())
@@ -1345,6 +1948,7 @@ mod tests {
             plan_args: Vec::new(),
             remedy: json!({}),
             explain: json!({}),
+            note_args: Vec::new(),
         };
         let forever = completion(
             json!([call(
@@ -1358,6 +1962,7 @@ mod tests {
             rounds: vec![forever.clone(), forever],
             n: 0,
             urls: vec![],
+            bodies: Vec::new(),
         };
         let run = session
             .tick(&mut tools, &mut chat, Instant::now())
@@ -1381,11 +1986,13 @@ mod tests {
             plan_args: Vec::new(),
             remedy: json!({}),
             explain: json!({}),
+            note_args: Vec::new(),
         };
         let mut chat = ScriptChat {
             rounds: vec![],
             n: 0,
             urls: vec![],
+            bodies: Vec::new(),
         };
         let run = session
             .tick(&mut tools, &mut chat, Instant::now())
@@ -1418,11 +2025,13 @@ mod tests {
             plan_args: Vec::new(),
             remedy: json!({}),
             explain: json!({}),
+            note_args: Vec::new(),
         };
         let mut chat = ScriptChat {
             rounds: vec![completion(json!([]), "quiet")],
             n: 0,
             urls: vec![],
+            bodies: Vec::new(),
         };
         let run = session
             .tick(&mut tools, &mut chat, Instant::now())
@@ -1447,12 +2056,14 @@ mod tests {
             plan_args: Vec::new(),
             remedy: json!({}),
             explain: json!({}),
+            note_args: Vec::new(),
         };
         let round = completion(json!([]), "seen");
         let mut chat = ScriptChat {
             rounds: vec![round.clone(), round],
             n: 0,
             urls: vec![],
+            bodies: Vec::new(),
         };
         assert!(session
             .tick(&mut tools, &mut chat, start)
@@ -1473,8 +2084,17 @@ mod tests {
         );
         assert_eq!(chat.n, calls);
         tools.findings["findings"][0]["summary"] = json!("sshd.service failed again");
+        assert!(
+            session
+                .tick(&mut tools, &mut chat, later + Duration::from_secs(11))
+                .unwrap()
+                .is_none(),
+            "a rewritten summary of the same failure is not a new incident"
+        );
+        assert_eq!(chat.n, calls);
+        tools.findings["findings"][0]["rule"] = json!("disk");
         let run = session
-            .tick(&mut tools, &mut chat, later + Duration::from_secs(11))
+            .tick(&mut tools, &mut chat, later + Duration::from_secs(12))
             .unwrap()
             .unwrap();
         assert_eq!(run.trigger, "finding:f1");
@@ -1496,6 +2116,7 @@ mod tests {
             plan_args: Vec::new(),
             remedy: json!({}),
             explain: json!({}),
+            note_args: Vec::new(),
         };
         let mut chat = ScriptChat {
             rounds: vec![
@@ -1523,6 +2144,7 @@ mod tests {
             ],
             n: 0,
             urls: vec![],
+            bodies: Vec::new(),
         };
         let first = session.tick(&mut tools, &mut chat, start).unwrap().unwrap();
         assert_eq!(first.status, "ok");
@@ -1542,8 +2164,13 @@ mod tests {
             "an unchanged open finding does not produce a second model run"
         );
         tools.findings["findings"][0]["summary"] = json!("sshd.service is still failed");
-        let second = session
+        assert!(session
             .tick(&mut tools, &mut chat, later + Duration::from_secs(11))
+            .unwrap()
+            .is_none());
+        tools.findings["findings"][0]["rule"] = json!("disk");
+        let second = session
+            .tick(&mut tools, &mut chat, later + Duration::from_secs(12))
             .unwrap()
             .unwrap();
         assert_eq!(second.trigger, "finding:f1");
@@ -1570,6 +2197,7 @@ mod tests {
             plan_args: Vec::new(),
             remedy: json!({}),
             explain: json!({}),
+            note_args: Vec::new(),
         };
         let mut chat = ScriptChat {
             rounds: vec![
@@ -1592,6 +2220,7 @@ mod tests {
             ],
             n: 0,
             urls: vec![],
+            bodies: Vec::new(),
         };
         let run = session
             .tick(&mut tools, &mut chat, Instant::now())
@@ -1617,6 +2246,7 @@ mod tests {
             plan_args: Vec::new(),
             remedy: json!({}),
             explain: json!({}),
+            note_args: Vec::new(),
         }
     }
 
@@ -1642,6 +2272,7 @@ mod tests {
             rounds: vec![],
             n: 0,
             urls: vec![],
+            bodies: Vec::new(),
         };
         assert!(session
             .tick(&mut tools, &mut chat, start)
@@ -1680,6 +2311,7 @@ mod tests {
             ],
             n: 0,
             urls: vec![],
+            bodies: Vec::new(),
         };
         assert!(session
             .tick(&mut tools, &mut chat, start)
@@ -1719,12 +2351,14 @@ mod tests {
 
         tools.changes["changes"][0]["seq"] = json!(10);
         tools.changes["as_of_seq"] = json!(10);
-        let again = session
-            .tick(&mut tools, &mut chat, start + Duration::from_secs(40))
-            .unwrap()
-            .expect("a later failure is a new change");
-        assert_eq!(again.trigger, "changes");
-        assert!(chat.n > calls);
+        assert!(
+            session
+                .tick(&mut tools, &mut chat, start + Duration::from_secs(40))
+                .unwrap()
+                .is_none(),
+            "the same health fault is not a new incident"
+        );
+        assert_eq!(chat.n, calls);
     }
 
     #[test]
@@ -1750,6 +2384,7 @@ mod tests {
             rounds: vec![completion(json!([]), "old")],
             n: 0,
             urls: vec![],
+            bodies: Vec::new(),
         };
         assert!(session
             .tick(&mut tools, &mut chat, start)
@@ -1781,6 +2416,7 @@ mod tests {
             rounds: vec![completion(json!([]), "process is using the host")],
             n: 0,
             urls: vec![],
+            bodies: Vec::new(),
         };
         let run = session
             .tick(&mut tools, &mut chat, Instant::now())
@@ -1811,6 +2447,7 @@ mod tests {
             rounds: vec![completion(json!([]), "memory")],
             n: 0,
             urls: vec![],
+            bodies: Vec::new(),
         };
         let run = session
             .tick(&mut tools, &mut chat, Instant::now())
@@ -1837,6 +2474,7 @@ mod tests {
             rounds: vec![completion(json!([]), "finding")],
             n: 0,
             urls: vec![],
+            bodies: Vec::new(),
         };
         let run = session
             .tick(&mut tools, &mut chat, Instant::now())
@@ -1883,11 +2521,13 @@ mod tests {
             plan_args: Vec::new(),
             remedy: rollout_remedy(),
             explain: json!({}),
+            note_args: Vec::new(),
         };
         let mut chat = ScriptChat {
             rounds: vec![],
             n: 0,
             urls: vec![],
+            bodies: Vec::new(),
         };
         let run = session
             .tick(&mut tools, &mut chat, Instant::now())
@@ -1918,11 +2558,13 @@ mod tests {
             plan_args: Vec::new(),
             remedy: json!({"open_plan": true}),
             explain: json!({}),
+            note_args: Vec::new(),
         };
         let mut chat = ScriptChat {
             rounds: vec![],
             n: 0,
             urls: vec![],
+            bodies: Vec::new(),
         };
         let run = session.tick(&mut tools, &mut chat, Instant::now()).unwrap();
         assert!(run.is_none());
@@ -1939,6 +2581,7 @@ mod tests {
             summary: "api is failed".into(),
             severity: "critical".into(),
             rule: "health".into(),
+            opened_at: None,
         };
         let text = digest(
             &[finding],
@@ -1946,6 +2589,7 @@ mod tests {
             &[],
             &["remedy health service systemd.restart approve {\"unit\":\"$unit\"}".into()],
             &["denied k8s.rollout_restart on workload:c:ns:deployment:api: port is closed".into()],
+            &[],
             3,
         );
         assert!(text.contains("port is closed"));
@@ -1966,6 +2610,7 @@ mod tests {
             plan_args: Vec::new(),
             remedy: json!({}),
             explain: json!({}),
+            note_args: Vec::new(),
         };
         let mut chat = ScriptChat {
             rounds: vec![
@@ -1974,6 +2619,7 @@ mod tests {
             ],
             n: 0,
             urls: vec![],
+            bodies: Vec::new(),
         };
         let run = session.tick(&mut tools, &mut chat, start).unwrap().unwrap();
         assert_eq!(run.status, "escalate");
@@ -1984,8 +2630,14 @@ mod tests {
             .is_none());
         assert_eq!(chat.n, calls);
         tools.findings["findings"][0]["summary"] = json!("sshd.service failed differently");
-        let again = session
+        assert!(session
             .tick(&mut tools, &mut chat, start + Duration::from_secs(22))
+            .unwrap()
+            .is_none());
+        assert_eq!(chat.n, calls);
+        tools.findings["findings"][0]["rule"] = json!("disk");
+        let again = session
+            .tick(&mut tools, &mut chat, start + Duration::from_secs(23))
             .unwrap()
             .unwrap();
         assert_eq!(again.trigger, "finding:f1");
@@ -2005,11 +2657,13 @@ mod tests {
             plan_args: Vec::new(),
             remedy: json!({}),
             explain: json!({}),
+            note_args: Vec::new(),
         };
         let mut chat = ScriptChat {
             rounds: vec![],
             n: 0,
             urls: vec![],
+            bodies: Vec::new(),
         };
         let failed = session.tick(&mut tools, &mut chat, start).unwrap().unwrap();
         assert_eq!(failed.status, "error");
@@ -2019,7 +2673,7 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(chat.urls.is_empty());
-        tools.findings["findings"][0]["summary"] = json!("sshd.service failed differently");
+        tools.findings["findings"][0]["rule"] = json!("disk");
         let held = session
             .tick(&mut tools, &mut chat, start + Duration::from_secs(22))
             .unwrap()
@@ -2040,6 +2694,8 @@ mod tests {
 
     #[test]
     fn a_counting_summary_is_one_incident() {
+        let opened = (chrono::Utc::now() - chrono::Duration::minutes(6))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let mut session = Session::new(local_config(), Instant::now());
         let mut tools = quiet_tools(
             json!({
@@ -2049,7 +2705,8 @@ mod tests {
                     "resource_id": "host:lee-cachy",
                     "severity": "critical",
                     "summary": "lee-cachy offline (last health ok); no push for 19s",
-                    "rule": "host offline"
+                    "rule": "host offline",
+                    "opened_at": opened
                 }]
             }),
             empty_changes(),
@@ -2058,6 +2715,7 @@ mod tests {
             rounds: vec![completion(json!([]), "offline")],
             n: 0,
             urls: vec![],
+            bodies: Vec::new(),
         };
         let start = Instant::now();
         assert!(session
@@ -2097,6 +2755,7 @@ mod tests {
             rounds: vec![completion(json!([]), "should not run")],
             n: 0,
             urls: vec![],
+            bodies: Vec::new(),
         };
         assert!(session
             .tick(&mut tools, &mut chat, start)
@@ -2130,6 +2789,7 @@ mod tests {
             rounds: vec![completion(json!([]), "after the cap")],
             n: 0,
             urls: vec![],
+            bodies: Vec::new(),
         };
         let held = session.tick(&mut tools, &mut chat, start).unwrap().unwrap();
         assert_eq!(held.status, "capped");
@@ -2173,11 +2833,13 @@ mod tests {
                 "rejections": [{"action": "k8s.rollout_restart", "reason": "port is closed"}]
             }),
             explain: json!({}),
+            note_args: Vec::new(),
         };
         let mut chat = ScriptChat {
             rounds: vec![completion(json!([]), "pick another action")],
             n: 0,
             urls: vec![],
+            bodies: Vec::new(),
         };
         let run = session
             .tick(&mut tools, &mut chat, Instant::now())
@@ -2209,11 +2871,13 @@ mod tests {
                     }
                 }
             }),
+            note_args: Vec::new(),
         };
         let mut chat = ScriptChat {
             rounds: vec![completion(json!([]), "should not run")],
             n: 0,
             urls: vec![],
+            bodies: Vec::new(),
         };
         let run = session
             .tick(&mut tools, &mut chat, Instant::now())
@@ -2230,5 +2894,312 @@ mod tests {
         assert_eq!(args["params"]["container"], "nginx");
         assert_eq!(args["params"]["port"], 80);
         assert!(!args["action"].as_str().unwrap().contains("rollout"));
+    }
+
+    fn opened_ago(mins: i64) -> String {
+        (chrono::Utc::now() - chrono::Duration::minutes(mins))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    }
+
+    fn health_change(seq: i64, id: &str, after: &str) -> Value {
+        json!({
+            "seq": seq,
+            "resource_id": id,
+            "kind": "changed",
+            "field": "health",
+            "before": "ok",
+            "after": after
+        })
+    }
+
+    fn script(rounds: Vec<Value>) -> ScriptChat {
+        ScriptChat {
+            rounds,
+            n: 0,
+            urls: Vec::new(),
+            bodies: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_pressure_flap_does_not_call_the_model_and_a_lasting_finding_does_once() {
+        let start = Instant::now();
+        let mut session = Session::new(local_config(), start);
+        let mut tools = quiet_tools(
+            json!({"as_of_seq": 2, "findings": []}),
+            json!({
+                "as_of_seq": 2,
+                "changes": [health_change(2, "sensor:lee-cachy:pressure", "degraded")]
+            }),
+        );
+        let mut chat = script(vec![
+            completion(json!([]), "pressure stayed high"),
+            completion(json!([]), "sshd failed"),
+        ]);
+        assert!(session.tick(&mut tools, &mut chat, start).unwrap().is_none());
+        assert_eq!(chat.n, 0);
+
+        tools.findings = json!({
+            "as_of_seq": 3,
+            "findings": [{
+                "id": "f-press",
+                "resource_id": "sensor:lee-cachy:pressure",
+                "severity": "warning",
+                "summary": "pressure is degraded: io pressure 12",
+                "rule": "health",
+                "opened_at": opened_ago(0)
+            }]
+        });
+        tools.changes = json!({"as_of_seq": 3, "changes": []});
+        assert!(session
+            .tick(&mut tools, &mut chat, start + Duration::from_secs(5))
+            .unwrap()
+            .is_none());
+        assert_eq!(chat.n, 0);
+
+        tools.findings["findings"][0]["opened_at"] = json!(opened_ago(2));
+        tools.findings["as_of_seq"] = json!(4);
+        let run = session
+            .tick(&mut tools, &mut chat, start + Duration::from_secs(70))
+            .unwrap()
+            .expect("a sensor finding that stays open is one look");
+        assert_eq!(run.trigger, "finding:f-press");
+        assert_eq!(chat.n, 1);
+        tools.findings["findings"][0]["summary"] = json!("pressure is degraded: io pressure 40");
+        assert!(session
+            .tick(&mut tools, &mut chat, start + Duration::from_secs(80))
+            .unwrap()
+            .is_none());
+        assert_eq!(chat.n, 1);
+
+        tools.findings["findings"][0] = json!({
+            "id": "f-unit",
+            "resource_id": "unit:web1:sshd.service",
+            "severity": "critical",
+            "summary": "sshd.service is failed",
+            "rule": "health",
+            "opened_at": opened_ago(1)
+        });
+        let unit = session
+            .tick(&mut tools, &mut chat, start + Duration::from_secs(90))
+            .unwrap()
+            .expect("an unrelated failure still wakes");
+        assert_eq!(unit.subjects, vec!["unit:web1:sshd.service".to_string()]);
+        assert_eq!(chat.n, 2);
+    }
+
+    #[test]
+    fn host_offline_waits_out_a_bounce_then_wakes_once() {
+        let start = Instant::now();
+        let mut session = Session::new(local_config(), start);
+        let mut tools = quiet_tools(
+            json!({
+                "as_of_seq": 2,
+                "findings": [{
+                    "id": "f-off",
+                    "resource_id": "host:prd-apps-worker-3",
+                    "severity": "critical",
+                    "summary": "prd-apps-worker-3 offline (last health ok); no push for 19s",
+                    "rule": "host offline",
+                    "opened_at": opened_ago(1)
+                }]
+            }),
+            empty_changes(),
+        );
+        let mut chat = script(vec![
+            completion(json!([]), "node came back"),
+            completion(json!([]), "should not run"),
+        ]);
+        assert!(session.tick(&mut tools, &mut chat, start).unwrap().is_none());
+        assert_eq!(chat.n, 0);
+
+        tools.findings["findings"][0]["opened_at"] = json!(opened_ago(6));
+        tools.findings["findings"][0]["summary"] = json!("prd-apps-worker-3 offline (last health ok); no push for 34s");
+        let run = session
+            .tick(&mut tools, &mut chat, start + Duration::from_secs(10))
+            .unwrap()
+            .expect("host offline older than five minutes wakes once");
+        assert_eq!(run.trigger, "finding:f-off");
+        assert_eq!(chat.n, 1);
+        tools.findings["findings"][0]["summary"] = json!("prd-apps-worker-3 offline (last health ok); no push for 90s");
+        assert!(session
+            .tick(&mut tools, &mut chat, start + Duration::from_secs(20))
+            .unwrap()
+            .is_none());
+        assert_eq!(chat.n, 1);
+    }
+
+    #[test]
+    fn a_pod_flip_during_the_node_bounce_does_not_wake_and_a_pod_that_stays_failed_does() {
+        let start = Instant::now();
+        let mut session = Session::new(local_config(), start);
+        let pod = "pod:prd-apps:coder:coder-1";
+        let other = "pod:prd-apps:auth:api-1";
+        let mut tools = quiet_tools(
+            json!({
+                "as_of_seq": 3,
+                "findings": [{
+                    "id": "f-node",
+                    "resource_id": "host:prd-apps-worker-3",
+                    "severity": "critical",
+                    "summary": "prd-apps-worker-3 offline (last health failed); no push for 20s",
+                    "rule": "host offline",
+                    "opened_at": opened_ago(1)
+                }]
+            }),
+            json!({
+                "as_of_seq": 3,
+                "changes": [
+                    health_change(3, "knode:prd-apps:prd-apps-worker-3", "failed"),
+                    health_change(4, pod, "failed"),
+                    health_change(5, other, "failed")
+                ]
+            }),
+        );
+        tools.explain = json!({
+            "by_id": {
+                "pod:prd-apps:coder:coder-1": {"resource": {"parent": "knode:prd-apps:prd-apps-worker-3"}},
+                "pod:prd-apps:auth:api-1": {"resource": {"parent": "knode:prd-apps:prd-apps-worker-9"}}
+            }
+        });
+        let mut chat = script(vec![
+            completion(json!([]), "other pod"),
+            completion(json!([]), "coder stayed down"),
+        ]);
+        let during = session
+            .tick(&mut tools, &mut chat, start)
+            .unwrap()
+            .expect("a pod on a healthy node still wakes");
+        assert_eq!(during.subjects, vec![other.to_string()]);
+        assert!(!during.subjects.iter().any(|id| id == pod));
+        assert_eq!(chat.n, 1);
+
+        tools.findings = json!({
+            "as_of_seq": 6,
+            "findings": [{
+                "id": "f-pod",
+                "resource_id": pod,
+                "severity": "critical",
+                "summary": "coder-1 is failed",
+                "rule": "health",
+                "opened_at": opened_ago(1)
+            }]
+        });
+        tools.changes = json!({"as_of_seq": 6, "changes": []});
+        let stayed = session
+            .tick(&mut tools, &mut chat, start + Duration::from_secs(30))
+            .unwrap()
+            .expect("a pod that is still failed after the node is back wakes");
+        assert_eq!(stayed.subjects, vec![pod.to_string()]);
+        assert_eq!(chat.n, 2);
+    }
+
+    #[test]
+    fn a_repeat_stores_a_reference_and_the_next_wake_reads_it() {
+        let start = Instant::now();
+        let mut config = local_config();
+        config.budget.max_runs_per_resource_per_day = 4;
+        let mut session = Session::new(config, start);
+        let id = "unit:web1:sshd.service";
+        let mut tools = quiet_tools(
+            json!({"as_of_seq": 1, "findings": []}),
+            json!({"as_of_seq": 1, "changes": [health_change(1, id, "failed")]}),
+        );
+        let mut chat = script(vec![
+            completion(json!([]), "leave the disk"),
+            completion(json!([]), "disk is a different fault"),
+            completion(json!([]), "look again after the quiet gap"),
+        ]);
+        let first = session
+            .tick(&mut tools, &mut chat, start)
+            .unwrap()
+            .expect("the first failure is investigated");
+        assert_eq!(first.conclusion, "leave the disk");
+        session.remember_run("p-first", &first);
+        assert_eq!(chat.n, 1);
+
+        tools.changes = json!({"as_of_seq": 2, "changes": [health_change(2, id, "failed")]});
+        assert!(session
+            .tick(&mut tools, &mut chat, start + Duration::from_secs(10))
+            .unwrap()
+            .is_none());
+        assert_eq!(chat.n, 1);
+        assert_eq!(tools.note_args.len(), 1);
+        let stored = tools.note_args[0]["text"].as_str().unwrap();
+        assert!(stored.contains("failure health on unit:web1:sshd.service"));
+        assert!(stored.contains("run p-first"));
+        assert!(stored.contains("decided: leave the disk"));
+        assert!(stored.contains("recurred 1"));
+        assert_eq!(
+            tools.note_args[0]["author"].as_str(),
+            Some(pulseblade_core::PILOT_REF_AUTHOR)
+        );
+
+        tools.findings = json!({
+            "as_of_seq": 3,
+            "findings": [{
+                "id": "f-disk",
+                "resource_id": id,
+                "severity": "warning",
+                "summary": "disk is full",
+                "rule": "disk",
+                "opened_at": opened_ago(1)
+            }]
+        });
+        tools.changes = json!({"as_of_seq": 3, "changes": []});
+        let other_mode = session
+            .tick(&mut tools, &mut chat, start + Duration::from_secs(20))
+            .unwrap()
+            .expect("a different rule is a new incident");
+        assert_eq!(other_mode.trigger, "finding:f-disk");
+        assert_eq!(chat.n, 2);
+
+        tools.findings = json!({"as_of_seq": 4, "findings": []});
+        tools.changes = json!({"as_of_seq": 4, "changes": [health_change(4, id, "ok")]});
+        assert!(session
+            .tick(&mut tools, &mut chat, start + Duration::from_secs(30))
+            .unwrap()
+            .is_none());
+        tools.changes = json!({"as_of_seq": 5, "changes": [health_change(5, id, "failed")]});
+        assert!(
+            session
+                .tick(&mut tools, &mut chat, start + Duration::from_secs(40))
+                .unwrap()
+                .is_none(),
+            "a flap inside the quiet gap does not call the model"
+        );
+        assert_eq!(chat.n, 2);
+        assert!(tools.note_args[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("recurred 2"));
+
+        let aged = (chrono::Utc::now() - chrono::Duration::hours(2))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let text = tools.note_args[0]["text"].as_str().unwrap().to_string();
+        let rewritten = text
+            .lines()
+            .map(|line| {
+                if let Some(rest) = line.strip_prefix("last ") {
+                    if !rest.is_empty() {
+                        return format!("last {aged}");
+                    }
+                }
+                line.to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        tools.note_args[0]["text"] = json!(rewritten);
+        session.incidents.clear();
+        tools.changes = json!({"as_of_seq": 6, "changes": [health_change(6, id, "failed")]});
+        let again = session
+            .tick(&mut tools, &mut chat, start + Duration::from_secs(50))
+            .unwrap()
+            .expect("the same mode after the quiet gap is one new look");
+        assert_eq!(again.conclusion, "look again after the quiet gap");
+        let body = chat.bodies.last().unwrap().to_string();
+        assert!(body.contains("leave the disk"));
+        assert!(body.contains("Do not call memory_note to repeat a stored conclusion."));
+        assert_eq!(chat.n, 3);
     }
 }

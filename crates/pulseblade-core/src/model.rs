@@ -555,6 +555,10 @@ pub struct ActionRun {
     pub finding_outcome: Option<FindingOutcome>,
 }
 
+/// Author of the one note that records a repeated failure the pilot did not
+/// send to a model. `resource_explain` and `memory_search` already return notes.
+pub const PILOT_REF_AUTHOR: &str = "pilot-ref";
+
 /// Free-form memory attached to a resource by an agent or human (M2).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Note {

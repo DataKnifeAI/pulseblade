@@ -869,7 +869,10 @@ fn run_pilot(
                     chrono::Utc::now(),
                 );
                 let id = match stored {
-                    Ok(id) => id,
+                    Ok(id) => {
+                        session.remember_run(&id, &run);
+                        id
+                    }
                     Err(err) => {
                         if shutdown.is_none() {
                             return Err(err.into());

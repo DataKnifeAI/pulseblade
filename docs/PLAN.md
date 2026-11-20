@@ -73,7 +73,7 @@ A model call is never the default. Every path that can reach a provider has a ca
 - Per-run limits stay: tool calls, tokens, and wall time.
 - Backstop outside Pulseblade: a spend limit on every provider API key (for example, a credit limit on each OpenRouter key), one key per environment, so a bug cannot bill past that limit.
 - Next: estimated dollars per run from configured per-model prices, a dollar cap per day, cap state on `/api/v1/status` and the dashboard, and an alert when a cap holds a wake.
-- Next: a cheap triage tier before the investigation model, so a known or noisy finding never reaches the expensive model.
+- A sensor flap (including pressure) does not call the model; a sensor finding that stays open for a minute gets one look. A host-offline finding waits five minutes, the same hold as an announced update, then one look. The update window still keeps that finding from opening. A pod or workload that only flipped while its node was NotReady does not call the model; one that is still failed after the node is healthy does. The same resource and failure mode is not investigated again while it keeps recurring. Each repeat updates one `pilot-ref` note (resource, mode, prior run or note, the stored conclusion, first and last seen, and how many times) that `resource_explain` and `memory_search` already return, and the next real wake is told to use that conclusion instead of writing it again. A new mode, or the same mode after an hour healthy, can be investigated once, still inside the daily per-resource cap.
 
 ### M9 — Hardware (in progress)
 
