@@ -1,44 +1,31 @@
-# Exposes the Pulseblade hub on the existing rke2 nginx Ingress.
-# poc-apps already terminates TLS with the Let's Encrypt wildcard
-# kube-system/wildcard-dataknife-net-tls (*.dataknife.net), the same default
-# certificate grafana.dataknife.net and harbor.dataknife.net use. Do not add a
-# second gateway controller or a new issuer.
-#
-# The hub ConfigMap allow-list must include these hostnames; any other Host
-# header is rejected with 403. Canonical DNS is a CNAME to the worker record,
-# matching the other apps:
+# Pulseblade hub via Traefik Gateway API (HTTPRoute).
+# TLS: traefik-gateway websecure uses kube-system/wildcard-dataknife-net-tls.
+# DNS stays a CNAME to the worker record (no VIP change):
 #   pulseblade-poc.dataknife.net  CNAME  poc-apps-wk.dataknife.net
-# pb-hub-poc.dataknife.net stays as an extra rule for one release.
+# pb-hub-poc.dataknife.net stays as an extra hostname for one release.
 #
 #   curl -fsS https://pulseblade-poc.dataknife.net/
 #   curl -fsS https://pulseblade-poc.dataknife.net/api/v1/status
-apiVersion: networking.k8s.io/v1
-kind: Ingress
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
 metadata:
   name: pulseblade-hub
   namespace: pulseblade
-  annotations:
-    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+  labels:
+    app: pulseblade-hub
 spec:
-  ingressClassName: rke2-ingress-nginx-migration
+  parentRefs:
+    - name: traefik-gateway
+      namespace: kube-system
+      sectionName: websecure
+  hostnames:
+    - pulseblade-poc.dataknife.net
+    - pb-hub-poc.dataknife.net
   rules:
-    - host: pulseblade-poc.dataknife.net
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: pulseblade-hub
-                port:
-                  number: 7170
-    - host: pb-hub-poc.dataknife.net
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: pulseblade-hub
-                port:
-                  number: 7170
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: pulseblade-hub
+          port: 7170
