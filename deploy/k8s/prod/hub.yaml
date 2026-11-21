@@ -187,6 +187,7 @@ data:
     [[hub.nodes]]
     id = "lee-cachy"
     token_env = "TOKEN_LEE_CACHY"
+    offline_ok = true
 ---
 apiVersion: postgresql.cnpg.io/v1
 kind: Cluster
@@ -257,7 +258,7 @@ spec:
         fsGroup: 65532
       containers:
         - name: pulseblade
-          image: harbor.dataknife.net/library/pulseblade:0.1.0@sha256:35f5cf9aef20368f307dac964526c6fad59d5f81d800378fdff62f10112fc195
+          image: harbor.dataknife.net/library/pulseblade:0.1.0@sha256:15cab06edf470314b15adb66ac6c3ceb90d8a61c247eb27a06e635a5b58ca32f
           imagePullPolicy: IfNotPresent
           command:
             - pulseblade
@@ -456,7 +457,7 @@ spec:
             - name: hub-cache
               mountPath: /var/lib/pulseblade-cache
         - name: pilot
-          image: harbor.dataknife.net/library/pulseblade:0.1.0@sha256:35f5cf9aef20368f307dac964526c6fad59d5f81d800378fdff62f10112fc195
+          image: harbor.dataknife.net/library/pulseblade:0.1.0@sha256:15cab06edf470314b15adb66ac6c3ceb90d8a61c247eb27a06e635a5b58ca32f
           imagePullPolicy: IfNotPresent
           command:
             - pulseblade
