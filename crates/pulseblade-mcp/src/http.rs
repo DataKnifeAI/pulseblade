@@ -16,10 +16,10 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use pulseblade_core::{
-    default_time_format, default_timezone, valid_time_format, valid_timezone, HealthThresholds,
-    ResourceKind,
+    default_time_format, default_timezone, parse_duration, valid_time_format, valid_timezone,
+    HealthThresholds, ResourceKind,
 };
-use pulseblade_store::{Store, StoreError};
+use pulseblade_store::{MaintenanceOnce, Store, StoreError};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -107,6 +107,9 @@ pub fn router_with_journal(
         .route("/actions/{id}/deny", post(deny_action))
         .route("/actions/{id}/dismiss", post(dismiss_action))
         .route("/actions/{id}/recheck", post(recheck_action))
+        .route("/maintenance", post(open_maintenance_window))
+        .route("/maintenance/clear", post(clear_maintenance_windows))
+        .route("/offline-ok", post(set_offline_ok))
         .route("/portal", get(portal_get).put(portal_put))
         .fallback(|| async { ApiError::not_found("no such API endpoint") });
     Router::new()
@@ -488,25 +491,192 @@ async fn recheck_action(
     decide_action(st, id, headers, Decision::Recheck).await
 }
 
+fn require_approve(st: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+    let Some(expected) = st.actions.approve_token() else {
+        return Ok(());
+    };
+    let presented = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("");
+    if !token_matches(expected, presented) {
+        return Err(ApiError(
+            StatusCode::UNAUTHORIZED,
+            "approval token required".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MaintenanceBody {
+    /// `30m`, `2h`. At most 6 hours.
+    #[serde(default)]
+    duration: String,
+    #[serde(default)]
+    reason: String,
+    /// Empty means the whole fleet.
+    #[serde(default)]
+    node: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OfflineOkBody {
+    node: String,
+    enabled: bool,
+}
+
+async fn open_maintenance_window(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    body: Result<Json<MaintenanceBody>, JsonRejection>,
+) -> ApiResult {
+    require_approve(&st, &headers)?;
+    let Json(body) = body.map_err(|err| ApiError::invalid(err.body_text()))?;
+    let span =
+        parse_duration(body.duration.trim()).map_err(|err| ApiError::invalid(err.to_string()))?;
+    if span <= chrono::Duration::zero() || span > chrono::Duration::hours(6) {
+        return Err(ApiError::invalid("duration must be from 1s to 6h"));
+    }
+    let reason = {
+        let trimmed = body.reason.trim();
+        if trimmed.is_empty() {
+            "dashboard".to_string()
+        } else {
+            trimmed.to_string()
+        }
+    };
+    let node = body.node.trim().to_string();
+    let nodes = if node.is_empty() {
+        Vec::new()
+    } else {
+        vec![node]
+    };
+    let journal = st.journal.clone();
+    let value = tokio::task::spawn_blocking(move || {
+        let Some(store) = journal.store() else {
+            return Err(ApiError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "database unavailable".into(),
+            ));
+        };
+        let now = Utc::now();
+        match store.open_maintenance(MaintenanceOnce {
+            starts_at: now,
+            ends_at: now + span,
+            nodes,
+            reason,
+        }) {
+            Ok(window) => Ok(window),
+            Err(StoreError::Invalid(msg)) => Err(ApiError::invalid(msg)),
+            Err(err) if journal::is_down(&err) => {
+                journal.mark_down();
+                Err(ApiError(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "database unavailable".into(),
+                ))
+            }
+            Err(err) => Err(ApiError(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())),
+        }
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
+    ok(value)
+}
+
+async fn clear_maintenance_windows(State(st): State<AppState>, headers: HeaderMap) -> ApiResult {
+    require_approve(&st, &headers)?;
+    let journal = st.journal.clone();
+    let removed = tokio::task::spawn_blocking(move || {
+        let Some(store) = journal.store() else {
+            return Err(ApiError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "database unavailable".into(),
+            ));
+        };
+        match store.clear_maintenance_once() {
+            Ok(n) => Ok(n),
+            Err(err) if journal::is_down(&err) => {
+                journal.mark_down();
+                Err(ApiError(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "database unavailable".into(),
+                ))
+            }
+            Err(err) => Err(ApiError(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())),
+        }
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
+    ok(json!({ "cleared": removed }))
+}
+
+async fn set_offline_ok(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    body: Result<Json<OfflineOkBody>, JsonRejection>,
+) -> ApiResult {
+    require_approve(&st, &headers)?;
+    let Json(body) = body.map_err(|err| ApiError::invalid(err.body_text()))?;
+    let node = body.node.trim().to_string();
+    if node.is_empty() {
+        return Err(ApiError::invalid("node id is required"));
+    }
+    let enabled = body.enabled;
+    let journal = st.journal.clone();
+    let listed = tokio::task::spawn_blocking(move || {
+        let Some(store) = journal.store() else {
+            return Err(ApiError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "database unavailable".into(),
+            ));
+        };
+        let write = store.set_runtime_offline_ok(&node, enabled);
+        if let Err(err) = write {
+            return match err {
+                StoreError::Invalid(msg) => Err(ApiError::invalid(msg)),
+                err if journal::is_down(&err) => {
+                    journal.mark_down();
+                    Err(ApiError(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "database unavailable".into(),
+                    ))
+                }
+                err => Err(ApiError(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())),
+            };
+        }
+        match (store.offline_ok_nodes(), store.config_offline_ok()) {
+            (Ok(offline_ok), Ok(offline_ok_config)) => Ok(json!({
+                "offline_ok": offline_ok,
+                "offline_ok_config": offline_ok_config,
+            })),
+            (Err(err), _) | (_, Err(err)) if journal::is_down(&err) => {
+                journal.mark_down();
+                Err(ApiError(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "database unavailable".into(),
+                ))
+            }
+            (Err(err), _) | (_, Err(err)) => {
+                Err(ApiError(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))
+            }
+        }
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
+    ok(listed)
+}
+
 async fn decide_action(
     st: AppState,
     id: String,
     headers: HeaderMap,
     decision: Decision,
 ) -> ApiResult {
-    if let Some(expected) = st.actions.approve_token() {
-        let presented = headers
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .unwrap_or("");
-        if !token_matches(expected, presented) {
-            return Err(ApiError(
-                StatusCode::UNAUTHORIZED,
-                "approval token required".into(),
-            ));
-        }
-    }
+    require_approve(&st, &headers)?;
     // A hub row is not the run. The node that planned it applies the decision,
     // because that is the process that would start the command.
     if let Some(route) = st.route.clone() {
@@ -762,6 +932,158 @@ mod tests {
     async fn get_json(app: &Router, uri: &str) -> (StatusCode, Value) {
         let (status, body, _) = get(app, uri).await;
         (status, serde_json::from_str(&body).unwrap())
+    }
+
+    async fn post_json(
+        app: &Router,
+        uri: &str,
+        body: Value,
+        token: Option<&str>,
+    ) -> (StatusCode, Value) {
+        let mut req = HttpRequest::post(uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCEPT, "application/json");
+        if let Some(token) = token {
+            req = req.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        let res = app
+            .clone()
+            .oneshot(req.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap();
+        let status = res.status();
+        let bytes = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        (
+            status,
+            serde_json::from_str(&text).unwrap_or(json!({ "raw": text })),
+        )
+    }
+
+    #[tokio::test]
+    async fn maintenance_and_offline_ok_change_status() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .replace_config_offline_ok(&["cfghost".into()])
+            .unwrap();
+        let app = router(Arc::new(store), Utc::now());
+
+        let (code, _) = post_json(
+            &app,
+            "/api/v1/maintenance",
+            json!({"duration": "30m", "reason": "hub roll", "node": ""}),
+            None,
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        let (code, v) = get_json(&app, "/api/v1/status").await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(v["maintenance"].as_array().unwrap().len(), 1);
+        assert_eq!(v["maintenance"][0]["reason"], "hub roll");
+        assert!(v["maintenance"][0].get("nodes").is_none());
+        let start = chrono::DateTime::parse_from_rfc3339(
+            v["maintenance"][0]["starts_at"].as_str().unwrap(),
+        )
+        .unwrap();
+        let end =
+            chrono::DateTime::parse_from_rfc3339(v["maintenance"][0]["ends_at"].as_str().unwrap())
+                .unwrap();
+        let minutes = (end - start).num_minutes();
+        assert!(minutes == 30, "window was {minutes} minutes");
+
+        let (code, _) = post_json(
+            &app,
+            "/api/v1/offline-ok",
+            json!({"node": "work1", "enabled": true}),
+            None,
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        let (_, v) = get_json(&app, "/api/v1/status").await;
+        let ids = v["offline_ok"].as_array().unwrap();
+        assert!(ids.iter().any(|n| n == "work1"));
+        assert!(ids.iter().any(|n| n == "cfghost"));
+        let configured = v["offline_ok_config"].as_array().unwrap();
+        assert!(configured.iter().any(|n| n == "cfghost"));
+        assert!(!configured.iter().any(|n| n == "work1"));
+
+        let (code, _) = post_json(
+            &app,
+            "/api/v1/offline-ok",
+            json!({"node": "cfghost", "enabled": false}),
+            None,
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        let (_, v) = get_json(&app, "/api/v1/status").await;
+        assert!(v["offline_ok"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n == "cfghost"));
+        assert!(v["offline_ok_config"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n == "cfghost"));
+
+        let (code, _) = post_json(&app, "/api/v1/maintenance/clear", json!({}), None).await;
+        assert_eq!(code, StatusCode::OK);
+        let (code, _) = post_json(
+            &app,
+            "/api/v1/offline-ok",
+            json!({"node": "work1", "enabled": false}),
+            None,
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        let (_, v) = get_json(&app, "/api/v1/status").await;
+        assert!(v.get("maintenance").is_none());
+        let left = v["offline_ok"].as_array().unwrap();
+        assert!(!left.iter().any(|n| n == "work1"));
+        assert!(left.iter().any(|n| n == "cfghost"));
+
+        let actions = pulseblade_act::ActionsConfig {
+            approve_token: "gate-token".into(),
+            ..pulseblade_act::ActionsConfig::default()
+        };
+        let registry = Arc::new(
+            pulseblade_act::Registry::new(
+                actions,
+                Arc::new(pulseblade_act::SystemRunner) as Arc<dyn pulseblade_act::CommandRunner>,
+            )
+            .unwrap(),
+        );
+        let gated = router_with(
+            Arc::new(Store::open_in_memory().unwrap()),
+            Utc::now(),
+            registry,
+        );
+        let (code, denied) = post_json(
+            &gated,
+            "/api/v1/maintenance",
+            json!({"duration": "30m", "reason": "nope"}),
+            None,
+        )
+        .await;
+        assert_eq!(code, StatusCode::UNAUTHORIZED);
+        assert!(denied["error"].as_str().unwrap().contains("token"));
+        let (code, _) = post_json(
+            &gated,
+            "/api/v1/offline-ok",
+            json!({"node": "work1", "enabled": true}),
+            None,
+        )
+        .await;
+        assert_eq!(code, StatusCode::UNAUTHORIZED);
+        let (code, _) = post_json(
+            &gated,
+            "/api/v1/maintenance",
+            json!({"duration": "30m", "reason": "opened"}),
+            Some("gate-token"),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
     }
 
     #[tokio::test]
@@ -1142,6 +1464,20 @@ mod tests {
         assert!(DASHBOARD.contains("data-deny"));
         assert!(DASHBOARD.contains("data-dismiss"));
         assert!(DASHBOARD.contains("data-recheck"));
+        assert!(DASHBOARD.contains("data-maint-start"));
+        assert!(DASHBOARD.contains("data-maint-clear"));
+        assert!(DASHBOARD.contains("data-offline-allow"));
+        assert!(DASHBOARD.contains("data-offline-clear"));
+        assert!(DASHBOARD.contains("data-offline-set"));
+        assert!(DASHBOARD.contains(">Start maintenance</button>"));
+        assert!(DASHBOARD.contains(">Clear maintenance</button>"));
+        assert!(DASHBOARD.contains(">Allow offline</button>"));
+        assert!(DASHBOARD.contains("Clear offline ok"));
+        assert!(DASHBOARD.contains("set in config"));
+        assert!(DASHBOARD.contains("/api/v1/maintenance"));
+        assert!(DASHBOARD.contains("/api/v1/maintenance/clear"));
+        assert!(DASHBOARD.contains("/api/v1/offline-ok"));
+        assert!(DASHBOARD.contains("offline ok"));
         assert!(DASHBOARD.contains("data-reason"));
         assert!(DASHBOARD.contains("/api/v1/actions/"));
         assert!(DASHBOARD.contains("method: \"POST\""));

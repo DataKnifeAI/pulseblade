@@ -9,6 +9,7 @@ use pulseblade_core::{
 };
 use pulseblade_detect::DetectConfig;
 use pulseblade_pilot::PilotConfig;
+use pulseblade_store::WeeklyMaintenance;
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -426,6 +427,9 @@ pub struct HubConfig {
     /// Signed release the hub may offer. Empty offers nothing.
     #[serde(default)]
     pub release: HubRelease,
+    /// Weekday quiet windows. Each row is at most six hours.
+    #[serde(default)]
+    pub maintenance: Vec<MaintenanceFile>,
 }
 
 /// A signed manifest on disk, and the nodes that may see it.
@@ -444,6 +448,32 @@ pub struct HubNode {
     pub id: String,
     /// Environment variable that holds this node's bearer token. Not the token.
     pub token_env: String,
+    /// When true, this host may be off. Silence does not open `host offline`.
+    #[serde(default)]
+    pub offline_ok: bool,
+}
+
+/// One recurring quiet window. `clock` is `utc` or `local` (the file's `timezone`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaintenanceFile {
+    /// `mon` through `sun`.
+    pub weekday: String,
+    /// `HH:MM` in `clock`.
+    pub start: String,
+    /// `HH:MM` later the same day, at most six hours after `start`.
+    pub end: String,
+    /// `utc` (default) or `local`.
+    #[serde(default = "utc_clock")]
+    pub clock: String,
+    /// Empty means the whole fleet.
+    #[serde(default)]
+    pub nodes: Vec<String>,
+    pub reason: String,
+}
+
+fn utc_clock() -> String {
+    "utc".into()
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -510,7 +540,41 @@ impl Default for HubConfig {
             database_ca_env: String::new(),
             snapshot_cache: String::new(),
             release: HubRelease::default(),
+            maintenance: Vec::new(),
         }
+    }
+}
+
+impl Config {
+    /// Weekday windows from `[hub]`. A row longer than six hours is an error.
+    pub fn maintenance_schedule(&self) -> anyhow::Result<Vec<WeeklyMaintenance>> {
+        self.hub
+            .maintenance
+            .iter()
+            .enumerate()
+            .map(|(i, row)| {
+                WeeklyMaintenance::parse(
+                    &row.weekday,
+                    &row.start,
+                    &row.end,
+                    &row.clock,
+                    &self.timezone,
+                    &row.nodes,
+                    &row.reason,
+                )
+                .map_err(|err| anyhow::anyhow!("[[hub.maintenance]] entry {i}: {err}"))
+            })
+            .collect()
+    }
+
+    /// Node ids with `offline_ok = true`. Empty means every missing host can alert.
+    pub fn config_offline_ok(&self) -> Vec<String> {
+        self.hub
+            .nodes
+            .iter()
+            .filter(|node| node.offline_ok)
+            .map(|node| node.id.clone())
+            .collect()
     }
 }
 
@@ -754,6 +818,9 @@ impl Config {
                 path.display()
             );
         }
+        cfg.maintenance_schedule().map_err(|err| {
+            anyhow::anyhow!("invalid [[hub.maintenance]] in {}: {err}", path.display())
+        })?;
         Ok(cfg)
     }
 }
@@ -975,6 +1042,8 @@ mod tests {
         assert_eq!(cfg.pilot.budget.max_tool_calls, 12);
         assert_eq!(cfg.hub.listen, "127.0.0.1:7170");
         assert_eq!(cfg.hub.nodes[0].id, "web1");
+        assert!(!cfg.hub.nodes[0].offline_ok);
+        assert!(cfg.hub.maintenance.is_empty());
         assert!(cfg.upstream.url.is_empty());
         assert!(cfg.k8s.api_url.is_empty());
         assert_eq!(cfg.k8s.cluster, "demo");
@@ -1096,6 +1165,53 @@ mod tests {
         .unwrap();
         let err = Config::load(Some(&path)).unwrap_err().to_string();
         assert!(err.contains("public_key"), "{err}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn offline_ok_is_per_node_and_a_long_window_is_rejected() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [[hub.nodes]]
+            id = "work1"
+            token_env = "TOKEN_WORK1"
+            offline_ok = true
+
+            [[hub.nodes]]
+            id = "web1"
+            token_env = "TOKEN_WEB1"
+
+            [[hub.maintenance]]
+            weekday = "sun"
+            start = "02:00"
+            end = "04:00"
+            clock = "local"
+            reason = "patch window"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.config_offline_ok(), vec!["work1".to_string()]);
+        assert!(!cfg.hub.nodes[1].offline_ok);
+        let schedule = cfg.maintenance_schedule().unwrap();
+        assert_eq!(schedule.len(), 1);
+        assert_eq!(schedule[0].clock, "local");
+        assert!(schedule[0].nodes.is_empty());
+
+        let path = std::env::temp_dir().join(format!(
+            "pulseblade-maint-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(
+            &path,
+            "[[hub.maintenance]]\nweekday = \"sun\"\nstart = \"02:00\"\nend = \"09:00\"\nreason = \"too long\"\n",
+        )
+        .unwrap();
+        let err = Config::load(Some(&path)).unwrap_err().to_string();
+        assert!(err.contains("6 hours"), "{err}");
         let _ = std::fs::remove_file(&path);
     }
 }

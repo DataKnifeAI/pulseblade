@@ -10,6 +10,7 @@ authors.workspace = true
 [dependencies]
 pulseblade-core.workspace = true
 chrono.workspace = true
+chrono-tz = "0.10"
 native-tls = "0.2"
 postgres = "0.19"
 postgres-native-tls = "0.5"

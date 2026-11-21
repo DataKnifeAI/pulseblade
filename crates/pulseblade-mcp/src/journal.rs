@@ -17,11 +17,14 @@ use crate::query::{Detail, QueryError, Snapshot};
 /// snapshot (`stale: true`, `as_of_seq` from the last successful read).
 #[derive(Debug, Serialize, JsonSchema)]
 #[serde(untagged)]
+// The stale arm is the summary snapshot on purpose. Boxing it would change every reader.
+#[allow(clippy::large_enum_variant)]
 pub enum LiveOrStale<T> {
     Stale(Snapshot),
     Live(T),
 }
 
+#[allow(clippy::large_enum_variant)]
 pub enum Read<T> {
     Live(T),
     Stale(Snapshot),

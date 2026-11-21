@@ -14,7 +14,7 @@ use clap::{Parser, Subcommand};
 use pulseblade_collect::default_collectors;
 use pulseblade_core::{Aggregation, ResourceKind};
 use pulseblade_mcp::query;
-use pulseblade_store::Store;
+use pulseblade_store::{MaintenanceOnce, Store};
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 
@@ -171,6 +171,39 @@ enum Ctl {
     Recheck { run_id: String },
     /// Recent pilot investigations, newest first.
     Runs,
+    /// Mark a node whose silence is normal, or list that set.
+    ///
+    /// The id is operator data. An empty set still opens `host offline` for every
+    /// missing host. `--clear` removes a runtime mark. A node with `offline_ok`
+    /// in the hub file stays allowed until that line is edited.
+    OfflineOk {
+        /// Node id. Omit it to list the set.
+        node: Option<String>,
+        /// Remove the runtime mark for `node`.
+        #[arg(long)]
+        clear: bool,
+    },
+    /// Open or clear a one-shot maintenance window. At most 6 hours.
+    Maintenance {
+        /// Duration from now, such as `30m` or `2h`.
+        #[arg(long = "for")]
+        duration: Option<String>,
+        /// RFC3339 start. Pair with `--end`.
+        #[arg(long)]
+        start: Option<String>,
+        /// RFC3339 end.
+        #[arg(long)]
+        end: Option<String>,
+        /// Why this window is quiet.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Limit the window to this node. Repeat for more than one. Omit for the fleet.
+        #[arg(long = "node")]
+        nodes: Vec<String>,
+        /// Drop one-shot windows. The weekly schedule in the hub file stays.
+        #[arg(long)]
+        clear: bool,
+    },
 }
 
 fn parse_agg(s: &str) -> Result<Aggregation, String> {
@@ -609,8 +642,19 @@ async fn main() -> anyhow::Result<()> {
             let history_days = config.history_days;
             let change_days = config.change_retention_days;
             let retry = journal.clone();
+            let offline_ok = config.config_offline_ok();
+            let schedule = config.maintenance_schedule()?;
             tokio::spawn(async move {
-                hub::supervise(retry, opener, supervised, history_days, change_days).await;
+                hub::supervise(
+                    retry,
+                    opener,
+                    supervised,
+                    history_days,
+                    change_days,
+                    offline_ok,
+                    schedule,
+                )
+                .await;
             });
             let allowed = http_allowed_hosts(&config, listener.local_addr()?);
             let actions = action_registry(&config)?;
@@ -651,7 +695,11 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Command::Ctl { command } => {
-            let store = open_store(&db)?;
+            let store = if matches!(command, Ctl::OfflineOk { .. } | Ctl::Maintenance { .. }) {
+                open_hub_store(&config, &db)?
+            } else {
+                open_store(&db)?
+            };
             run_ctl(&store, &db, &config, command)
         }
     }
@@ -803,7 +851,103 @@ fn run_ctl(store: &Store, db: &Path, config: &Config, command: Ctl) -> anyhow::R
             print_json(&reg.recheck(store, &run_id)?)
         }
         Ctl::Runs => print_json(&store.recent_pilot_runs(20)?),
+        Ctl::OfflineOk { node, clear } => offline_ok_cmd(store, config, node, clear),
+        Ctl::Maintenance {
+            duration,
+            start,
+            end,
+            reason,
+            nodes,
+            clear,
+        } => maintenance_cmd(store, duration, start, end, reason, nodes, clear),
     }
+}
+
+fn open_hub_store(config: &Config, path: &Path) -> anyhow::Result<Arc<Store>> {
+    Ok(Arc::new(hub_opener(config, path)?.open()?))
+}
+
+fn offline_ok_cmd(
+    store: &Store,
+    config: &Config,
+    node: Option<String>,
+    clear: bool,
+) -> anyhow::Result<()> {
+    let from_config = config.config_offline_ok();
+    if let Some(node) = node.as_deref().map(str::trim).filter(|id| !id.is_empty()) {
+        store.set_runtime_offline_ok(node, !clear)?;
+    } else if clear {
+        anyhow::bail!("offline-ok --clear needs a node id");
+    }
+    let runtime = store.runtime_offline_ok()?;
+    let mut offline_ok = from_config.clone();
+    for id in &runtime {
+        if !offline_ok.iter().any(|have| have == id) {
+            offline_ok.push(id.clone());
+        }
+    }
+    offline_ok.sort();
+    print_json(&serde_json::json!({
+        "offline_ok": offline_ok,
+        "from_config": from_config,
+        "runtime": runtime,
+    }))
+}
+
+fn maintenance_cmd(
+    store: &Store,
+    duration: Option<String>,
+    start: Option<String>,
+    end: Option<String>,
+    reason: Option<String>,
+    nodes: Vec<String>,
+    clear: bool,
+) -> anyhow::Result<()> {
+    if clear {
+        if duration.is_some() || start.is_some() || end.is_some() {
+            anyhow::bail!("maintenance --clear does not take a window");
+        }
+        let removed = store.clear_maintenance_once()?;
+        return print_json(&serde_json::json!({
+            "cleared": removed,
+            "maintenance": store.active_maintenance(chrono::Utc::now())?,
+        }));
+    }
+    if duration.is_none() && start.is_none() && end.is_none() {
+        return print_json(&serde_json::json!({
+            "maintenance": store.active_maintenance(chrono::Utc::now())?,
+        }));
+    }
+    let reason = reason.unwrap_or_default();
+    let now = chrono::Utc::now();
+    let (starts_at, ends_at) = if let Some(duration) = duration {
+        if start.is_some() || end.is_some() {
+            anyhow::bail!("pass either --for or --start and --end");
+        }
+        let span =
+            pulseblade_core::parse_duration(&duration).map_err(|err| anyhow::anyhow!("{err}"))?;
+        if span <= chrono::Duration::zero() || span > chrono::Duration::hours(6) {
+            anyhow::bail!("--for must be from 1s to 6h");
+        }
+        (now, now + span)
+    } else {
+        let start = start.context("--start and --end are both required")?;
+        let end = end.context("--start and --end are both required")?;
+        let starts_at = chrono::DateTime::parse_from_rfc3339(&start)
+            .map_err(|err| anyhow::anyhow!("--start: {err}"))?
+            .with_timezone(&chrono::Utc);
+        let ends_at = chrono::DateTime::parse_from_rfc3339(&end)
+            .map_err(|err| anyhow::anyhow!("--end: {err}"))?
+            .with_timezone(&chrono::Utc);
+        (starts_at, ends_at)
+    };
+    let opened = store.open_maintenance(MaintenanceOnce {
+        starts_at,
+        ends_at,
+        nodes,
+        reason,
+    })?;
+    print_json(&opened)
 }
 
 fn pilot_mcp_url(config: &Config, flag: Option<String>) -> String {

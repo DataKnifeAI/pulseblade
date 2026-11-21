@@ -189,6 +189,15 @@ pub struct Status {
     /// accepted that push. Omitted on a node, which has no cursor rows.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub nodes: Vec<NodePushStatus>,
+    /// Windows open right now.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub maintenance: Vec<MaintenanceView>,
+    /// Hosts whose silence is normal. Empty means every missing host can alert.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub offline_ok: Vec<String>,
+    /// Subset of `offline_ok` that comes from hub config. Clearing a runtime mark leaves these.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub offline_ok_config: Vec<String>,
 }
 
 /// One node's cursor on the hub, plus whether it has stopped pushing.
@@ -214,6 +223,21 @@ pub struct NodePushStatus {
     pub release_seq: u64,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub update_state: String,
+    /// This host may be off. A missing push is not an outage.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub offline_ok: bool,
+}
+
+/// A maintenance window that is open now.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct MaintenanceView {
+    pub id: String,
+    pub starts_at: DateTime<Utc>,
+    pub ends_at: DateTime<Utc>,
+    /// Empty means the whole fleet.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nodes: Vec<String>,
+    pub reason: String,
 }
 
 /// Self-health. `process_started` is the serving process's start time, if any.
@@ -245,18 +269,22 @@ pub fn status(store: &Store, process_started: Option<DateTime<Utc>>) -> Result<S
         open_findings: store.open_finding_count()?,
         awaiting_actions: store.awaiting_action_count()?,
         nodes: node_push_statuses(store, now)?,
+        maintenance: maintenance_now(store)?,
+        offline_ok: store.offline_ok_nodes()?,
+        offline_ok_config: store.config_offline_ok()?,
     })
 }
 
 fn node_push_statuses(store: &Store, now: DateTime<Utc>) -> Result<Vec<NodePushStatus>> {
+    let allowed = store.offline_ok_nodes()?;
     Ok(store
         .node_pushes()?
         .iter()
-        .map(|row| node_push_status(now, row))
+        .map(|row| node_push_status(now, row, allowed.iter().any(|id| id == &row.node)))
         .collect())
 }
 
-fn node_push_status(now: DateTime<Utc>, row: &NodePush) -> NodePushStatus {
+fn node_push_status(now: DateTime<Utc>, row: &NodePush, offline_ok: bool) -> NodePushStatus {
     let (age_secs, stale) = row.freshness(now);
     NodePushStatus {
         node: row.node.clone(),
@@ -270,13 +298,28 @@ fn node_push_status(now: DateTime<Utc>, row: &NodePush) -> NodePushStatus {
         digest: row.digest.clone(),
         release_seq: row.release_seq,
         update_state: row.update_state.clone(),
+        offline_ok,
     }
+}
+
+fn maintenance_now(store: &Store) -> Result<Vec<MaintenanceView>> {
+    Ok(store
+        .active_maintenance(Utc::now())?
+        .into_iter()
+        .map(|window| MaintenanceView {
+            id: window.id,
+            starts_at: window.starts_at,
+            ends_at: window.ends_at,
+            nodes: window.nodes,
+            reason: window.reason,
+        })
+        .collect())
 }
 
 fn stale_nodes(store: &Store) -> Result<Vec<NodePushStatus>> {
     Ok(node_push_statuses(store, Utc::now())?
         .into_iter()
-        .filter(|n| n.stale)
+        .filter(|n| n.stale && !n.offline_ok)
         .collect())
 }
 
@@ -386,8 +429,15 @@ pub struct Snapshot {
     #[serde(default, skip_serializing_if = "is_false")]
     pub truncated: bool,
     /// Hub nodes that have missed three push intervals. Empty on a node.
+    /// A host marked offline-ok is left off this list.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub nodes: Vec<NodePushStatus>,
+    /// Windows open right now.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub maintenance: Vec<MaintenanceView>,
+    /// Hosts whose silence is normal.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub offline_ok: Vec<String>,
     /// The database was unavailable. This is the last successful summary, at `as_of_seq`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub stale: bool,
@@ -397,12 +447,16 @@ pub fn snapshot(store: &Store, p: SnapshotParams) -> Result<Snapshot> {
     let as_of_seq = store.current_seq()?;
     let collectors: Vec<CollectorHealth> = collectors(store)?.iter().map(|c| c.health()).collect();
     let nodes = stale_nodes(store)?;
+    let maintenance = maintenance_now(store)?;
+    let offline_ok = store.offline_ok_nodes()?;
     if p.if_changed_since == Some(as_of_seq) {
         return Ok(Snapshot {
             as_of_seq,
             unchanged: true,
             collectors: collectors.into_iter().filter(|c| !c.ok).collect(),
             nodes,
+            maintenance,
+            offline_ok,
             ..Default::default()
         });
     }
@@ -472,6 +526,8 @@ pub fn snapshot(store: &Store, p: SnapshotParams) -> Result<Snapshot> {
         total: Some(total),
         truncated: total > limit,
         nodes,
+        maintenance,
+        offline_ok,
         stale: false,
     })
 }
@@ -1306,6 +1362,12 @@ pub struct FindingPage {
     #[serde(default, skip_serializing_if = "is_false")]
     pub truncated: bool,
     pub findings: Vec<FindingView>,
+    /// Windows open right now. The pilot holds wakes for nodes inside one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub maintenance: Vec<MaintenanceView>,
+    /// Hosts whose silence is normal. The pilot does not wake because they are off.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub offline_ok: Vec<String>,
 }
 
 pub fn findings(store: &Store, p: FindingsParams) -> Result<FindingPage> {
@@ -1324,6 +1386,8 @@ pub fn findings(store: &Store, p: FindingsParams) -> Result<FindingPage> {
         total,
         truncated: total > rows.len(),
         findings: rows.into_iter().map(|f| finding_view(f, detail)).collect(),
+        maintenance: maintenance_now(store)?,
+        offline_ok: store.offline_ok_nodes()?,
     })
 }
 
@@ -1895,6 +1959,7 @@ mod tests {
                 shutting_down: false,
                 ..NodePush::default()
             },
+            false,
         );
         assert_eq!(fresh.node, "web1");
         assert_eq!(fresh.seq, 3);
@@ -1911,6 +1976,7 @@ mod tests {
                 shutting_down: false,
                 ..NodePush::default()
             },
+            false,
         );
         assert!(silent.stale);
         assert!(silent.last_push_age_secs >= 119);
@@ -1925,6 +1991,7 @@ mod tests {
                 shutting_down: false,
                 ..NodePush::default()
             },
+            false,
         );
         assert!(unknown.stale);
 
@@ -1938,6 +2005,7 @@ mod tests {
                 shutting_down: false,
                 ..NodePush::default()
             },
+            false,
         );
         assert!(!recent.stale, "three 15s intervals have not elapsed");
         let missed = node_push_status(
@@ -1950,6 +2018,7 @@ mod tests {
                 shutting_down: true,
                 ..NodePush::default()
             },
+            false,
         );
         assert!(missed.stale);
         assert!(missed.shutting_down);

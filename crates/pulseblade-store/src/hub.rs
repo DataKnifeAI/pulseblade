@@ -869,13 +869,15 @@ impl Store {
 
     /// One open `host offline` finding per stale node. A push that is fresh again
     /// resolves that host's finding and leaves every other finding alone.
-    /// Resources are not marked disappeared.
+    /// A node inside a maintenance window, or marked offline-ok, is skipped.
+    /// Past the window, silence is a finding again. Resources are not marked disappeared.
     pub fn sync_offline_hosts(
         &self,
         now: DateTime<Utc>,
     ) -> crate::Result<Vec<pulseblade_core::Finding>> {
         let mut drafts = Vec::new();
         let now_ms = now.timestamp_millis();
+        let quiet = self.silence_policy(now)?;
         for push in self.node_pushes()? {
             let (age, stale) = push.freshness(now);
             if !stale {
@@ -883,6 +885,10 @@ impl Store {
             }
             // A planned swap announced this. Past the deadline, silence is offline.
             if update_window_open(&push, now_ms) {
+                continue;
+            }
+            // Operator maintenance, or a host that is allowed to be off.
+            if quiet.allows(&push.node) {
                 continue;
             }
             let host_id = format!("host:{}", push.node);

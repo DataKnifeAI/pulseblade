@@ -474,6 +474,57 @@ mod tests {
     }
 
     #[test]
+    fn an_offline_ok_host_stays_quiet_and_a_full_disk_still_fails() {
+        use pulseblade_store::NodeBatch;
+
+        let store = Store::open_in_memory().unwrap();
+        let now = Utc::now();
+        store.set_runtime_offline_ok("work1", true).unwrap();
+        store
+            .ingest_node(
+                "work1",
+                &NodeBatch {
+                    resources: vec![
+                        Resource::new("host:work1", ResourceKind::Host, "work1").health(Health::Ok),
+                        Resource::new("disk:work1:/", ResourceKind::Disk, "/")
+                            .parent("host:work1")
+                            .health(Health::Failed),
+                    ],
+                    interval_secs: 15,
+                    ..NodeBatch::default()
+                },
+            )
+            .unwrap();
+        store
+            .set_node_last_push("work1", now.timestamp_millis() - 120_000)
+            .unwrap();
+        assert!(
+            store.sync_offline_hosts(now).unwrap().is_empty(),
+            "silence on an offline-ok host is not host offline"
+        );
+        let opened = sync(&store, &DetectConfig::default(), now).unwrap();
+        assert!(
+            opened
+                .iter()
+                .any(|f| f.resource_id == "disk:work1:/" && f.rule == "health"),
+            "a full disk on that host is still a failure"
+        );
+        assert!(opened.iter().all(|f| f.rule != "host offline"));
+        store.sync_offline_hosts(now).unwrap();
+        let (rows, _) = store
+            .findings(
+                &pulseblade_store::FindingFilter {
+                    status: Some(pulseblade_core::FindingStatus::Open),
+                    ..Default::default()
+                },
+                20,
+            )
+            .unwrap();
+        assert!(rows.iter().any(|f| f.resource_id == "disk:work1:/"));
+        assert!(rows.iter().all(|f| f.rule != "host offline"));
+    }
+
+    #[test]
     fn ewma_ignores_low_jitter_and_flags_a_high_spike() {
         let store = Store::open_in_memory().unwrap();
         let start = Utc::now() - chrono::Duration::minutes(30);

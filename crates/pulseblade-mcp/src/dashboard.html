@@ -155,6 +155,7 @@
   .tile:hover { border-color: var(--line); }
   .tile.sel { border-color: var(--amber); }
   .tile.stale { opacity: .6; }
+  .quiet { margin: 0; color: var(--muted); font-size: 12.5px; }
   .tname { display: flex; align-items: center; gap: 8px; min-width: 0; }
   .tname b { font-family: var(--mono); font-size: 12px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .tname .num { margin-left: auto; color: var(--faint); white-space: nowrap; }
@@ -320,7 +321,25 @@
   <nav class="tabs" role="tablist" aria-label="Views" id="tabs"></nav>
 </header>
 <div class="layout" id="layout">
-  <main class="view" id="view"></main>
+  <main class="view" id="view">
+  <div id="quiet" class="quiet" hidden>
+    <p id="quiet-status"></p>
+    <div class="approve">
+      <label>Duration <input data-maint-for value="30m" aria-label="Maintenance duration"></label>
+      <label>Reason <input data-maint-reason aria-label="Maintenance reason"></label>
+      <label>Host <input data-maint-node placeholder="fleet" aria-label="Maintenance host"></label>
+      <button type="button" data-maint-start>Start maintenance</button>
+      <button type="button" data-maint-clear>Clear maintenance</button>
+    </div>
+    <div id="offline-list" class="approve"></div>
+    <div class="approve">
+      <label>Host <input data-offline-node aria-label="Offline ok host"></label>
+      <button type="button" data-offline-allow>Allow offline</button>
+    </div>
+    <p id="quiet-err" class="small t-failed" hidden></p>
+  </div>
+  <div id="view-body"></div>
+</main>
   <aside class="card" id="panel" hidden></aside>
 </div>
 <div id="err" class="err" hidden style="max-width:980px;margin:0 auto 12px"></div>
@@ -414,7 +433,7 @@ const state = {
   changesKey: "", sensorsKey: "", spark: null, sparkWin: "1h", sparkLoading: null, searchHits: [], detailRecent: {}, detailFindings: {}, detailActions: {}, missing: {},
   trendHost: params.get("host") || null, trendWin: "6h", trendCache: {},
   gapWin: "24h", gapCache: {}, gapKey: "", gapAt: 0, gapFlight: "",
-  deciding: null, decideErr: null,
+  deciding: null, decideErr: null, quietErr: "",
   tz: loadZone(), serverTz: serverZone(), tf: loadFormat(), serverTf: serverFormat(), health: Object.assign({}, HEALTH_DEFAULTS), portalMsg: "",
 };
 let D = { status: null, all: [], findings: { total: 0, findings: [] }, actions: { runs: [] }, changes: [], counts: {} };
@@ -557,7 +576,10 @@ function buildModel() {
       stor: pct("storage.used_pct", m.rs.filter((r) => r.kind === "storage")),
       failed: own.filter((r) => r.health === "failed").length,
       degraded: own.filter((r) => r.health === "degraded").length,
-      stale: !!(push && push.stale), age: push && push.last_push_age_secs,
+      offlineOk: !!(push && push.offline_ok),
+      stale: !!(push && push.stale && !push.offline_ok),
+      quiet: !!(push && push.stale && push.offline_ok),
+      age: push && push.last_push_age_secs,
       shuttingDown: !!(push && push.shutting_down),
     });
     const key = m.type === "k8s" ? "k8s:" + m.cluster : m.type === "pve" ? "pve:" + m.name : "host:" + m.name;
@@ -697,7 +719,7 @@ async function decideRun(id, op) {
   refresh().catch(showError);
 }
 function staleSources() {
-  const nodes = ((D.status && D.status.nodes) || []).filter((n) => n.stale).map((n) => ({ name: n.node, id: "host:" + n.node, age: n.last_push_age_secs, what: n.shutting_down ? "node shut down" : "no push from node agent" }));
+  const nodes = ((D.status && D.status.nodes) || []).filter((n) => n.stale && !n.offline_ok).map((n) => ({ name: n.node, id: "host:" + n.node, age: n.last_push_age_secs, what: n.shutting_down ? "node shut down" : "no push from node agent" }));
   const cols = ((D.status && D.status.collectors) || []).filter((c) => c.stale || !c.ok).map((c) => ({ name: c.source + " collector", id: null, age: c.age_secs, what: c.stale ? "no pass" : (c.error || "failing") }));
   return nodes.concat(cols);
 }
@@ -841,7 +863,8 @@ function machineTile(m) {
   const glyph = m.type === "k8s" ? "" : ic(machineIcon(m), "", a.os ? String(a.os).replace(/^Linux \((.*)\)$/, "$1") : (m.pnode ? "Proxmox VE" : ""));
   const guests = m.type === "pve" ? `${plural(m.rs.filter((r) => r.kind === "vm").length, "VM")} · ${m.rs.filter((r) => r.id.startsWith("lxc:")).length} LXC` : "";
   const sense = sensorBlurb(m);
-  const foot = m.stale ? `<div class="tfoot">${m.shuttingDown ? "shut down" : "stale"} · last push ${ago(m.age)} ago</div>`
+  const foot = m.quiet ? `<div class="tfoot">offline ok · last push ${ago(m.age)} ago</div>`
+    : m.stale ? `<div class="tfoot">${m.shuttingDown ? "shut down" : "stale"} · last push ${ago(m.age)} ago</div>`
     : m.failed || m.degraded ? `<div class="tfoot">${[guests, issues(m), sense].filter(Boolean).join(" · ")}</div>`
     : `<div class="tfoot">${[guests || plural(m.own.length, "resource") + " ok", sense].filter(Boolean).join(" · ")}</div>`;
   return `<button type="button" class="tile ${m.stale ? "stale" : ""} ${sel ? "sel" : ""}" data-machine="${esc(m.name)}" title="${esc(a.os || "")}">
@@ -1326,9 +1349,10 @@ function machineView(name, inline) {
   const up = a.boot_time ? ago((Date.now() - Date.parse(a.boot_time)) / 1000) : null;
   const role = m.knode ? `k8s node · ${esc(m.knode.attrs.status || "")}` : m.pnode ? `proxmox node · ${esc(m.pnode.attrs.status || "")}` : "";
   return `${inline ? "" : crumbs(g && g.type !== "host" ? scopeCrumb(g) : "<span>host</span>", `<span>${m.knode ? "node" : m.pnode ? "pve node" : ""}</span>`)}
-    <div class="ititle">${dot(m.stale ? "unknown" : m.failed ? "failed" : m.degraded ? "degraded" : "ok")}${ic(machineIcon(m) || "host", "lg", a.os || (m.pnode ? "Proxmox VE" : ""))}<b>${esc(name)}</b>${m.stale ? `<span class="small muted">stale ${ago(m.age)}</span>` : ""}</div>
+    <div class="ititle">${dot(m.stale ? "unknown" : m.failed ? "failed" : m.degraded ? "degraded" : "ok")}${ic(machineIcon(m) || "host", "lg", a.os || (m.pnode ? "Proxmox VE" : ""))}<b>${esc(name)}</b>${m.quiet ? `<span class="small muted">offline ok</span>` : m.stale ? `<span class="small muted">stale ${ago(m.age)}</span>` : ""}</div>
     <div class="facts">${[role, a.os, a.cpu_count && a.cpu_count + " cpu", a.memory_total_bytes && bytes(a.memory_total_bytes), up && "up " + up,
-      m.age != null && `last push ${ago(m.age)} ago`].filter(Boolean).join(" · ")}</div>
+      m.quiet && "offline ok", m.age != null && `last push ${ago(m.age)} ago`].filter(Boolean).join(" · ")}</div>
+    <div class="approve">${offlineSwitch(name)}</div>
     ${(m.host || m.pnode) ? metricBlock(m.host || m.pnode, inline) : ""}
     <h3>Resources</h3>${kindGroups(m.rs, "m:" + name) || `<div class="empty small">No resources loaded for this machine.</div>`}
     ${inline ? "" : `<h3>Changed here</h3>${recentFor((c) => hostOf(byId.get(c.resource_id) || { kind: "process", id: c.resource_id, labels: {} }) === name, 5)}`}`;
@@ -1338,7 +1362,7 @@ function scopeView(key) {
   if (!g) return crumbs() + `<div class="empty">Gone.</div>`;
   if (g.type === "host" && g.machines[0]) return machineView(g.machines[0].name);
   const nodes = g.machines.map((m) => `<div class="rrow ${m.failed || m.degraded ? "u" : ""}" data-machine="${esc(m.name)}">${dot(m.stale ? "unknown" : m.failed ? "failed" : m.degraded ? "degraded" : "ok")}
-      <span class="nm">${esc(m.name)}</span><span class="sm">${esc(((m.knode || m.pnode || {}).attrs || {}).status || "")} · cpu ${fmt("x_pct", m.cpu)} · mem ${fmt("x_pct", m.mem)}${m.stale ? " · stale" : ""}</span></div>`).join("");
+      <span class="nm">${esc(m.name)}</span><span class="sm">${esc(((m.knode || m.pnode || {}).attrs || {}).status || "")} · cpu ${fmt("x_pct", m.cpu)} · mem ${fmt("x_pct", m.mem)}${m.quiet ? " · offline ok" : m.stale ? " · stale" : ""}</span></div>`).join("");
   return `${crumbs(`<span>${SCOPE_LABEL[g.type]}</span>`)}
     <div class="ititle">${dot(g.failed ? "failed" : g.sev === 1 ? "degraded" : "ok")}${ic(SCOPE_ICON[g.type], "lg")}<b>${esc(g.name)}</b><span class="small">${issues(g)}</span></div>
     <div class="facts">${groupSummary(g)}</div>${g.machines.length ? `<h3>Nodes</h3>${nodes}` : ""}
@@ -1510,15 +1534,67 @@ function renderPanel() {
   el.innerHTML = s.t === "machine" ? machineView(s.id) : s.t === "scope" ? scopeView(s.id) : s.t === "search" ? searchView(s.id) : s.t === "settings" ? settingsView() : s.t === "clients" ? clientsView() : resourceView(s.id);
   if (s.t === "settings") bindSettings();
 }
+function offlineConfig(id) {
+  return ((D.status && D.status.offline_ok_config) || []).indexOf(id) >= 0;
+}
+function offlineOn(id) {
+  return ((D.status && D.status.offline_ok) || []).indexOf(id) >= 0;
+}
+function offlineSwitch(name) {
+  if (offlineConfig(name)) return `<span class="small muted">${esc(name)} set in config</span>`;
+  if (offlineOn(name)) return `<button type="button" data-offline-clear="${esc(name)}">Clear offline ok</button>`;
+  return `<button type="button" data-offline-set="${esc(name)}">Allow offline</button>`;
+}
+function renderQuiet() {
+  const box = $("quiet");
+  if (!box || !D.status) return;
+  box.hidden = false;
+  const parts = [];
+  for (const w of D.status.maintenance || []) {
+    const who = w.nodes && w.nodes.length ? w.nodes.join(", ") : "fleet";
+    const end = Date.parse(w.ends_at);
+    const until = Number.isNaN(end) ? "" : " until " + formatClock(new Date(end), zoneName(), timeFormatName(), true);
+    parts.push("Maintenance · " + who + until + (w.reason ? " · " + w.reason : ""));
+  }
+  const ok = D.status.offline_ok || [];
+  if (ok.length) parts.push("Offline ok · " + ok.join(", "));
+  const statusEl = $("quiet-status");
+  if (statusEl) statusEl.textContent = parts.join("  ·  ");
+  const list = $("offline-list");
+  if (list) {
+    list.innerHTML = ok.map((id) => offlineConfig(id)
+      ? `<span>${esc(id)} <span class="muted">set in config</span></span>`
+      : `<span>${esc(id)} <button type="button" data-offline-clear="${esc(id)}">Clear offline ok</button></span>`).join("");
+  }
+  const err = $("quiet-err");
+  if (err) {
+    err.hidden = !state.quietErr;
+    err.textContent = state.quietErr || "";
+  }
+}
+async function postQuiet(path, payload) {
+  state.quietErr = "";
+  const r = await fetch(path, {
+    method: "POST",
+    headers: { accept: "application/json", "content-type": "application/json" },
+    body: JSON.stringify(payload || {}),
+  });
+  const body = await r.json().catch(() => ({ error: r.statusText }));
+  if (!r.ok) throw new Error(body.error || r.statusText);
+  await refresh();
+}
 function renderView() {
   if (state.tab === "fleet" && single()) state.tab = "overview";
-  $("view").innerHTML = state.tab === "fleet" ? fleetView() : state.tab === "trends" ? trendsView() : state.tab === "gaps" ? gapsView() : state.tab === "changes" ? changesView() : state.tab === "actions" ? actionsView() : overviewView();
+  const body = state.tab === "fleet" ? fleetView() : state.tab === "trends" ? trendsView() : state.tab === "gaps" ? gapsView() : state.tab === "changes" ? changesView() : state.tab === "actions" ? actionsView() : overviewView();
+  const slot = $("view-body");
+  if (slot) slot.innerHTML = body;
 }
 function renderFoot() {
   const s = D.status, gs = [...M.groups.values()], n = (t) => gs.filter((g) => g.type === t).length;
   const scope = (s.nodes && s.nodes.length) ? [n("k8s") && plural(n("k8s"), "cluster"), n("pve") && plural(n("pve"), "pve node"), n("host") && plural(n("host"), "host")].filter(Boolean).join(" · ")
     : "node " + ((gs[0] && gs[0].name) || "");
-  const src = s.nodes && s.nodes.length ? `${s.nodes.filter((x) => !x.stale).length}/${s.nodes.length} agents pushing`
+  const away = s.nodes ? s.nodes.filter((x) => x.offline_ok && x.stale).length : 0;
+  const src = s.nodes && s.nodes.length ? `${s.nodes.filter((x) => !x.stale).length}/${s.nodes.length} agents pushing${away ? " · " + away + " offline ok" : ""}`
     : (s.collectors || []).map((c) => `<span class="${c.stale || !c.ok ? "t-degraded" : ""}">${esc(c.source)} ${ago(c.age_secs)}</span>`).join(" · ");
   $("foot").innerHTML = `<span>${esc(scope)} · ${resourceTotal()} resources</span><span>${src}</span>
     <span>${state.paused ? "paused" : "updated " + formatClock(new Date(), zoneName(), timeFormatName(), true)}</span>
@@ -1532,11 +1608,13 @@ function liveHealth() {
 }
 function render() {
   if (!D.status) {
-    $("view").innerHTML = `<section class="card"><div class="empty">Loading…</div></section>`;
+    const slot = $("view-body");
+    if (slot) slot.innerHTML = `<section class="card"><div class="empty">Loading…</div></section>`;
     return;
   }
   M = buildModel();
   liveHealth();
+  renderQuiet();
   if (state.tab === "fleet" && single()) state.tab = "overview";
   renderTabs(); renderView(); renderPanel(); renderFoot();
 }
@@ -1834,6 +1912,35 @@ document.addEventListener("change", (ev) => {
   syncUrl();
 });
 document.addEventListener("click", (ev) => {
+  const maintStart = ev.target.closest("[data-maint-start]");
+  const maintClear = ev.target.closest("[data-maint-clear]");
+  const offlineAllow = ev.target.closest("[data-offline-allow]");
+  const offlineSet = ev.target.closest("[data-offline-set]");
+  const offlineClear = ev.target.closest("[data-offline-clear]");
+  if (maintStart || maintClear || offlineAllow || offlineSet || offlineClear) {
+    const fail = (e) => { state.quietErr = e.message || "save failed"; renderQuiet(); };
+    if (maintStart) {
+      const duration = (document.querySelector("[data-maint-for]") || {}).value || "";
+      const reason = (document.querySelector("[data-maint-reason]") || {}).value || "";
+      const node = (document.querySelector("[data-maint-node]") || {}).value || "";
+      if (!String(duration).trim()) { state.quietErr = "Duration is required"; renderQuiet(); return; }
+      postQuiet("/api/v1/maintenance", { duration: String(duration).trim(), reason: String(reason).trim(), node: String(node).trim() }).catch(fail);
+      return;
+    }
+    if (maintClear) { postQuiet("/api/v1/maintenance/clear", {}).catch(fail); return; }
+    if (offlineAllow) {
+      const node = String((document.querySelector("[data-offline-node]") || {}).value || "").trim();
+      if (!node) { state.quietErr = "Host is required"; renderQuiet(); return; }
+      postQuiet("/api/v1/offline-ok", { node, enabled: true }).catch(fail);
+      return;
+    }
+    if (offlineSet) {
+      postQuiet("/api/v1/offline-ok", { node: offlineSet.dataset.offlineSet, enabled: true }).catch(fail);
+      return;
+    }
+    postQuiet("/api/v1/offline-ok", { node: offlineClear.dataset.offlineClear, enabled: false }).catch(fail);
+    return;
+  }
   const decision = ev.target.closest("[data-approve],[data-deny],[data-dismiss],[data-recheck]");
   if (decision) {
     if (decision.dataset.approve) decideRun(decision.dataset.approve, "approve");

@@ -23,6 +23,7 @@ use pulseblade_mcp::query::{self, SnapshotParams};
 use pulseblade_mcp::{build_router, ActionRoute, PortalDefaults};
 use pulseblade_store::{
     ChangeFilter, IngestResult, NodeBatch, NodeBuild, NodeCursor, RouteJob, Store, StoreError,
+    WeeklyMaintenance,
 };
 
 use crate::config::NodeUpdate;
@@ -691,6 +692,8 @@ pub async fn supervise(
     shutdown: CancellationToken,
     history_days: u64,
     change_days: u64,
+    offline_ok: Vec<String>,
+    schedule: Vec<WeeklyMaintenance>,
 ) {
     let mut tick = tokio::time::interval(Duration::from_secs(2));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -719,8 +722,12 @@ pub async fn supervise(
                 next_maintain = tokio::time::Instant::now() + Duration::from_secs(15);
                 let Some(store) = journal.store() else { continue };
                 let checked = store.clone();
+                let offline_ok = offline_ok.clone();
+                let schedule = schedule.clone();
                 match tokio::task::spawn_blocking(move || {
                     let now = chrono::Utc::now();
+                    checked.replace_config_offline_ok(&offline_ok)?;
+                    checked.replace_weekly_maintenance(&schedule)?;
                     let opened = checked.sync_offline_hosts(now)?;
                     let closed = checked.resolve_recovered_health(now)?;
                     Ok::<_, StoreError>((opened, closed))

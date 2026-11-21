@@ -127,7 +127,10 @@ impl Session {
         }
         for incident in self.incidents.values_mut() {
             if incident.run_id.is_empty()
-                && run.subjects.iter().any(|subject| subject == &incident.resource_id)
+                && run
+                    .subjects
+                    .iter()
+                    .any(|subject| subject == &incident.resource_id)
             {
                 incident.run_id = id.to_string();
             }
@@ -174,10 +177,14 @@ impl Session {
         // finding is new or its signature changed, or when a resource's health
         // became failed or degraded. Sensor flaps, a host-offline bounce, a
         // pod that flipped with its node, and a failure mode already
-        // investigated are not a call. An investigation that already failed
-        // to root-cause that same signature does not run again.
+        // investigated are not a call. A node inside a maintenance window also
+        // holds host-offline, pressure, and pod or workload flips until the
+        // window ends. A host marked offline-ok never wakes for its own silence.
+        // An investigation that already failed to root-cause that same
+        // signature does not run again.
         self.note_recoveries(&all_changes, now);
         let wall = Utc::now();
+        let quiet = fleet_quiet(&findings, wall);
         let bounce = bounce_nodes(&open, &all_changes, wall);
         let mut parents = BTreeMap::new();
         let mut delayed = BTreeSet::new();
@@ -197,7 +204,7 @@ impl Session {
                 self.record_repeat(tools, &finding.resource_id, &mode, &mut counted);
                 continue;
             }
-            if hold_finding(tools, &finding, &bounce, wall, &mut parents) {
+            if hold_finding(tools, &finding, &bounce, &quiet, wall, &mut parents) {
                 delayed.insert(finding.id.clone());
                 continue;
             }
@@ -217,7 +224,7 @@ impl Session {
                 self.record_repeat(tools, &id, &mode, &mut counted);
                 return false;
             }
-            if hold_change(tools, change, &bounce, &mut parents) {
+            if hold_change(tools, change, &bounce, &quiet, &mut parents) {
                 self.change_seen.insert(change_signature(change));
                 return false;
             }
@@ -584,9 +591,7 @@ impl Session {
             ));
         }
         if !lines.is_empty() {
-            lines.push(
-                "Do not call memory_note to repeat a stored conclusion.".to_string(),
-            );
+            lines.push("Do not call memory_note to repeat a stored conclusion.".to_string());
         }
         lines
     }
@@ -1397,14 +1402,125 @@ fn parent_node<T: Tools>(
     node_name(&parent)
 }
 
+/// Quiet time the hub already published on `findings_list`.
+struct FleetQuiet {
+    windows: Vec<QuietWindow>,
+    offline_ok: BTreeSet<String>,
+}
+
+struct QuietWindow {
+    /// Empty `nodes` on the wire: the window covers the fleet.
+    fleet: bool,
+    nodes: BTreeSet<String>,
+}
+
+impl FleetQuiet {
+    fn covers(&self, node: &str) -> bool {
+        self.windows
+            .iter()
+            .any(|window| window.fleet || window.nodes.contains(node))
+    }
+
+    fn fleet(&self) -> bool {
+        self.windows.iter().any(|window| window.fleet)
+    }
+}
+
+fn fleet_quiet(findings: &Value, wall: DateTime<Utc>) -> FleetQuiet {
+    let mut windows = Vec::new();
+    if let Some(rows) = findings.get("maintenance").and_then(|v| v.as_array()) {
+        for row in rows {
+            let Some(starts) = row
+                .get("starts_at")
+                .and_then(|v| v.as_str())
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                .map(|t| t.with_timezone(&Utc))
+            else {
+                continue;
+            };
+            let Some(ends) = row
+                .get("ends_at")
+                .and_then(|v| v.as_str())
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                .map(|t| t.with_timezone(&Utc))
+            else {
+                continue;
+            };
+            if wall < starts || wall >= ends {
+                continue;
+            }
+            let nodes = row
+                .get("nodes")
+                .and_then(|v| v.as_array())
+                .map(|ids| {
+                    ids.iter()
+                        .filter_map(|id| id.as_str().map(str::to_string))
+                        .filter(|id| !id.is_empty())
+                        .collect::<BTreeSet<_>>()
+                })
+                .unwrap_or_default();
+            windows.push(QuietWindow {
+                fleet: nodes.is_empty(),
+                nodes,
+            });
+        }
+    }
+    let offline_ok = findings
+        .get("offline_ok")
+        .and_then(|v| v.as_array())
+        .map(|ids| {
+            ids.iter()
+                .filter_map(|id| id.as_str().map(str::to_string))
+                .filter(|id| !id.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    FleetQuiet {
+        windows,
+        offline_ok,
+    }
+}
+
+/// Host, sensor, or Kubernetes node name carried in the resource id.
+fn subject_node(id: &str) -> Option<String> {
+    if let Some(name) = id.strip_prefix("host:") {
+        return Some(name.to_string());
+    }
+    if id.starts_with("knode:") {
+        return node_name(id);
+    }
+    if id.starts_with("sensor:") || id.starts_with("temp:") || id.starts_with("fan:") {
+        return id
+            .split(':')
+            .nth(1)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string);
+    }
+    None
+}
+
 fn hold_finding<T: Tools>(
     tools: &mut T,
     finding: &OpenFinding,
     bounce: &BTreeSet<String>,
+    quiet: &FleetQuiet,
     wall: DateTime<Utc>,
     parents: &mut BTreeMap<String, String>,
 ) -> bool {
     let kind = kind_of(&finding.resource_id);
+    if let Some(name) = subject_node(&finding.resource_id) {
+        let allowed_off = quiet.offline_ok.contains(&name);
+        let in_window = quiet.covers(&name);
+        if allowed_off && (finding.rule == HOST_OFFLINE || kind == "host") {
+            return true;
+        }
+        if in_window && (finding.rule == HOST_OFFLINE || kind == "host" || kind == "node") {
+            return true;
+        }
+        if in_window && kind == "sensor" {
+            return true;
+        }
+    }
     if finding.rule == HOST_OFFLINE || kind == "node" {
         return !age_reached(finding.opened_at, BOUNCE_WINDOW, wall);
     }
@@ -1414,10 +1530,18 @@ fn hold_finding<T: Tools>(
     if kind != "pod" && kind != "workload" {
         return false;
     }
+    let parent = parent_node(tools, parents, &finding.resource_id);
+    if let Some(node) = &parent {
+        if quiet.covers(node) {
+            return true;
+        }
+    } else if quiet.fleet() {
+        return true;
+    }
     if bounce.is_empty() || age_reached(finding.opened_at, BOUNCE_WINDOW, wall) {
         return false;
     }
-    match parent_node(tools, parents, &finding.resource_id) {
+    match parent {
         Some(node) => bounce.contains(&node),
         None => true,
     }
@@ -1427,17 +1551,36 @@ fn hold_change<T: Tools>(
     tools: &mut T,
     change: &Value,
     bounce: &BTreeSet<String>,
+    quiet: &FleetQuiet,
     parents: &mut BTreeMap<String, String>,
 ) -> bool {
     let id = change_resource(change);
     let kind = kind_of(id);
+    if kind == "host" {
+        if let Some(name) = id.strip_prefix("host:") {
+            if quiet.offline_ok.contains(name) || quiet.covers(name) {
+                return true;
+            }
+        }
+    }
     if kind == "sensor" || kind == "node" {
         return true;
     }
-    if (kind != "pod" && kind != "workload") || bounce.is_empty() {
+    if kind != "pod" && kind != "workload" {
         return false;
     }
-    match parent_node(tools, parents, id) {
+    let parent = parent_node(tools, parents, id);
+    if let Some(node) = &parent {
+        if quiet.covers(node) {
+            return true;
+        }
+    } else if quiet.fleet() {
+        return true;
+    }
+    if bounce.is_empty() {
+        return false;
+    }
+    match parent {
         Some(node) => bounce.contains(&node),
         None => true,
     }
@@ -2936,7 +3079,10 @@ mod tests {
             completion(json!([]), "pressure stayed high"),
             completion(json!([]), "sshd failed"),
         ]);
-        assert!(session.tick(&mut tools, &mut chat, start).unwrap().is_none());
+        assert!(session
+            .tick(&mut tools, &mut chat, start)
+            .unwrap()
+            .is_none());
         assert_eq!(chat.n, 0);
 
         tools.findings = json!({
@@ -3010,18 +3156,23 @@ mod tests {
             completion(json!([]), "node came back"),
             completion(json!([]), "should not run"),
         ]);
-        assert!(session.tick(&mut tools, &mut chat, start).unwrap().is_none());
+        assert!(session
+            .tick(&mut tools, &mut chat, start)
+            .unwrap()
+            .is_none());
         assert_eq!(chat.n, 0);
 
         tools.findings["findings"][0]["opened_at"] = json!(opened_ago(6));
-        tools.findings["findings"][0]["summary"] = json!("prd-apps-worker-3 offline (last health ok); no push for 34s");
+        tools.findings["findings"][0]["summary"] =
+            json!("prd-apps-worker-3 offline (last health ok); no push for 34s");
         let run = session
             .tick(&mut tools, &mut chat, start + Duration::from_secs(10))
             .unwrap()
             .expect("host offline older than five minutes wakes once");
         assert_eq!(run.trigger, "finding:f-off");
         assert_eq!(chat.n, 1);
-        tools.findings["findings"][0]["summary"] = json!("prd-apps-worker-3 offline (last health ok); no push for 90s");
+        tools.findings["findings"][0]["summary"] =
+            json!("prd-apps-worker-3 offline (last health ok); no push for 90s");
         assert!(session
             .tick(&mut tools, &mut chat, start + Duration::from_secs(20))
             .unwrap()
@@ -3201,5 +3352,216 @@ mod tests {
         assert!(body.contains("leave the disk"));
         assert!(body.contains("Do not call memory_note to repeat a stored conclusion."));
         assert_eq!(chat.n, 3);
+    }
+
+    fn quiet_window(nodes: &[&str]) -> Value {
+        let start = (chrono::Utc::now() - chrono::Duration::minutes(5))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let end = (chrono::Utc::now() + chrono::Duration::minutes(30))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        json!({
+            "id": "m-test",
+            "starts_at": start,
+            "ends_at": end,
+            "nodes": nodes,
+            "reason": "planned"
+        })
+    }
+
+    #[test]
+    fn maintenance_holds_a_bounce_and_a_failure_that_outlasts_it_wakes_once() {
+        let start = Instant::now();
+        let mut session = Session::new(local_config(), start);
+        let pod = "pod:prd-apps:coder:coder-1";
+        let other = "pod:prd-apps:auth:api-1";
+        let mut tools = quiet_tools(
+            json!({
+                "as_of_seq": 3,
+                "maintenance": [quiet_window(&["prd-apps-worker-3"])],
+                "findings": [{
+                    "id": "f-node",
+                    "resource_id": "host:prd-apps-worker-3",
+                    "severity": "critical",
+                    "summary": "prd-apps-worker-3 offline",
+                    "rule": "host offline",
+                    "opened_at": opened_ago(1)
+                }]
+            }),
+            json!({
+                "as_of_seq": 3,
+                "changes": [
+                    health_change(3, "knode:prd-apps:prd-apps-worker-3", "failed"),
+                    health_change(4, pod, "failed"),
+                    health_change(5, other, "failed")
+                ]
+            }),
+        );
+        tools.explain = json!({
+            "by_id": {
+                "pod:prd-apps:coder:coder-1": {"resource": {"parent": "knode:prd-apps:prd-apps-worker-3"}},
+                "pod:prd-apps:auth:api-1": {"resource": {"parent": "knode:prd-apps:prd-apps-worker-9"}}
+            }
+        });
+        let mut chat = script(vec![
+            completion(json!([]), "other pod"),
+            completion(json!([]), "coder stayed down"),
+        ]);
+        let during = session
+            .tick(&mut tools, &mut chat, start)
+            .unwrap()
+            .expect("a pod on a node outside the window still wakes");
+        assert_eq!(during.subjects, vec![other.to_string()]);
+        assert_eq!(chat.n, 1);
+
+        tools.findings = json!({
+            "as_of_seq": 6,
+            "findings": [{
+                "id": "f-pod",
+                "resource_id": pod,
+                "severity": "critical",
+                "summary": "coder-1 is failed",
+                "rule": "health",
+                "opened_at": opened_ago(6)
+            }]
+        });
+        tools.changes = json!({"as_of_seq": 6, "changes": []});
+        let stayed = session
+            .tick(&mut tools, &mut chat, start + Duration::from_secs(30))
+            .unwrap()
+            .expect("a failure that is still open after the window wakes once");
+        assert_eq!(stayed.subjects, vec![pod.to_string()]);
+        assert_eq!(chat.n, 2);
+        assert!(session
+            .tick(&mut tools, &mut chat, start + Duration::from_secs(40))
+            .unwrap()
+            .is_none());
+        assert_eq!(chat.n, 2);
+    }
+
+    #[test]
+    fn a_pressure_flap_stays_quiet_inside_maintenance_and_wakes_once_after() {
+        let start = Instant::now();
+        let mut session = Session::new(local_config(), start);
+        let mut tools = quiet_tools(
+            json!({
+                "as_of_seq": 2,
+                "maintenance": [quiet_window(&["box"])],
+                "findings": [{
+                    "id": "f-press",
+                    "resource_id": "sensor:box:pressure",
+                    "severity": "warning",
+                    "summary": "pressure is degraded",
+                    "rule": "health",
+                    "opened_at": opened_ago(2)
+                }]
+            }),
+            empty_changes(),
+        );
+        let mut chat = script(vec![completion(json!([]), "pressure stayed high")]);
+        assert!(session
+            .tick(&mut tools, &mut chat, start)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            chat.n, 0,
+            "a lasting pressure finding is held for the window"
+        );
+        tools.findings = json!({
+            "as_of_seq": 3,
+            "findings": [{
+                "id": "f-press",
+                "resource_id": "sensor:box:pressure",
+                "severity": "warning",
+                "summary": "pressure is degraded",
+                "rule": "health",
+                "opened_at": opened_ago(2)
+            }]
+        });
+        let run = session
+            .tick(&mut tools, &mut chat, start + Duration::from_secs(10))
+            .unwrap()
+            .expect("pressure that is still degraded after the window wakes once");
+        assert_eq!(run.trigger, "finding:f-press");
+        assert_eq!(chat.n, 1);
+        assert!(session
+            .tick(&mut tools, &mut chat, start + Duration::from_secs(20))
+            .unwrap()
+            .is_none());
+        assert_eq!(chat.n, 1);
+    }
+
+    #[test]
+    fn offline_ok_does_not_wake_for_silence_and_a_full_disk_still_does() {
+        let start = Instant::now();
+        let mut session = Session::new(local_config(), start);
+        let mut tools = quiet_tools(
+            json!({
+                "as_of_seq": 2,
+                "offline_ok": ["work1"],
+                "findings": [{
+                    "id": "f-off",
+                    "resource_id": "host:work1",
+                    "severity": "critical",
+                    "summary": "work1 shut down",
+                    "rule": "host offline",
+                    "opened_at": opened_ago(10)
+                }]
+            }),
+            json!({
+                "as_of_seq": 2,
+                "changes": [health_change(2, "host:work1", "failed")]
+            }),
+        );
+        let mut chat = script(vec![
+            completion(json!([]), "web1 is down"),
+            completion(json!([]), "disk is full"),
+        ]);
+        assert!(
+            session
+                .tick(&mut tools, &mut chat, start)
+                .unwrap()
+                .is_none(),
+            "an allowed-offline host does not wake"
+        );
+        assert_eq!(chat.n, 0);
+
+        tools.findings["findings"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "id": "f-web",
+                "resource_id": "host:web1",
+                "severity": "critical",
+                "summary": "web1 offline",
+                "rule": "host offline",
+                "opened_at": opened_ago(10)
+            }));
+        tools.findings["as_of_seq"] = json!(3);
+        tools.changes = empty_changes();
+        let web = session
+            .tick(&mut tools, &mut chat, start + Duration::from_secs(5))
+            .unwrap()
+            .expect("a host that is not offline-ok still wakes");
+        assert_eq!(web.trigger, "finding:f-web");
+        assert_eq!(chat.n, 1);
+
+        tools.findings["findings"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "id": "f-disk",
+                "resource_id": "disk:work1:/",
+                "severity": "critical",
+                "summary": "/ is failed",
+                "rule": "health",
+                "opened_at": opened_ago(2)
+            }));
+        tools.findings["as_of_seq"] = json!(4);
+        let disk = session
+            .tick(&mut tools, &mut chat, start + Duration::from_secs(10))
+            .unwrap()
+            .expect("a full disk on an offline-ok host still wakes");
+        assert_eq!(disk.subjects, vec!["disk:work1:/".to_string()]);
+        assert_eq!(chat.n, 2);
     }
 }

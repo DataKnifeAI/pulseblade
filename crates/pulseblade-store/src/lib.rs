@@ -12,6 +12,7 @@ use chrono::{DateTime, TimeZone, Utc};
 mod actions;
 mod history;
 mod hub;
+mod maintenance;
 mod memory;
 mod pilot;
 mod remedies;
@@ -20,6 +21,7 @@ mod sql;
 pub use actions::{ActionTransition, NewAction};
 pub use history::{MetricBucket, StoredEvent, BUCKET_MS, DEFAULT_HISTORY_DAYS, HUB_RAW_HOURS};
 pub use hub::{IngestResult, NodeBatch, NodeBuild, NodeCursor, NodePush, RouteJob, StampedSample};
+pub use maintenance::{ActiveMaintenance, MaintenanceOnce, WeeklyMaintenance};
 pub use memory::{FindingDraft, FindingFilter};
 pub use pilot::{NewPilotRun, PilotRunRow, PilotSpend};
 pub use remedies::{ActionRejection, RemedyPage, RemedyRow};
@@ -445,6 +447,28 @@ pub(crate) fn ensure_later_columns(sql: &mut dyn sql::Sql) -> Result<()> {
             reason      TEXT NOT NULL,
             created_at  BIGINT NOT NULL,
             PRIMARY KEY (resource_id, action)
+        )",
+        &[],
+    )?;
+    sql.execute(
+        "CREATE TABLE IF NOT EXISTS offline_ok (
+            node_id TEXT NOT NULL,
+            origin  TEXT NOT NULL,
+            PRIMARY KEY (node_id, origin)
+        )",
+        &[],
+    )?;
+    sql.execute(
+        "CREATE TABLE IF NOT EXISTS maintenance (
+            id       TEXT PRIMARY KEY,
+            kind     TEXT NOT NULL,
+            start_ms BIGINT NOT NULL,
+            end_ms   BIGINT NOT NULL,
+            weekday  INTEGER NOT NULL DEFAULT -1,
+            clock    TEXT NOT NULL DEFAULT 'utc',
+            tz       TEXT NOT NULL DEFAULT '',
+            nodes    TEXT NOT NULL DEFAULT '[]',
+            reason   TEXT NOT NULL
         )",
         &[],
     )?;
