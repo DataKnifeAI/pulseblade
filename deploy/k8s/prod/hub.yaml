@@ -515,7 +515,7 @@ metadata:
     nginx.ingress.kubernetes.io/ssl-redirect: "true"
     nginx.ingress.kubernetes.io/proxy-body-size: "32m"
 spec:
-  ingressClassName: nginx
+  ingressClassName: rke2-ingress-nginx-migration
   rules:
     - host: pulseblade.dataknife.net
       http:

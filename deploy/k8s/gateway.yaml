@@ -20,7 +20,7 @@ metadata:
   annotations:
     nginx.ingress.kubernetes.io/ssl-redirect: "true"
 spec:
-  ingressClassName: nginx
+  ingressClassName: rke2-ingress-nginx-migration
   rules:
     - host: pulseblade-poc.dataknife.net
       http:
