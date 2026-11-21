@@ -106,20 +106,23 @@ impl HostCollector {
             }
             let used_pct = pct(total - disk.available_space() as f64, total);
             let inode_pct = inodes(disk.mount_point());
+            let device = disk.name().to_string_lossy().to_string();
+            let fs = disk.file_system().to_string_lossy().to_string();
             let root_ro = mount == "/" && disk.is_read_only();
-            let health = disk_health(used_pct, inode_pct, root_ro);
+            let optical = optical_media(&device, &fs, &mount);
+            let health = disk_health(used_pct, inode_pct, root_ro, optical);
             let id = format!("disk:{}:{}", self.host, mount);
             let mut resource = Resource::new(&id, ResourceKind::Disk, &mount)
                 .parent(&parent)
                 .health(health)
                 .label("host", &self.host)
-                .attr("device", disk.name().to_string_lossy().to_string())
-                .attr("fs", disk.file_system().to_string_lossy().to_string())
+                .attr("device", device)
+                .attr("fs", fs)
                 .attr("kind", disk.kind().to_string())
                 .attr("read_only", disk.is_read_only())
                 .attr("removable", disk.is_removable())
                 .attr("total_bytes", disk.total_space());
-            if let Some(fault) = disk_fault(used_pct, inode_pct, root_ro) {
+            if let Some(fault) = disk_fault(used_pct, inode_pct, root_ro, optical) {
                 resource = resource.attr("fault", fault);
             }
             obs.resources.push(resource);
@@ -215,7 +218,33 @@ fn inodes(mount: &std::path::Path) -> Option<f64> {
     Some(pct(used as f64, stat.f_files as f64))
 }
 
-fn disk_health(used_pct: f64, inode_pct: Option<f64>, root_read_only: bool) -> Health {
+/// A pressed optical disc is full by design. `srN` and UDF or iso9660 under
+/// `/run/media` are not failed filesystems. Block devices such as nvme stay
+/// on the usage thresholds, including `/` and `/home`.
+fn optical_media(device: &str, fs: &str, mount: &str) -> bool {
+    if !mount.starts_with("/run/media/") {
+        return false;
+    }
+    let name = device.rsplit('/').next().unwrap_or(device);
+    let sr = name.len() > 2
+        && name.as_bytes().starts_with(b"sr")
+        && name.as_bytes()[2..].iter().all(|b| b.is_ascii_digit());
+    let optical_fs = fs.eq_ignore_ascii_case("udf") || fs.eq_ignore_ascii_case("iso9660");
+    sr || optical_fs
+}
+
+fn disk_health(
+    used_pct: f64,
+    inode_pct: Option<f64>,
+    root_read_only: bool,
+    optical: bool,
+) -> Health {
+    if root_read_only {
+        return Health::Failed;
+    }
+    if optical {
+        return Health::Ok;
+    }
     let mut health = if used_pct >= DISK_FAILED_PCT {
         Health::Failed
     } else if used_pct >= DISK_DEGRADED_PCT {
@@ -235,22 +264,23 @@ fn disk_health(used_pct: f64, inode_pct: Option<f64>, root_read_only: bool) -> H
             health = inode;
         }
     }
-    if root_read_only {
-        Health::Failed
-    } else {
-        health
-    }
+    health
 }
 
-fn disk_fault(used_pct: f64, inode_pct: Option<f64>, root_read_only: bool) -> Option<String> {
+fn disk_fault(
+    used_pct: f64,
+    inode_pct: Option<f64>,
+    root_read_only: bool,
+    optical: bool,
+) -> Option<String> {
     let mut why = Vec::new();
     if root_read_only {
         why.push("read-only");
     }
-    if used_pct >= DISK_DEGRADED_PCT {
+    if !optical && used_pct >= DISK_DEGRADED_PCT {
         why.push("filesystem full");
     }
-    if inode_pct.is_some_and(|pct| pct >= DISK_DEGRADED_PCT) {
+    if !optical && inode_pct.is_some_and(|pct| pct >= DISK_DEGRADED_PCT) {
         why.push("inodes full");
     }
     if why.is_empty() {
@@ -271,11 +301,32 @@ mod tests {
 
     #[test]
     fn disk_thresholds() {
-        assert_eq!(disk_health(50.0, None, false), Health::Ok);
-        assert_eq!(disk_health(90.0, None, false), Health::Degraded);
-        assert_eq!(disk_health(99.0, None, false), Health::Failed);
-        assert_eq!(disk_health(10.0, Some(99.0), false), Health::Failed);
-        assert_eq!(disk_health(10.0, None, true), Health::Failed);
+        assert_eq!(disk_health(50.0, None, false, false), Health::Ok);
+        assert_eq!(disk_health(90.0, None, false, false), Health::Degraded);
+        assert_eq!(disk_health(99.0, None, false, false), Health::Failed);
+        assert_eq!(disk_health(10.0, Some(99.0), false, false), Health::Failed);
+        assert_eq!(disk_health(10.0, None, true, false), Health::Failed);
+    }
+
+    #[test]
+    fn full_removable_optical_disc_is_not_failed_and_a_full_disk_still_is() {
+        let disc = "/run/media/lee/COWBOYS_ALIENS_DOM";
+        assert!(optical_media("/dev/sr0", "udf", disc));
+        assert!(optical_media("/dev/sr1", "iso9660", "/run/media/lee/NEXT"));
+        assert!(optical_media("sr0", "UDF", "/run/media/lee/NEXT"));
+        assert_eq!(disk_health(100.0, Some(100.0), false, true), Health::Ok);
+        assert!(disk_fault(100.0, Some(100.0), false, true).is_none());
+
+        assert!(!optical_media("/dev/nvme0n1p2", "btrfs", "/"));
+        assert!(!optical_media("/dev/nvme0n1p2", "btrfs", "/home"));
+        assert!(!optical_media("/dev/sda1", "ext4", "/run/media/lee/USB"));
+        assert!(!optical_media("/dev/sr0", "udf", "/"));
+        assert_eq!(disk_health(100.0, None, false, false), Health::Failed);
+        assert_eq!(
+            disk_fault(100.0, None, false, false).as_deref(),
+            Some("filesystem full")
+        );
+        assert_eq!(disk_health(10.0, None, true, true), Health::Failed);
     }
 
     #[test]
