@@ -1482,6 +1482,12 @@ mod tests {
         assert!(DASHBOARD.contains("/api/v1/actions/"));
         assert!(DASHBOARD.contains("method: \"POST\""));
         assert!(!DASHBOARD.contains("read-only"));
+        let markup = DASHBOARD.split("<script>").next().unwrap();
+        assert!(
+            !markup.contains("Start maintenance"),
+            "maintenance controls stay on the Maintenance tab"
+        );
+        assert!(DASHBOARD.contains("[\"maintenance\", \"Maintenance\"]"));
         assert_eq!(
             DASHBOARD.matches("decisionControl(").count(),
             4,
